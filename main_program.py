@@ -6,8 +6,8 @@ from collections import defaultdict
 import math
 
 # Constants
-G = 6.67430e-11  # gravitational constant
-softening = 0.05  # softening parameter to avoid singularities
+G = 1.0  # gravitational constant
+softening = 0.01  # softening parameter to avoid singularities
 
 class Particle:
     def __init__(self, x, y, mass=1.0, vx=0.0, vy=0.0):
@@ -30,11 +30,10 @@ def compute_forces_direct(particles):
             if i != j:
                 dx = particles[j].x - particles[i].x
                 dy = particles[j].y - particles[i].y
-                r_squared = dx*dx + dy*dy + softening*softening
-                r = np.sqrt(r_squared)
+                r = np.sqrt(dx*dx + dy*dy + softening*softening)
                 
                 # Gravitational force
-                f = G * particles[i].mass * particles[j].mass / r_squared
+                f = G * particles[i].mass * particles[j].mass / r**2
                 
                 # Acceleration components
                 particles[i].ax += f * dx / (r * particles[i].mass)
@@ -286,46 +285,167 @@ def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.01, thet
         vy = v * np.cos(angle)
         
         # Add some randomness to the velocities
-        vx *= np.random.uniform(0.8, 1.2)
-        vy *= np.random.uniform(0.8, 1.2)
+        #vx *= np.random.uniform(0.8, 1.2)
+        #vy *= np.random.uniform(0.8, 1.2)
         
         particles.append(Particle(x, y, mass=np.random.uniform(0.1, 1.0), vx=vx, vy=vy))
     
-    # Setup the figure for animation
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_xlim(-50, 50)
-    ax.set_ylim(-50, 50)
-    ax.set_aspect('equal')
-    ax.grid(True)
-    scatter = ax.scatter([p.x for p in particles], [p.y for p in particles], 
-                         s=[p.mass * 5 for p in particles], alpha=0.7)
+    # Store particle positions for static visualization
+    positions_x = []
+    positions_y = []
     
-    # Animation function
-    def animate(frame):
+    # Run simulation for specified steps
+    print(f"Running {method.upper()} simulation with {n_particles} particles...")
+    
+    # Setup visualization
+    plt.figure(figsize=(10, 10))
+    plt.xlim(-50, 50)
+    plt.ylim(-50, 50)
+    plt.grid(True)
+    
+    # Run simulation steps
+    for step in range(steps):
+        # Store current positions
+        positions_x.append([p.x for p in particles])
+        positions_y.append([p.y for p in particles])
+        
+        # Update forces
         if method == 'direct':
             compute_forces_direct(particles)
         else:
             compute_forces_fmm(particles, domain_size=100.0, theta=theta)
         
+        # Update positions
         update_positions(particles, dt)
         
-        # Update scatter plot data
-        scatter.set_offsets(np.column_stack([[p.x for p in particles], [p.y for p in particles]]))
-        return scatter,
+        # Print progress
+        if step % 20 == 0:
+            print(f"Step {step}/{steps} completed")
     
-    # Create animation
-    anim = FuncAnimation(fig, animate, frames=steps, interval=50, blit=True)
+    # Plot particle trajectories
+    for i in range(n_particles):
+        # Extract this particle's trajectory
+        x_traj = [positions_x[step][i] for step in range(steps)]
+        y_traj = [positions_y[step][i] for step in range(steps)]
+        
+        # Plot with different style for central particle
+        if i == 0:  # Central particle
+            plt.plot(x_traj, y_traj, 'r-', linewidth=1, alpha=0.3)
+            plt.scatter(x_traj[-1], y_traj[-1], s=particles[i].mass * 10, c='red', 
+                      label='Central Mass')
+        else:
+            plt.plot(x_traj, y_traj, '-', linewidth=0.5, alpha=0.3)
+            plt.scatter(x_traj[-1], y_traj[-1], s=particles[i].mass * 5, alpha=0.7)
     
-    plt.title(f'2D Gravity Simulation ({method.upper()} method)')
+    plt.title(f'2D Gravity Simulation ({method.upper()} method) - Particle Trajectories')
+    plt.legend()
+    plt.axis('equal')
     plt.tight_layout()
+    plt.show()
+
+def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, max_steps=1000):
+    """
+    Run an interactive real-time simulation showing particle movements frame by frame
+    """
+    # Create particles
+    particles = []
+    # Create a central massive particle
+    particles.append(Particle(0, 0, mass=100.0))
+    
+    # Create orbiting particles
+    for i in range(1, n_particles):
+        distance = np.random.uniform(5.0, 30.0)
+        angle = np.random.uniform(0, 2 * np.pi)
+        x = distance * np.cos(angle)
+        y = distance * np.sin(angle)
+        
+        # Calculate orbital velocity for a circular orbit
+        v = np.sqrt(G * particles[0].mass / distance)
+        vx = -v * np.sin(angle)  # Tangential velocity
+        vy = v * np.cos(angle)
+        
+        # Add some randomness to the velocities
+        #vx *= np.random.uniform(0.8, 1.2)
+        #vy *= np.random.uniform(0.8, 1.2)
+        
+        particles.append(Particle(x, y, mass=np.random.uniform(0.1, 1.0), vx=vx, vy=vy))
+    
+    # Setup the plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(-50, 50)
+    ax.set_ylim(-50, 50)
+    ax.set_aspect('equal')
+    ax.grid(True)
+    
+    # Initial scatter plot
+    masses = [p.mass * 5 for p in particles]
+    colors = ['red' if i == 0 else 'blue' for i in range(n_particles)]
+    scatter = ax.scatter([p.x for p in particles], [p.y for p in particles], 
+                         s=masses, c=colors, alpha=0.7)
+    
+    # Add a title with current method
+    title = ax.set_title(f'2D Gravity Simulation - {method.upper()} method')
+    
+    # Add step counter text
+    step_text = ax.text(0.02, 0.98, 'Step: 0', transform=ax.transAxes,
+                        verticalalignment='top')
+    
+    # Trails (past positions)
+    trails = [ax.plot([], [], '-', lw=0.5, alpha=0.3)[0] for _ in range(n_particles)]
+    trail_history = [[] for _ in range(n_particles)]
+    max_trail_length = 50  # Maximum number of points in trail
+    
+    # Function to initialize the animation
+    def init():
+        for trail in trails:
+            trail.set_data([], [])
+        return [scatter] + trails + [step_text]
+    
+    # Animation update function
+    def update(frame):
+        # Calculate forces
+        if method == 'direct':
+            compute_forces_direct(particles)
+        else:
+            compute_forces_fmm(particles, domain_size=100.0, theta=theta)
+        
+        # Update positions
+        update_positions(particles, dt)
+        
+        # Update scatter plot
+        scatter.set_offsets(np.column_stack([[p.x for p in particles], [p.y for p in particles]]))
+        
+        # Update trails
+        for i, p in enumerate(particles):
+            trail_history[i].append((p.x, p.y))
+            # Limit trail length
+            if len(trail_history[i]) > max_trail_length:
+                trail_history[i] = trail_history[i][-max_trail_length:]
+            
+            if trail_history[i]:
+                x_trail, y_trail = zip(*trail_history[i])
+                trails[i].set_data(x_trail, y_trail)
+        
+        # Update step counter
+        step_text.set_text(f'Step: {frame}')
+        
+        return [scatter] + trails + [step_text]
+    
+    # Create the animation
+    ani = FuncAnimation(fig, update, frames=max_steps, init_func=init, 
+                        interval=50, blit=True)
+    
+    plt.tight_layout()
+    print(f"Running {method} simulation with {n_particles} particles. Close the plot window to stop.")
     plt.show()
 
 def main():
     # Example usage
     print("2D Gravity Simulation: Fast Multipole Method vs Direct N-body")
     print("\n1. Benchmark performance")
-    print("2. Run interactive simulation")
-    choice = input("Select an option (1/2): ")
+    print("2. Run simulation with trajectories")
+    print("3. Run real-time interactive simulation")
+    choice = input("Select an option (1/2/3): ")
     
     if choice == '1':
         # Benchmark comparison
@@ -335,7 +455,22 @@ def main():
         plot_results(n_particles_list, results)
         
     elif choice == '2':
-        # Run interactive simulation
+        # Run simulation with trajectories
+        print("\n1. Direct N-body method")
+        print("2. Fast Multipole Method (FMM)")
+        sim_choice = input("Select simulation method (1/2): ")
+        
+        n = int(input("Number of particles [default=100]: ") or "100")
+        steps = int(input("Number of simulation steps [default=200]: ") or "200")
+        
+        if sim_choice == '1':
+            simulate_and_animate(n_particles=n, method='direct', steps=steps)
+        else:
+            theta = float(input("FMM accuracy parameter theta (0.1-1.0) [default=0.5]: ") or "0.5")
+            simulate_and_animate(n_particles=n, method='fmm', theta=theta, steps=steps)
+    
+    elif choice == '3':
+        # Run real-time interactive simulation
         print("\n1. Direct N-body method")
         print("2. Fast Multipole Method (FMM)")
         sim_choice = input("Select simulation method (1/2): ")
@@ -343,10 +478,10 @@ def main():
         n = int(input("Number of particles [default=100]: ") or "100")
         
         if sim_choice == '1':
-            simulate_and_animate(n_particles=n, method='direct')
+            run_real_time_simulation(n_particles=n, method='direct')
         else:
             theta = float(input("FMM accuracy parameter theta (0.1-1.0) [default=0.5]: ") or "0.5")
-            simulate_and_animate(n_particles=n, method='fmm', theta=theta)
+            run_real_time_simulation(n_particles=n, method='fmm', theta=theta)
     
     else:
         print("Invalid choice!")
