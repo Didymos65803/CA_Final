@@ -30,14 +30,23 @@ def compute_forces_direct(particles):
             if i != j:
                 dx = particles[j].x - particles[i].x
                 dy = particles[j].y - particles[i].y
-                r = np.sqrt(dx*dx + dy*dy + softening*softening)
+                r = np.sqrt(dx*dx + dy*dy)
                 
-                # Gravitational force
-                f = G * particles[i].mass * particles[j].mass / r**2
+                if r <= softening: # collision
+                    particles[i].ax = particles[j].ax
+                    particles[i].ay = particles[j].ay
+                    particles[i].vx = particles[j].vx
+                    particles[i].vy = particles[j].vy
+                    particles[i].x = particles[j].x
+                    particles[i].y = particles[j].y
+                    break
                 
-                # Acceleration components
-                particles[i].ax += f * dx / (r * particles[i].mass)
-                particles[i].ay += f * dy / (r * particles[i].mass)
+                else :# Gravitational force
+                    f = G * particles[i].mass * particles[j].mass / r**2
+                
+                    # Acceleration components
+                    particles[i].ax += f * dx / (r * particles[i].mass)
+                    particles[i].ay += f * dy / (r * particles[i].mass)
 
 class QuadTreeNode:
     def __init__(self, cx, cy, size):
@@ -159,15 +168,17 @@ def compute_forces_fmm(particles, domain_size=100.0, theta=0.5):
         p.ax += ax
         p.ay += ay
 
-def update_positions(particles, dt=0.01):
+def update_positions(particles, dt=0.1):
     for p in particles:
+        
         # Update velocities (half-step)
         p.vx += 0.5 * p.ax * dt
         p.vy += 0.5 * p.ay * dt
         
         # Update positions
-        p.x += p.vx * dt
-        p.y += p.vy * dt
+        p.x += p.vx * 0.5 * dt
+        p.y += p.vy * 0.5 * dt
+
 
 def benchmark(n_particles_list, method='both'):
     results = defaultdict(list)
@@ -266,11 +277,11 @@ def plot_results(n_particles_list, results):
     plt.tight_layout()
     plt.show()
 
-def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.01, theta=0.5):
+def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.1, theta=0.5):
     # Create particles
     particles = []
     # Create a central massive particle
-    particles.append(Particle(0, 0, mass=100.0))
+    particles.append(Particle(0, 0, mass=1000.0))
     
     # Create orbiting particles
     for i in range(1, n_particles):
@@ -284,11 +295,7 @@ def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.01, thet
         vx = -v * np.sin(angle)  # Tangential velocity
         vy = v * np.cos(angle)
         
-        # Add some randomness to the velocities
-        #vx *= np.random.uniform(0.8, 1.2)
-        #vy *= np.random.uniform(0.8, 1.2)
-        
-        particles.append(Particle(x, y, mass=np.random.uniform(0.1, 1.0), vx=vx, vy=vy))
+        particles.append(Particle(x, y, mass=np.random.uniform(1.0, 2.0), vx=vx, vy=vy))
     
     # Store particle positions for static visualization
     positions_x = []
@@ -342,14 +349,14 @@ def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.01, thet
     plt.axis('equal')
     plt.tight_layout()
     plt.show()
-
+ 
+# Real-time simulation showing particle movements frame by frame
 def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, max_steps=1000):
-    """
-    Run an interactive real-time simulation showing particle movements frame by frame
-    """
+
     # Create particles
     particles = []
-    # Create a central massive particle
+    
+    # Create a massive particle at the center
     particles.append(Particle(0, 0, mass=100.0))
     
     # Create orbiting particles
@@ -360,15 +367,13 @@ def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, 
         y = distance * np.sin(angle)
         
         # Calculate orbital velocity for a circular orbit
-        v = np.sqrt(G * particles[0].mass / distance)
-        vx = -v * np.sin(angle)  # Tangential velocity
+        v = np.sqrt(G * particles[0].mass / distance) 
+        vx = -v * np.sin(angle)
         vy = v * np.cos(angle)
         
-        # Add some randomness to the velocities
-        #vx *= np.random.uniform(0.8, 1.2)
-        #vy *= np.random.uniform(0.8, 1.2)
-        
-        particles.append(Particle(x, y, mass=np.random.uniform(0.1, 1.0), vx=vx, vy=vy))
+        particles.append(Particle(x, y, mass=np.random.uniform(1.0, 2.0), vx=vx, vy=vy))
+        #particles.append(Particle(x, y, mass=np.random.uniform(1.0, 2.0), vx=0, vy=0))
+
     
     # Setup the plot
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -384,7 +389,7 @@ def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, 
                          s=masses, c=colors, alpha=0.7)
     
     # Add a title with current method
-    title = ax.set_title(f'2D Gravity Simulation - {method.upper()} method')
+    plt.title = ax.set_title(f'2D Gravity Simulation - {method.upper()} method')
     
     # Add step counter text
     step_text = ax.text(0.02, 0.98, 'Step: 0', transform=ax.transAxes,
@@ -410,6 +415,7 @@ def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, 
             compute_forces_fmm(particles, domain_size=100.0, theta=theta)
         
         # Update positions
+        update_positions(particles, dt)
         update_positions(particles, dt)
         
         # Update scatter plot
@@ -440,11 +446,10 @@ def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, 
     plt.show()
 
 def main():
-    # Example usage
     print("2D Gravity Simulation: Fast Multipole Method vs Direct N-body")
     print("\n1. Benchmark performance")
-    print("2. Run simulation with trajectories")
-    print("3. Run real-time interactive simulation")
+    print("2. Run simulation result with trajectories")
+    print("3. Run real-time simulation animation")
     choice = input("Select an option (1/2/3): ")
     
     if choice == '1':
