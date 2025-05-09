@@ -459,7 +459,7 @@ def main():
     
     if choice == '1':
         # Benchmark comparison
-        n_particles_list = [100, 500, 1000, 5000, 10000, 50000]
+        n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
         print("\nBenchmarking both methods...")
         results = benchmark(n_particles_list, 'both')
         plot_results(n_particles_list, results)
