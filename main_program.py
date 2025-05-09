@@ -31,7 +31,9 @@ def compute_forces_direct(particles):
                 dx = particles[j].x - particles[i].x
                 dy = particles[j].y - particles[i].y
                 r = np.sqrt(dx*dx + dy*dy)
-                
+                if r < softening:
+                    r = softening
+                '''
                 if r <= softening: # collision
                     particles[i].ax = particles[j].ax
                     particles[i].ay = particles[j].ay
@@ -40,13 +42,14 @@ def compute_forces_direct(particles):
                     particles[i].x = particles[j].x
                     particles[i].y = particles[j].y
                     break
+                '''
+                    
+                # Gravitational force
+                f = G * particles[i].mass * particles[j].mass / r**2
                 
-                else :# Gravitational force
-                    f = G * particles[i].mass * particles[j].mass / r**2
-                
-                    # Acceleration components
-                    particles[i].ax += f * dx / (r * particles[i].mass)
-                    particles[i].ay += f * dy / (r * particles[i].mass)
+                # Acceleration components
+                particles[i].ax += f * dx / (r * particles[i].mass)
+                particles[i].ay += f * dy / (r * particles[i].mass)
 
 class QuadTreeNode:
     def __init__(self, cx, cy, size):
@@ -167,6 +170,8 @@ def compute_forces_fmm(particles, domain_size=100.0, theta=0.5):
         ax, ay = root.compute_force(p, theta)
         p.ax += ax
         p.ay += ay
+
+
 
 def update_positions(particles, dt=0.1):
     for p in particles:
@@ -454,7 +459,7 @@ def main():
     
     if choice == '1':
         # Benchmark comparison
-        n_particles_list = [10, 50, 100, 500, 1000, 5000]
+        n_particles_list = [100, 500, 1000, 5000, 10000, 50000]
         print("\nBenchmarking both methods...")
         results = benchmark(n_particles_list, 'both')
         plot_results(n_particles_list, results)
