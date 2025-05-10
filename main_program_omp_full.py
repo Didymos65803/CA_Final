@@ -160,7 +160,7 @@ def benchmark(n_list, method='both'):
 
 # Plot results and save
 
-def plot_results(n_list, res, fname='benchmark.png'):
+def plot_results(n_list, res):
     fig,axs=plt.subplots(1,2,figsize=(12,5))
     axs[0].loglog(n_list,res['direct_times'],'o-',label='Direct')
     axs[0].loglog(n_list,res['fmm_times'],'s-',label='FMM')
@@ -168,12 +168,14 @@ def plot_results(n_list, res, fname='benchmark.png'):
     x=np.array(n_list)
     axs[1].loglog(n_list,res['errors'],'o-')
     axs[1].set(xlabel='N',ylabel='Avg Rel Error',title='Accuracy'); axs[1].grid(True)
+    fname = 'benchmark_' + ','.join(str(x) for x in n_list) + '.jpg' 
     plt.tight_layout(); plt.savefig(fname); print(f"Saved {fname}")
 
 # Trajectory & Animation
 
 def simulate_and_animate(n=100, steps=200, method='fmm', theta=0.5,
-                         traj_fname='trajectories.png', anim_fname='simulation.gif'):
+                         traj_fname='trajectories.png'):
+    anim_fname=f'simulation_{n}.gif'
     from tqdm import tqdm
     # 1) Initialize particles
     arr = [Particle(0, 0, mass=1000.0)]
