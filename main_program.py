@@ -18,6 +18,7 @@ class Particle:
         self.vy = vy
         self.ax = 0.0
         self.ay = 0.0
+        self.f = 0.0
 
 # Direct N-body method (O(n²))
 def compute_forces_direct(particles):
@@ -45,11 +46,12 @@ def compute_forces_direct(particles):
                 '''
                     
                 # Gravitational force
-                f = G * particles[i].mass * particles[j].mass / r**2
+                #f = G * particles[i].mass * particles[j].mass / r**2
+                particles[i].f = G * particles[i].mass * particles[j].mass / r**2
                 
                 # Acceleration components
-                particles[i].ax += f * dx / (r * particles[i].mass)
-                particles[i].ay += f * dy / (r * particles[i].mass)
+                particles[i].ax += particles[i].f * dx / (r * particles[i].mass)
+                particles[i].ay += particles[i].f * dy / (r * particles[i].mass)
 
 class QuadTreeNode:
     def __init__(self, cx, cy, size):
@@ -185,16 +187,19 @@ def update_positions(particles, dt=0.1):
         p.y += p.vy * 0.5 * dt
 
 
-def benchmark(n_particles_list, method='both'):
+def performance_comparison(n_particles_list, method='both'):
     results = defaultdict(list)
-    
+    positions_x = []
+    positions_y = []
+    plt.figure(figsize=(24, 4))
+
     for n in n_particles_list:
         # Create particles randomly distributed in a square
         particles = []
         for i in range(n):
-            x = (np.random.random() - 0.5) * 50.0
-            y = (np.random.random() - 0.5) * 50.0
-            mass = np.random.random() * 9.0 + 1.0  # Mass between 1 and 10
+            x = (np.random.random() - 0.5) * 100.0
+            y = (np.random.random() - 0.5) * 100.0
+            mass = np.random.uniform(1.0, 5.0)  # Mass between 1 and 5
             particles.append(Particle(x, y, mass))
         
         # Make a deep copy for comparing the two methods
@@ -216,7 +221,7 @@ def benchmark(n_particles_list, method='both'):
             results['fmm_times'].append(fmm_time)
             print(f"FMM with {n} particles: {fmm_time:.6f} seconds")
         
-        # Calculate error (if comparing both)
+        # Calculate discrapency between two methods
         if method == 'both':
             total_error = 0.0
             for i in range(n):
@@ -226,14 +231,31 @@ def benchmark(n_particles_list, method='both'):
                 ay_error = abs(p_direct.ay - p_fmm.ay)
                 # Relative error norm
                 error = math.sqrt(ax_error**2 + ay_error**2) / (math.sqrt(p_direct.ax**2 + p_direct.ay**2) + 1e-10)
+                #error = abs(p_direct.f - p_fmm.f) / (abs(p_direct.f) + 1e-10)
                 total_error += error
             avg_error = total_error / n
             results['errors'].append(avg_error)
             print(f"Average relative error: {avg_error:.6f}")
-            
+        
+        plt.subplot(1, len(n_particles_list), n_particles_list.index(n)+1)
+        plt.xlim(-50, 50)
+        plt.ylim(-50, 50)
+        plt.grid(True)
+        positions_x.clear()
+        positions_y.clear()
+        positions_x.append([p.x for p in particles])
+        positions_y.append([p.y for p in particles])
+        plt.scatter(positions_x, positions_y, s=particles[i].mass * 3, c='red', alpha=0.7)
+        #plt.axis('equal')
+        plt.title('Particle Initial Positions for n = {}'.format(n))
+
+    # Particle positions
+    #plt.tight_layout()
+    plt.show()
     return results
 
 def plot_results(n_particles_list, results):
+    
     plt.figure(figsize=(16, 6))
     
     # Performance comparison
@@ -282,11 +304,12 @@ def plot_results(n_particles_list, results):
     plt.tight_layout()
     plt.show()
 
+
 def simulate_and_animate(n_particles=100, steps=200, method='fmm', dt=0.1, theta=0.5):
     # Create particles
     particles = []
     # Create a central massive particle
-    particles.append(Particle(0, 0, mass=1000.0))
+    particles.append(Particle(0, 0, mass=100.0))
     
     # Create orbiting particles
     for i in range(1, n_particles):
@@ -452,16 +475,17 @@ def run_real_time_simulation(n_particles=100, method='fmm', dt=0.01, theta=0.5, 
 
 def main():
     print("2D Gravity Simulation: Fast Multipole Method vs Direct N-body")
-    print("\n1. Benchmark performance")
-    print("2. Run simulation result with trajectories")
-    print("3. Run real-time simulation animation")
+    print("\n1. Gravitational force computing performance comparison")
+    print("2. Simulation result with trajectories")
+    print("3. Real-time simulation animation")
     choice = input("Select an option (1/2/3): ")
     
     if choice == '1':
-        # Benchmark comparison
-        n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
-        print("\nBenchmarking both methods...")
-        results = benchmark(n_particles_list, 'both')
+        # Performance comparison
+        #n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
+        n_particles_list = [50, 100, 200, 500, 1000, 2000]
+        print("\nComputing in both methods...")
+        results = performance_comparison(n_particles_list, 'both')
         plot_results(n_particles_list, results)
         
     elif choice == '2':
@@ -480,7 +504,7 @@ def main():
             simulate_and_animate(n_particles=n, method='fmm', theta=theta, steps=steps)
     
     elif choice == '3':
-        # Run real-time interactive simulation
+        # Run real-time simulation
         print("\n1. Direct N-body method")
         print("2. Fast Multipole Method (FMM)")
         sim_choice = input("Select simulation method (1/2): ")
