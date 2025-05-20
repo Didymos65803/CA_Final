@@ -46,7 +46,7 @@ sys.setrecursionlimit(10000)  # deep QuadTree safety
 # Physical constants -----------------------------------------------------------
 # -----------------------------------------------------------------------------
 G: float = 1.0
-SOFTENING: float = 0.01
+SOFTENING: float = 0.1
 SOFT2: float = SOFTENING**2
 DEFAULT_DT: float = 0.02
 
@@ -81,6 +81,52 @@ class Particle:  # noqa: D101 – simple container
 # Direct solver (Python & OpenMP) ---------------------------------------------
 # -----------------------------------------------------------------------------
 
+def accretion(p1: Particle, p2: Particle) -> Particle: # Accretion case
+    """Merge p2 into p1 by conserving momentum and mass."""
+    total_mass = p1.mass + p2.mass
+
+    # Center of mass position
+    x_cm = (p1.mass * p1.x + p2.mass * p2.x) / total_mass
+    y_cm = (p1.mass * p1.y + p2.mass * p2.y) / total_mass
+
+    # Center of mass velocity
+    vx_cm = (p1.mass * p1.vx + p2.mass * p2.vx) / total_mass
+    vy_cm = (p1.mass * p1.vy + p2.mass * p2.vy) / total_mass
+
+    # Update p1 with merged properties
+    p1.x, p1.y = x_cm, y_cm
+    p1.vx, p1.vy = vx_cm, vy_cm
+    p1.mass = total_mass
+
+    return p1  # p2 should be removed externally
+
+def check_collisions(particles: list[Particle]) -> None: 
+    a = 0
+    while a < len(particles):
+        p1 = particles[a]
+        
+        # Check if particle is too close to the central mass at (0, 0)
+        r2_to_center = p1.x * p1.x + p1.y * p1.y
+        if r2_to_center < SOFT2:
+            # Particle falls into the central mass
+            # Optionally: add p1.mass to central mass if you track it
+            particles.pop(a)
+            continue  # Don't increment i, next particle shifts into i
+        
+        # Check for collisions with other particles
+        j = a + 1
+        while j < len(particles):
+            p2 = particles[j]
+            dx = p2.x - p1.x
+            dy = p2.y - p1.y
+            r2 = dx * dx + dy * dy
+            if r2 < SOFT2:
+                accretion(p1, p2) # Accretion case
+                particles.pop(j)  # Remove p2
+                continue  # Recheck new particle at index j
+            j += 1
+        a += 1
+
 def _compute_forces_direct_py(particles: list[Particle]) -> None:
     n = len(particles)
     for i in range(n):
@@ -99,7 +145,6 @@ def _compute_forces_direct_py(particles: list[Particle]) -> None:
             axi += f * dx * inv_r
             ayi += f * dy * inv_r
         pi.ax, pi.ay = axi, ayi
-
 
 def _compute_forces_direct_omp(particles: list[Particle]) -> None:  # noqa: D401
     n = len(particles)
@@ -121,6 +166,7 @@ def _compute_forces_direct_omp(particles: list[Particle]) -> None:  # noqa: D401
 
 
 def compute_forces_direct(particles: list[Particle]) -> None:  # noqa: D401
+    check_collisions(particles)
     if USE_OMP:
         _compute_forces_direct_omp(particles)
     else:
@@ -382,7 +428,7 @@ def animate(args: argparse.Namespace) -> None:
     scat_p = ax.scatter([], [], s=15, c="tab:blue"); scat_s = ax.scatter([], [], s=60, c="red")
 
     def _upd(frame: int):
-        scat_p.set_offsets(np.column_stack(( [xs[i][frame] for i in range(1, n)], [ys[i][frame] for i in range(1, n)] )))
+        scat_p.set_offsets(np.column_stack(([xs[i][frame] for i in range(1, n)], [ys[i][frame] for i in range(1, n)] )))
         scat_s.set_offsets((xs[0][frame], ys[0][frame])); return scat_p, scat_s
 
     ani = FuncAnimation(fig, _upd, frames=steps, interval=30, blit=True)
