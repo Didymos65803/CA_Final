@@ -166,7 +166,6 @@ def _compute_forces_direct_omp(particles: list[Particle]) -> None:  # noqa: D401
 
 
 def compute_forces_direct(particles: list[Particle]) -> None:  # noqa: D401
-    check_collisions(particles)
     if USE_OMP:
         _compute_forces_direct_omp(particles)
     else:
@@ -211,10 +210,6 @@ class QuadTreeNode:  # noqa: D101
             self.total_mass = p.mass
             self.com_x = p.x
             self.com_y = p.y
-            return
-        if self.is_leaf and len(self.particles) < 1:
-            self.particles.append(p)
-            self._update_com(p)
             return
         if self.is_leaf:
             self.is_leaf = False
@@ -297,6 +292,7 @@ def leapfrog_step(
         p.x += p.vx * dt
         p.y += p.vy * dt
     # force
+    #check_collisions(particles)
     compute_forces_direct(particles) if method == "direct" else compute_forces_fmm(particles, theta)
     # kick 2
     for i, p in enumerate(particles):
