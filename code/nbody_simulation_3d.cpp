@@ -210,6 +210,9 @@ public:
     }
 };
 
+// --- Elastic Collision ---
+
+
 // --- Force Calculation ---
 void compute_forces_direct(std::vector<Particle>& particles) {
     #pragma omp parallel for
