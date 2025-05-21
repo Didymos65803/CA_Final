@@ -80,9 +80,9 @@ class Particle:  # noqa: D101 – simple container
 # -----------------------------------------------------------------------------
 # Direct solver (Python & OpenMP) ---------------------------------------------
 # -----------------------------------------------------------------------------
-
-def accretion(p1: Particle, p2: Particle) -> Particle: # Accretion case
-    """Merge p2 into p1 by conserving momentum and mass."""
+'''
+def accretion(p1: Particle, p2: Particle) -> Particle: #Accretion
+    """ Accretion of p2 into p1. """
     total_mass = p1.mass + p2.mass
 
     # Center of mass position
@@ -98,16 +98,44 @@ def accretion(p1: Particle, p2: Particle) -> Particle: # Accretion case
     p1.vx, p1.vy = vx_cm, vy_cm
     p1.mass = total_mass
 
-    return p1  # p2 should be removed externally
+    return p1
+'''
+def collision_elastic(p1: Particle, p2: Particle) -> tuple[Particle, Particle]:
+    """Update velocities of p1 and p2 after an elastic collision."""
+    # Relative position and velocity
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+    dvx = p2.vx - p1.vx
+    dvy = p2.vy - p1.vy
+
+    # Distance squared
+    dist2 = dx * dx + dy * dy
+    #if dist2 == 0:
+        #return  # Avoid division by zero if particles are on top of each other
+
+    # Dot product of relative velocity and position
+    dot = dvx * dx + dvy * dy
+
+    # Compute collision scale
+    mass_sum = p1.mass + p2.mass
+    scale1 = (2 * p2.mass / mass_sum) * dot / dist2
+    scale2 = (2 * p1.mass / mass_sum) * dot / dist2
+
+    # Update velocities (projected along line of centers)
+    p1.vx += scale1 * dx
+    p1.vy += scale1 * dy
+    p2.vx -= scale2 * dx
+    p2.vy -= scale2 * dy
 
 def check_collisions(particles: list[Particle]) -> None: 
-    a = 0
+    r_sink = 0.1
+    a = 1
     while a < len(particles):
         p1 = particles[a]
         
         # Check if particle is too close to the central mass at (0, 0)
         r2_to_center = p1.x * p1.x + p1.y * p1.y
-        if r2_to_center < SOFT2:
+        if r2_to_center < r_sink**2:
             # Particle falls into the central mass
             # Optionally: add p1.mass to central mass if you track it
             particles.pop(a)
@@ -120,9 +148,9 @@ def check_collisions(particles: list[Particle]) -> None:
             dx = p2.x - p1.x
             dy = p2.y - p1.y
             r2 = dx * dx + dy * dy
-            if r2 < SOFT2:
-                accretion(p1, p2) # Accretion case
-                particles.pop(j)  # Remove p2
+            if r2 <= SOFT2:
+                collision_elastic(p1, p2) # Elastic collision
+                #particles.pop(j)  # Remove p2
                 continue  # Recheck new particle at index j
             j += 1
         a += 1
@@ -292,7 +320,7 @@ def leapfrog_step(
         p.x += p.vx * dt
         p.y += p.vy * dt
     # force
-    #check_collisions(particles)
+    check_collisions(particles)
     compute_forces_direct(particles) if method == "direct" else compute_forces_fmm(particles, theta)
     # kick 2
     for i, p in enumerate(particles):
