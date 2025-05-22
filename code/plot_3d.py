@@ -94,15 +94,7 @@ def animate_3d_simulation(trajectory_df, n_total_particles, num_steps, output_fi
     # Determine plot limits from the whole dataset for consistent animation window
     all_x, all_y, all_z = trajectory_df['x'], trajectory_df['y'], trajectory_df['z']
     if not all_x.empty:
-        x_min, x_max = all_x.min(), all_x.max()
-        y_min, y_max = all_y.min(), all_y.max()
-        z_min, z_max = all_z.min(), all_z.max()
-
-        center_x, center_y, center_z = (x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2
-        max_range = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.6
-        ax.set_xlim(center_x - max_range, center_x + max_range)
-        ax.set_ylim(center_y - max_range, center_y + max_range)
-        ax.set_zlim(center_z - max_range, center_z + max_range)
+        ax.set_xlim(-50, 50); ax.set_ylim(-50, 50); ax.set_zlim(-50, 50)
     else:
         ax.set_xlim(-50, 50); ax.set_ylim(-50, 50); ax.set_zlim(-50, 50)
         
