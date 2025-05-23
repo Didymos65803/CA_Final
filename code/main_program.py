@@ -6,6 +6,7 @@ from collections import defaultdict
 import math
 from scipy.stats import linregress
 
+
 # Constants
 G = 1.0  # gravitational constant
 softening = 0.01  # softening parameter to avoid singularities
@@ -263,7 +264,6 @@ def plot_results(n_particles_list, results):
     # Scale the theoretical curves to match the actual data
     scale_factor_direct = results['direct_times'][0] / (n_particles_list[0]**2)
     scale_factor_fmm = results['fmm_times'][0] / (n_particles_list[0] * np.log(n_particles_list[0]))
-    #scale_factor_fmm = results['fmm_times'][0] / (np.log2(n_particles_list[0]))
     #scale_factor_fmm = np.mean([results['fmm_times'][i] / (n * np.log2(n))for i, n in enumerate(n_particles_list)])
     
     plt.plot(x, scale_factor_direct * x**2, '--', label='O(n²) reference')
@@ -471,7 +471,7 @@ def main():
         # Performance comparison
         #n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
         #n_particles_list = [100, 200, 500, 1000, 2000, 4000, 5000]
-        n_particles_list = [1000, 2000, 5000, 7000, 10000]
+        n_particles_list = [100, 200, 500, 1000, 2000, 5000, 7000, 10000, 20000]
         print("\nComputing in both methods...")
         results = performance_comparison(n_particles_list, 'both')
         plot_results(n_particles_list, results)
