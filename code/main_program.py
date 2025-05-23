@@ -4,6 +4,7 @@ import time
 from matplotlib.animation import FuncAnimation
 from collections import defaultdict
 import math
+from scipy.stats import linregress
 
 # Constants
 G = 1.0  # gravitational constant
@@ -34,16 +35,6 @@ def compute_forces_direct(particles):
                 r = np.sqrt(dx*dx + dy*dy)
                 if r < softening:
                     r = softening
-                '''
-                if r <= softening: # collision
-                    particles[i].ax = particles[j].ax
-                    particles[i].ay = particles[j].ay
-                    particles[i].vx = particles[j].vx
-                    particles[i].vy = particles[j].vy
-                    particles[i].x = particles[j].x
-                    particles[i].y = particles[j].y
-                    break
-                '''
                     
                 # Gravitational force
                 #f = G * particles[i].mass * particles[j].mass / r**2
@@ -256,28 +247,24 @@ def performance_comparison(n_particles_list, method='both'):
 
 def plot_results(n_particles_list, results):
     
-    plt.figure(figsize=(16, 6))
+    # fitting the data in log-log
+    log_n = np.log(n_particles_list)
+    log_direct = np.log(results['direct_times'])
+    log_fmm = np.log(results['fmm_times'])
+    slope_direct, *_ = linregress(log_n, log_direct)
+    slope_fmm, *_ = linregress(log_n, log_fmm)
+    print(f"Empirical slope (Direct): ~{slope_direct:.2f}")
+    print(f"Empirical slope (FMM): ~{slope_fmm:.2f}")
+
+    plt.figure(figsize=(12, 6))
     
     # Performance comparison
-    plt.subplot(1, 2, 1)
-    plt.plot(n_particles_list, results['direct_times'], 'o-', label='Direct N-body')
-    plt.plot(n_particles_list, results['fmm_times'], 's-', label='FMM')
-    plt.xlabel('Number of Particles')
-    plt.ylabel('Computation Time (seconds)')
-    plt.title('Performance Comparison')
-    plt.legend()
-    plt.grid(True)
-    plt.xscale('log')
-    plt.yscale('log')
-    
-    # Scaling analysis
-    plt.subplot(1, 2, 2)
-    
-    # Theoretical complexity lines
     x = np.array(n_particles_list)
     # Scale the theoretical curves to match the actual data
     scale_factor_direct = results['direct_times'][0] / (n_particles_list[0]**2)
     scale_factor_fmm = results['fmm_times'][0] / (n_particles_list[0] * np.log(n_particles_list[0]))
+    #scale_factor_fmm = results['fmm_times'][0] / (np.log2(n_particles_list[0]))
+    scale_factor_fmm = np.mean([results['fmm_times'][i] / (n * np.log2(n))for i, n in enumerate(n_particles_list)])
     
     plt.plot(x, scale_factor_direct * x**2, '--', label='O(n²) reference')
     plt.plot(x, scale_factor_fmm * x * np.log(x), '--', label='O(n log n) reference')
@@ -286,12 +273,12 @@ def plot_results(n_particles_list, results):
     
     plt.xlabel('Number of Particles')
     plt.ylabel('Computation Time (seconds)')
-    plt.title('Scaling Analysis')
+    plt.title('Performance Comparison and Scaling Analysis')
     plt.legend()
     plt.grid(True)
     plt.xscale('log')
     plt.yscale('log')
-    
+    '''
     if 'errors' in results:
         plt.figure(figsize=(8, 6))
         plt.plot(n_particles_list, results['errors'], 'o-')
@@ -300,7 +287,7 @@ def plot_results(n_particles_list, results):
         plt.title('FMM Accuracy vs. Direct Method')
         plt.grid(True)
         plt.xscale('log')
-    
+    '''
     plt.tight_layout()
     plt.show()
 
@@ -483,7 +470,7 @@ def main():
     if choice == '1':
         # Performance comparison
         #n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
-        n_particles_list = [50, 100, 200, 500, 1000, 2000]
+        n_particles_list = [100, 200, 500, 750, 1000, 2000, 4000, 5000]
         print("\nComputing in both methods...")
         results = performance_comparison(n_particles_list, 'both')
         plot_results(n_particles_list, results)
