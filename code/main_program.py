@@ -264,7 +264,7 @@ def plot_results(n_particles_list, results):
     scale_factor_direct = results['direct_times'][0] / (n_particles_list[0]**2)
     scale_factor_fmm = results['fmm_times'][0] / (n_particles_list[0] * np.log(n_particles_list[0]))
     #scale_factor_fmm = results['fmm_times'][0] / (np.log2(n_particles_list[0]))
-    scale_factor_fmm = np.mean([results['fmm_times'][i] / (n * np.log2(n))for i, n in enumerate(n_particles_list)])
+    #scale_factor_fmm = np.mean([results['fmm_times'][i] / (n * np.log2(n))for i, n in enumerate(n_particles_list)])
     
     plt.plot(x, scale_factor_direct * x**2, '--', label='O(n²) reference')
     plt.plot(x, scale_factor_fmm * x * np.log(x), '--', label='O(n log n) reference')
@@ -470,7 +470,8 @@ def main():
     if choice == '1':
         # Performance comparison
         #n_particles_list = [100, 500, 1000, 5000, 10000, 20000]
-        n_particles_list = [100, 200, 500, 750, 1000, 2000, 4000, 5000]
+        #n_particles_list = [100, 200, 500, 1000, 2000, 4000, 5000]
+        n_particles_list = [1000, 2000, 5000, 7000, 10000]
         print("\nComputing in both methods...")
         results = performance_comparison(n_particles_list, 'both')
         plot_results(n_particles_list, results)
