@@ -4,7 +4,6 @@ import time
 from collections import defaultdict
 import math
 from scipy.stats import linregress
-import cmath
 
 # Constants
 G = 1.0  # gravitational constant
@@ -496,34 +495,23 @@ def plot_results(n_particles_list, results):
     plt.tight_layout()
     plt.show()
 
+def plot_fmm_scaling(n_particles, results):
 
-if __name__ == "__main__":
-    # Test with different particle counts
-    n_particles_small = [100, 500, 1000, 2000, 5000]  # Smaller for direct comparison
-    n_particles_large = [5000, 7500, 10000, 20000, 50000]  # Larger for FMM scaling
-    
-    print("Performance comparison with direct method (smaller N):")
-    results_small = performance_comparison(n_particles_small, 'all')
-    
-    print("\nPerformance comparison for large N (FMM vs Barnes-Hut):")
-    results_large = performance_comparison(n_particles_large, method='fmm')
-    
-    # Plot results
-    plot_results(n_particles_small, results_small)
-    #plot_results(n_particles_large, results_large)
-    
-    
-    # Plot large N results
     plt.figure(figsize=(10, 6))
     plt.loglog(n_particles_large, results_large['fmm_times'], '^-', label='FMM O(N)', color='green', linewidth=2)
-    
+    plt.loglog(n_particles_large, results_large['bh_times'], 's-', label='Barnes-Hut O(N log N)', color='blue', linewidth=2)
+
     # Theoretical O(N) scaling
     scale_fmm = results_large['fmm_times'][0] / n_particles_large[0]
+    scale_bh = results_large['bh_times'][0] / (n_particles_large[0] * np.log(n_particles_large[0]))
     plt.loglog(n_particles_large, [scale_fmm * n for n in n_particles_large], '--', color='green', alpha=0.7, label='Theoretical O(N)')
+    plt.loglog(n_particles_large, [scale_bh * n * np.log(n) for n in n_particles_large], '--', color='blue', alpha=0.7, label='Theoretical O(N log N)')
     
     # Fit and display empirical scaling
     log_n = np.log(n_particles_large)
     log_times = np.log(results_large['fmm_times'])
+    slope, intercept, r_value, p_value, std_err = linregress(log_n, np.log(results_large['bh_times']))
+    print(f"\nEmpirical Barnes-Hut scaling: O(N log N) {slope:.2f} with R² = {r_value**2:.3f}")
     slope, intercept, r_value, p_value, std_err = linregress(log_n, log_times)
     print(f"\nEmpirical FMM scaling: O(N^{slope:.2f}) with R² = {r_value**2:.3f}")
     
@@ -533,4 +521,18 @@ if __name__ == "__main__":
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
+
+if __name__ == "__main__":
+    # Test with different particle counts
+    n_particles_small = [100, 300, 500, 750, 1000, 2000, 5000]  # Smaller for direct comparison
+    n_particles_large = [5000, 7000, 8500, 10000, 20000, 30000, 40000, 50000, 100000]  # Larger for FMM scaling
     
+    print("Performance comparison with direct method (smaller N):")
+    results_small = performance_comparison(n_particles_small, 'all')
+    
+    print("\nPerformance comparison for large N (FMM vs Barnes-Hut):")
+    results_large = performance_comparison(n_particles_large, method='fmm')
+    
+    # Plot results
+    plot_results(n_particles_small, results_small)
+    plot_fmm_scaling(n_particles_large, results_large)
