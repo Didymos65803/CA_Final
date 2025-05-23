@@ -49,7 +49,7 @@ struct Particle {
 class OctreeNode {
 public:
     double cx, cy, cz, size; 
-    std::vector<std::unique_ptr<OctreeNode>> children;
+    std::vector<std::unique_ptr<OctreeNode> > children;
     std::vector<Particle*> node_particles; 
 
     double total_mass;
