@@ -94,7 +94,6 @@ plt.tight_layout()
 plt.savefig('energy_vs_step.png', dpi=300)
 
 print('Saved snapshot.png and energy_vs_step.png')
-```python
 """Minimal test harness for the Barnes–Hut OpenMP kernel."""
 import numpy as np
 import matplotlib.pyplot as plt
