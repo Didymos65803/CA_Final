@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import time
 from collections import defaultdict
 import math
-from scipy.stats import linregress
 
 # Constants
 G = 1.0  # gravitational constant
