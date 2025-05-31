@@ -93,16 +93,35 @@ void eval(Cell* n,const std::vector<double>& x,const std::vector<double>& y,cons
 // ----------------—— Python wrapper ——----------------
 py::tuple fmm_omp(py::array_t<double> x,py::array_t<double> y,py::array_t<double> m,
                   double dom,double theta=0.5,double G=1.0,double soft=0.05,int maxLeaf=16){
-    size_t N=x.size(); std::vector<double> vx(x.data(),x.data()+N), vy(y.data(),y.data()+N), vm(m.data(),m.data()+N);
-    std::vector<double> ax(N,0), ay(N,0);
-    Cell* root=new Cell(0,0,dom/2);
-    root->idx.resize(N); std::iota(root->idx.begin(),root->idx.end(),0);
-    subdiv(root,vx,vy,maxLeaf);
-    upward(root,vx,vy,vm); build_M2L(root,root,theta); downward(root);
-    eval(root,vx,vy,vm,ax,ay,G,soft*soft); delete root;
-    return py::make_tuple(py::array(ax.size(),ax.data()),py::array(ay.size(),ay.data()));
+    size_t N=x.size();
+    std::vector<double> vx(x.data(), x.data()+N);
+    std::vector<double> vy(y.data(), y.data()+N);
+    std::vector<double> vm(m.data(), m.data()+N);
+    std::vector<double> ax(N,0.0), ay(N,0.0);
+
+    Cell* root = new Cell(0,0,dom/2);
+    root->idx.resize(N);
+    std::iota(root->idx.begin(), root->idx.end(), 0);
+
+    subdiv(root, vx, vy, maxLeaf);
+    upward(root, vx, vy, vm);
+    build_M2L(root, root, theta);
+    downward(root);
+    eval(root, vx, vy, vm, ax, ay, G, soft*soft);
+    delete root;
+
+    // ---- copy into NumPy memory to avoid dangling pointers ----
+    py::array_t<double> ax_out(N), ay_out(N);
+    auto pax=ax_out.mutable_unchecked<1>();
+    auto pay=ay_out.mutable_unchecked<1>();
+    for(size_t i=0;i<N;++i){ pax(i)=ax[i]; pay(i)=ay[i]; }
+
+    return py::make_tuple(ax_out, ay_out);
 }
-PYBIND11_MODULE(fmm_kernel,m){ m.doc()="2‑D FMM P=4 (binom‑safe)";
-    m.def("fmm_omp",&fmm_omp,py::arg("x"),py::arg("y"),py::arg("m"),py::arg("domain"),
-          py::arg("theta")=0.5,py::arg("G")=1.0,py::arg("soft")=0.05,py::arg("maxLeaf")=16);
+
+PYBIND11_MODULE(fmm_kernel,m){
+    m.doc() = "2-D FMM P=4 (binom‑safe, owns memory)";
+    m.def("fmm_omp", &fmm_omp,
+          py::arg("x"), py::arg("y"), py::arg("m"), py::arg("domain"),
+          py::arg("theta")=0.5, py::arg("G")=1.0, py::arg("soft")=0.05, py::arg("maxLeaf")=16);
 }
