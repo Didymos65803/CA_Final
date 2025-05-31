@@ -25,8 +25,7 @@ def plot_positions(traj_file, step, output_png):
 
     plt.xlabel("x")
     plt.ylabel("y")
-    plt.xlim(-200, 200)  # Adjust as needed based on expected range
-    plt.ylim(-200, 200)  # Adjust as needed based on expected range
+   
     plt.title(f"Asteroid Belt at Step {step}")
     plt.legend()
     plt.axis('equal')
@@ -51,7 +50,7 @@ def plot_radial_histogram(traj_file, step, bins, output_png):
     plt.hist(radii, bins=bins, edgecolor='black')
     plt.xlabel("Radius")
     plt.ylabel("Number of Asteroids")
-    plt.xlim(0, 200)  # Adjust as needed based on expected radius range
+    
     plt.title(f"Radial Distribution at Step {step}")
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
