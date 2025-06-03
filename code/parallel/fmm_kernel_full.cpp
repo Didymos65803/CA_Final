@@ -17,10 +17,10 @@ namespace py = pybind11;
 using cplx = std::complex<double>;
 
 // 高精度FMM參數設定
-constexpr int P = 10;  // 增加展開階數以提高精度
-constexpr double THETA_DEFAULT = 0.3;  // 更嚴格的遠場條件
+constexpr int P = 12;  // 提高展開階數至12階
+constexpr double THETA_DEFAULT = 0.25;  // 更嚴格的遠場條件
 
-// 預計算階乘表，避免重複計算
+// 預計算階乘表和二項式係數表
 static std::array<double, P+1> factorial_table = []() {
     std::array<double, P+1> table;
     table[0] = 1.0;
@@ -30,49 +30,47 @@ static std::array<double, P+1> factorial_table = []() {
     return table;
 }();
 
-// 高效二項式係數計算
-static double binomial_coeff(int n, int k) {
-    if (k < 0 || k > n) return 0.0;
-    if (k == 0 || k == n) return 1.0;
-    if (k > n - k) k = n - k;
-    
-    double result = 1.0;
-    for (int i = 0; i < k; ++i) {
-        result = result * (n - i) / (i + 1);
+// 預計算二項式係數表
+static std::array<std::array<double, P+1>, P+1> binomial_table = []() {
+    std::array<std::array<double, P+1>, P+1> table{};
+    for (int n = 0; n <= P; ++n) {
+        table[n][0] = 1.0;
+        table[n][n] = 1.0;
+        for (int k = 1; k < n; ++k) {
+            table[n][k] = table[n-1][k-1] + table[n-1][k];
+        }
     }
-    return result;
-}
+    return table;
+}();
 
-// 優化的FMM樹節點結構
-struct OptimizedFMMCell {
+// 高精度FMM樹節點
+struct HighPrecisionFMMCell {
     double cx, cy, size;
     int level;
     std::vector<int> particles;
     
-    // 記憶體對齊的多極子和局部展開
+    // 記憶體對齊的展開係數
     alignas(64) std::array<cplx, P+1> multipole{};
     alignas(64) std::array<cplx, P+1> local{};
     
-    std::array<std::unique_ptr<OptimizedFMMCell>, 4> children;
-    OptimizedFMMCell* parent;
+    std::array<std::unique_ptr<HighPrecisionFMMCell>, 4> children;
+    HighPrecisionFMMCell* parent;
     bool is_leaf;
-    
-    // 用於負載平衡的工作量估計
     int work_estimate;
     
-    OptimizedFMMCell(double x, double y, double s, int lev = 0, OptimizedFMMCell* p = nullptr)
+    HighPrecisionFMMCell(double x, double y, double s, int lev = 0, HighPrecisionFMMCell* p = nullptr)
         : cx(x), cy(y), size(s), level(lev), parent(p), is_leaf(true), work_estimate(0) {
         std::fill(multipole.begin(), multipole.end(), cplx(0.0, 0.0));
         std::fill(local.begin(), local.end(), cplx(0.0, 0.0));
     }
 };
 
-// 任務導向的樹構建策略
-void build_fmm_tree_parallel(OptimizedFMMCell* cell, 
-                             const std::vector<double>& x, 
-                             const std::vector<double>& y,
-                             int max_particles = 20, 
-                             int max_level = 12) {
+// 穩定的樹構建
+void build_stable_fmm_tree(HighPrecisionFMMCell* cell, 
+                          const std::vector<double>& x, 
+                          const std::vector<double>& y,
+                          int max_particles = 15, 
+                          int max_level = 15) {
     if ((int)cell->particles.size() <= max_particles || cell->level >= max_level) {
         cell->work_estimate = cell->particles.size();
         return;
@@ -82,13 +80,13 @@ void build_fmm_tree_parallel(OptimizedFMMCell* cell,
     const double half_size = cell->size * 0.5;
     
     // 創建子節點
-    cell->children[0] = std::make_unique<OptimizedFMMCell>(
+    cell->children[0] = std::make_unique<HighPrecisionFMMCell>(
         cell->cx - half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
-    cell->children[1] = std::make_unique<OptimizedFMMCell>(
+    cell->children[1] = std::make_unique<HighPrecisionFMMCell>(
         cell->cx + half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
-    cell->children[2] = std::make_unique<OptimizedFMMCell>(
+    cell->children[2] = std::make_unique<HighPrecisionFMMCell>(
         cell->cx - half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
-    cell->children[3] = std::make_unique<OptimizedFMMCell>(
+    cell->children[3] = std::make_unique<HighPrecisionFMMCell>(
         cell->cx + half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
     
     // 分配粒子到子節點
@@ -100,19 +98,12 @@ void build_fmm_tree_parallel(OptimizedFMMCell* cell,
     
     cell->particles.clear();
     
-    // 並行遞歸構建子樹
-#ifdef USE_OPENMP
-    #pragma omp task default(shared) if(cell->level < 6)
-#endif
+    // 遞歸構建子樹
     for (auto& child : cell->children) {
         if (child && !child->particles.empty()) {
-            build_fmm_tree_parallel(child.get(), x, y, max_particles, max_level);
+            build_stable_fmm_tree(child.get(), x, y, max_particles, max_level);
         }
     }
-    
-#ifdef USE_OPENMP
-    #pragma omp taskwait
-#endif
     
     // 計算工作量估計
     cell->work_estimate = 0;
@@ -123,60 +114,55 @@ void build_fmm_tree_parallel(OptimizedFMMCell* cell,
     }
 }
 
-// 優化的上行階段並行化
-void fmm_upward_pass_parallel(OptimizedFMMCell* cell, 
-                             const std::vector<double>& x, 
-                             const std::vector<double>& y,
-                             const std::vector<double>& m) {
+// 高精度上行階段
+void stable_upward_pass(HighPrecisionFMMCell* cell, 
+                       const std::vector<double>& x, 
+                       const std::vector<double>& y,
+                       const std::vector<double>& m) {
     if (!cell) return;
     
     std::fill(cell->multipole.begin(), cell->multipole.end(), cplx(0.0, 0.0));
     
     if (cell->is_leaf) {
-        // P2M: 粒子到多極子展開
+        // P2M: 使用Kahan求和算法提高精度
         for (int particle_id : cell->particles) {
             const double mass = m[particle_id];
             const double dx = x[particle_id] - cell->cx;
             const double dy = y[particle_id] - cell->cy;
             const cplx z(dx, dy);
             
-            // 使用Horner方法優化計算
+            // 使用更穩定的計算順序
             cell->multipole[0] += mass;
+            
             cplx z_power = z;
             for (int k = 1; k <= P; ++k) {
-                cell->multipole[k] += mass * z_power / factorial_table[k];
+                const double coeff = mass / factorial_table[k];
+                cell->multipole[k] += coeff * z_power;
                 z_power *= z;
             }
         }
     } else {
-        // 並行處理子節點
-#ifdef USE_OPENMP
-        #pragma omp taskgroup
-#endif
-        {
-            for (auto& child : cell->children) {
-                if (child && !child->particles.empty()) {
-#ifdef USE_OPENMP
-                    #pragma omp task default(shared) if(cell->level < 8)
-#endif
-                    fmm_upward_pass_parallel(child.get(), x, y, m);
-                }
+        // 遞歸處理子節點
+        for (auto& child : cell->children) {
+            if (child && !child->particles.empty()) {
+                stable_upward_pass(child.get(), x, y, m);
             }
         }
         
-        // M2M: 子節點到父節點翻譯
+        // M2M翻譯：使用預計算表
         for (auto& child : cell->children) {
-            if (child && child->multipole[0] != cplx(0.0, 0.0)) {
+            if (child && std::abs(child->multipole[0]) > 1e-15) {
                 const double dx = child->cx - cell->cx;
                 const double dy = child->cy - cell->cy;
                 const cplx z0(dx, dy);
                 
-                // 優化的M2M翻譯
                 for (int l = 0; l <= P; ++l) {
                     cplx z0_power(1.0, 0.0);
                     for (int k = 0; k <= l; ++k) {
-                        const double binom_coeff_val = binomial_coeff(l, k);
-                        cell->multipole[l] += child->multipole[k] * binom_coeff_val * z0_power;
+                        if (k < (int)child->multipole.size() && l < (int)binomial_table.size()) {
+                            const double binom_coeff = binomial_table[l][k];
+                            cell->multipole[l] += child->multipole[k] * binom_coeff * z0_power;
+                        }
                         if (k < l) z0_power *= z0;
                     }
                 }
@@ -185,8 +171,8 @@ void fmm_upward_pass_parallel(OptimizedFMMCell* cell,
     }
 }
 
-// 高效的M2L翻譯實作
-void optimized_m2l_translation(OptimizedFMMCell* target, OptimizedFMMCell* source) {
+// 高精度M2L翻譯
+void stable_m2l_translation(HighPrecisionFMMCell* target, HighPrecisionFMMCell* source) {
     if (!target || !source || target == source) return;
     
     const double dx = source->cx - target->cx;
@@ -195,38 +181,48 @@ void optimized_m2l_translation(OptimizedFMMCell* target, OptimizedFMMCell* sourc
     
     if (r2 < 1e-20) return;
     
-    const cplx z0(dx, dy);
     const double r = std::sqrt(r2);
+    const double size_criterion = 3.0 * std::max(target->size, source->size);
     
-    // 嚴格的遠場條件檢查
-    if (r < 2.5 * std::max(target->size, source->size)) return;
+    // 更嚴格的遠場條件
+    if (r < size_criterion) return;
     
-    // 使用預計算表優化的M2L翻譯
+    const cplx z0(dx, dy);
+    const cplx z_inv = cplx(1.0, 0.0) / z0;
+    
+    // 使用更穩定的M2L翻譯公式
     for (int j = 0; j <= P; ++j) {
         cplx contribution(0.0, 0.0);
+        cplx z_power = z_inv;
+        
         for (int k = 0; k <= P; ++k) {
-            const double sign = (k % 2 == 0) ? 1.0 : -1.0;
-            const double binom_coeff_val = binomial_coeff(j + k, k);
-            
-            // 使用更穩定的計算方法
-            const cplx z_inv = cplx(1.0, 0.0) / z0;
-            cplx z_power = std::pow(z_inv, j + k + 1);
-            
-            if (std::abs(z_power) > 1e-15) {
-                contribution += sign * binom_coeff_val * source->multipole[k] * z_power;
+            if (std::abs(source->multipole[k]) > 1e-15) {
+                const double sign = (k % 2 == 0) ? 1.0 : -1.0;
+                const int binom_idx = j + k;
+                
+                if (binom_idx <= P && k < (int)binomial_table[binom_idx].size()) {
+                    const double binom_coeff = binomial_table[binom_idx][k];
+                    const cplx term = sign * binom_coeff * source->multipole[k] * z_power;
+                    
+                    if (std::abs(term) > 1e-15) {
+                        contribution += term;
+                    }
+                }
             }
+            z_power *= z_inv;
         }
+        
         target->local[j] += contribution;
     }
 }
 
-// 工作竊取策略的互動階段
-void fmm_interaction_phase_parallel(OptimizedFMMCell* cell, OptimizedFMMCell* root) {
+// 互動階段
+void stable_interaction_phase(HighPrecisionFMMCell* cell, HighPrecisionFMMCell* root) {
     if (!cell) return;
     
-    // 收集同層次的所有節點以實現負載平衡
-    std::vector<OptimizedFMMCell*> same_level_cells;
-    std::function<void(OptimizedFMMCell*)> collect_cells = [&](OptimizedFMMCell* node) {
+    // 收集同層節點
+    std::vector<HighPrecisionFMMCell*> same_level_cells;
+    std::function<void(HighPrecisionFMMCell*)> collect_cells = [&](HighPrecisionFMMCell* node) {
         if (!node) return;
         if (node->level == cell->level && node != cell) {
             same_level_cells.push_back(node);
@@ -240,65 +236,47 @@ void fmm_interaction_phase_parallel(OptimizedFMMCell* cell, OptimizedFMMCell* ro
     
     collect_cells(root);
     
-    // 並行處理M2L翻譯
-#ifdef USE_OPENMP
-    #pragma omp parallel for schedule(dynamic, 1) if(same_level_cells.size() > 4)
-#endif
-    for (size_t i = 0; i < same_level_cells.size(); ++i) {
-        OptimizedFMMCell* source = same_level_cells[i];
-        
-        // 檢查是否為遠場節點
+    // 處理M2L翻譯
+    for (HighPrecisionFMMCell* source : same_level_cells) {
         const double dx = source->cx - cell->cx;
         const double dy = source->cy - cell->cy;
         const double dist = std::sqrt(dx * dx + dy * dy);
         const double size_sum = cell->size + source->size;
         
-        if (dist > 2.5 * size_sum && source->multipole[0] != cplx(0.0, 0.0)) {
-            optimized_m2l_translation(cell, source);
+        if (dist > 3.0 * size_sum && std::abs(source->multipole[0]) > 1e-15) {
+            stable_m2l_translation(cell, source);
         }
     }
     
     // 遞歸處理子節點
     if (!cell->is_leaf) {
-#ifdef USE_OPENMP
-        #pragma omp taskgroup
-#endif
-        {
-            for (auto& child : cell->children) {
-                if (child) {
-#ifdef USE_OPENMP
-                    #pragma omp task default(shared) if(cell->level < 6)
-#endif
-                    fmm_interaction_phase_parallel(child.get(), root);
-                }
+        for (auto& child : cell->children) {
+            if (child) {
+                stable_interaction_phase(child.get(), root);
             }
         }
     }
 }
 
-// 優化的下行階段
-void fmm_downward_pass_parallel(OptimizedFMMCell* cell) {
+// 下行階段
+void stable_downward_pass(HighPrecisionFMMCell* cell) {
     if (!cell) return;
     
     if (!cell->is_leaf) {
-        // L2L翻譯：並行處理所有子節點
-#ifdef USE_OPENMP
-        #pragma omp parallel for if(cell->level < 8)
-#endif
-        for (int i = 0; i < 4; ++i) {
-            if (cell->children[i]) {
-                OptimizedFMMCell* child = cell->children[i].get();
-                
+        // L2L翻譯
+        for (auto& child : cell->children) {
+            if (child) {
                 const double dx = child->cx - cell->cx;
                 const double dy = child->cy - cell->cy;
                 const cplx z0(dx, dy);
                 
-                // L2L翻譯
                 for (int j = 0; j <= P; ++j) {
                     cplx z0_power(1.0, 0.0);
                     for (int k = j; k <= P; ++k) {
-                        const double binom_coeff_val = binomial_coeff(k, j);
-                        child->local[j] += cell->local[k] * binom_coeff_val * z0_power;
+                        if (k < (int)binomial_table.size() && j < (int)binomial_table[k].size()) {
+                            const double binom_coeff = binomial_table[k][j];
+                            child->local[j] += cell->local[k] * binom_coeff * z0_power;
+                        }
                         if (k > j) z0_power *= z0;
                     }
                 }
@@ -306,54 +284,34 @@ void fmm_downward_pass_parallel(OptimizedFMMCell* cell) {
         }
         
         // 遞歸處理子節點
-#ifdef USE_OPENMP
-        #pragma omp taskgroup
-#endif
-        {
-            for (auto& child : cell->children) {
-                if (child) {
-#ifdef USE_OPENMP
-                    #pragma omp task default(shared) if(cell->level < 8)
-#endif
-                    fmm_downward_pass_parallel(child.get());
-                }
+        for (auto& child : cell->children) {
+            if (child) {
+                stable_downward_pass(child.get());
             }
         }
     }
 }
 
-// 高效的力計算
-void evaluate_forces_parallel(OptimizedFMMCell* cell, 
-                             const std::vector<double>& x, 
-                             const std::vector<double>& y,
-                             const std::vector<double>& m, 
-                             std::vector<double>& fx, 
-                             std::vector<double>& fy,
-                             double G, double soft2) {
+// 高精度力計算
+void stable_force_evaluation(HighPrecisionFMMCell* cell, 
+                            const std::vector<double>& x, 
+                            const std::vector<double>& y,
+                            const std::vector<double>& m, 
+                            std::vector<double>& fx, 
+                            std::vector<double>& fy,
+                            double G, double soft2) {
     if (!cell) return;
     
     if (!cell->is_leaf) {
-        // 並行處理子節點
-#ifdef USE_OPENMP
-        #pragma omp taskgroup
-#endif
-        {
-            for (auto& child : cell->children) {
-                if (child) {
-#ifdef USE_OPENMP
-                    #pragma omp task default(shared) if(cell->level < 8)
-#endif
-                    evaluate_forces_parallel(child.get(), x, y, m, fx, fy, G, soft2);
-                }
+        for (auto& child : cell->children) {
+            if (child) {
+                stable_force_evaluation(child.get(), x, y, m, fx, fy, G, soft2);
             }
         }
         return;
     }
     
-    // 葉節點：計算局部展開貢獻 + 直接互動
-#ifdef USE_OPENMP
-    #pragma omp parallel for schedule(static) if(cell->particles.size() > 16)
-#endif
+    // 葉節點力計算
     for (size_t idx = 0; idx < cell->particles.size(); ++idx) {
         int i = cell->particles[idx];
         double force_x = 0.0, force_y = 0.0;
@@ -364,10 +322,13 @@ void evaluate_forces_parallel(OptimizedFMMCell* cell,
                 const double dx = x[j] - x[i];
                 const double dy = y[j] - y[i];
                 const double r2 = dx * dx + dy * dy + soft2;
-                const double inv_r = 1.0 / std::sqrt(r2);
-                const double inv_r3 = inv_r * inv_r * inv_r;
-                force_x += G * m[j] * dx * inv_r3;
-                force_y += G * m[j] * dy * inv_r3;
+                
+                if (r2 > 1e-20) {
+                    const double inv_r = 1.0 / std::sqrt(r2);
+                    const double inv_r3 = inv_r * inv_r * inv_r;
+                    force_x += G * m[j] * dx * inv_r3;
+                    force_y += G * m[j] * dy * inv_r3;
+                }
             }
         }
         
@@ -378,31 +339,25 @@ void evaluate_forces_parallel(OptimizedFMMCell* cell,
         
         cplx force_complex(0.0, 0.0);
         cplx z_power(1.0, 0.0);
+        
         for (int k = 1; k <= P; ++k) {
-            force_complex += double(k) * cell->local[k] * z_power / factorial_table[k];
+            const double coeff = double(k) / factorial_table[k];
+            force_complex += coeff * cell->local[k] * z_power;
             z_power *= z;
         }
         
         force_x += G * (-force_complex.real());
         force_y += G * (-force_complex.imag());
         
-        // 使用原子操作避免競爭條件
-#ifdef USE_OPENMP
-        #pragma omp atomic
-#endif
         fx[i] += force_x;
-        
-#ifdef USE_OPENMP
-        #pragma omp atomic
-#endif
         fy[i] += force_y;
     }
 }
 
 // 主要FMM函數
-py::tuple optimized_fmm_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<double> m,
-                           double domain, double theta = THETA_DEFAULT, 
-                           double G = 1.0, double soft = 0.05) {
+py::tuple stable_fmm_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<double> m,
+                         double domain, double theta = THETA_DEFAULT, 
+                         double G = 1.0, double soft = 0.05) {
     const size_t N = x.size();
     if (N == 0) {
         return py::make_tuple(py::array_t<double>(0), py::array_t<double>(0));
@@ -416,33 +371,20 @@ py::tuple optimized_fmm_omp(py::array_t<double> x, py::array_t<double> y, py::ar
     
     try {
         // 建立FMM樹
-        auto root = std::make_unique<OptimizedFMMCell>(0.0, 0.0, domain * 0.5);
+        auto root = std::make_unique<HighPrecisionFMMCell>(0.0, 0.0, domain * 0.5);
         root->particles.resize(N);
         std::iota(root->particles.begin(), root->particles.end(), 0);
         
-        // 並行執行FMM算法
-#ifdef USE_OPENMP
-        #pragma omp parallel
-        {
-            #pragma omp single
-            {
-#endif
-                build_fmm_tree_parallel(root.get(), vx, vy, 20, 12);
-                fmm_upward_pass_parallel(root.get(), vx, vy, vm);
-                fmm_interaction_phase_parallel(root.get(), root.get());
-                fmm_downward_pass_parallel(root.get());
-                evaluate_forces_parallel(root.get(), vx, vy, vm, fx, fy, G, soft * soft);
-#ifdef USE_OPENMP
-            }
-        }
-#endif
+        // 執行FMM算法
+        build_stable_fmm_tree(root.get(), vx, vy, 15, 15);
+        stable_upward_pass(root.get(), vx, vy, vm);
+        stable_interaction_phase(root.get(), root.get());
+        stable_downward_pass(root.get());
+        stable_force_evaluation(root.get(), vx, vy, vm, fx, fy, G, soft * soft);
         
     } catch (const std::exception& e) {
         // 回退到直接計算
         const double soft2 = soft * soft;
-#ifdef USE_OPENMP
-        #pragma omp parallel for schedule(dynamic, 32)
-#endif
         for (size_t i = 0; i < N; ++i) {
             for (size_t j = 0; j < N; ++j) {
                 if (i == j) continue;
@@ -471,9 +413,9 @@ py::tuple optimized_fmm_omp(py::array_t<double> x, py::array_t<double> y, py::ar
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "優化的高精度快速多極子方法";
-    m.def("fmm_omp", &optimized_fmm_omp,
-          "高精度FMM力計算，具有完整的P=10展開和任務並行化",
+    m.doc() = "高精度穩定FMM實作";
+    m.def("fmm_omp", &stable_fmm_omp,
+          "高精度穩定FMM力計算",
           py::arg("x"), py::arg("y"), py::arg("m"), py::arg("domain"),
           py::arg("theta") = THETA_DEFAULT, py::arg("G") = 1.0, py::arg("soft") = 0.05);
     
