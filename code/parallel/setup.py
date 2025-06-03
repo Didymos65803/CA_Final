@@ -17,6 +17,12 @@ print(f"Building for {system}")
 # Base compiler arguments
 base_args = ["-std=c++17", "-O3", "-DNDEBUG"]
 base_link_args = []
+base_args.extend([
+    "-fno-finite-math-only",     # 保留NaN和無限值處理
+    "-fno-unsafe-math-optimizations",  # 禁用不安全的數學優化
+    "-fno-associative-math",     # 保持運算順序
+    "-fno-reciprocal-math"       # 避免除法優化導致的精度損失
+])
 
 # System-specific optimizations
 if system == "Linux":
@@ -63,7 +69,7 @@ ext_modules = [
 
 setup(
     name="nbody_kernels",
-    version="1.0.0",
+    version="2.0.0",
     description="High-precision N-body simulation kernels",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},

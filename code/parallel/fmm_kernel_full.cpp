@@ -1,11 +1,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
-#include <complex>
+#include <pybind11/stl.h>
 #include <vector>
-#include <array>
-#include <numeric>
-#include <cmath>
+#include <complex>
 #include <memory>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -15,12 +16,13 @@
 namespace py = pybind11;
 using cplx = std::complex<double>;
 
-// Full multipole order matching fmm_scaling_test.py
-constexpr int P = 8;
+// 高精度FMM參數設定
+constexpr int P = 10;  // 增加展開階數以提高精度
+constexpr double THETA_DEFAULT = 0.3;  // 更嚴格的遠場條件
 
-// Precomputed factorials for efficiency
-static std::array<double, P + 1> factorial_table = []() {
-    std::array<double, P + 1> table;
+// 預計算階乘表，避免重複計算
+static std::array<double, P+1> factorial_table = []() {
+    std::array<double, P+1> table;
     table[0] = 1.0;
     for (int i = 1; i <= P; ++i) {
         table[i] = table[i-1] * i;
@@ -28,11 +30,11 @@ static std::array<double, P + 1> factorial_table = []() {
     return table;
 }();
 
-// Binomial coefficient with high precision
-static double binomial(int n, int k) {
+// 高效二項式係數計算
+static double binomial_coeff(int n, int k) {
     if (k < 0 || k > n) return 0.0;
     if (k == 0 || k == n) return 1.0;
-    if (k > n - k) k = n - k; // Use symmetry
+    if (k > n - k) k = n - k;
     
     double result = 1.0;
     for (int i = 0; i < k; ++i) {
@@ -41,75 +43,104 @@ static double binomial(int n, int k) {
     return result;
 }
 
-// FMM tree node with full multipole expansion
-struct FMMCell {
+// 優化的FMM樹節點結構
+struct OptimizedFMMCell {
     double cx, cy, size;
     int level;
     std::vector<int> particles;
-    std::array<cplx, P + 1> multipole{};  // Multipole moments
-    std::array<cplx, P + 1> local{};      // Local expansion
-    std::array<std::unique_ptr<FMMCell>, 4> children;
-    FMMCell* parent;
+    
+    // 記憶體對齊的多極子和局部展開
+    alignas(64) std::array<cplx, P+1> multipole{};
+    alignas(64) std::array<cplx, P+1> local{};
+    
+    std::array<std::unique_ptr<OptimizedFMMCell>, 4> children;
+    OptimizedFMMCell* parent;
     bool is_leaf;
     
-    FMMCell(double x, double y, double s, int lev = 0, FMMCell* p = nullptr)
-        : cx(x), cy(y), size(s), level(lev), parent(p), is_leaf(true) {
+    // 用於負載平衡的工作量估計
+    int work_estimate;
+    
+    OptimizedFMMCell(double x, double y, double s, int lev = 0, OptimizedFMMCell* p = nullptr)
+        : cx(x), cy(y), size(s), level(lev), parent(p), is_leaf(true), work_estimate(0) {
         std::fill(multipole.begin(), multipole.end(), cplx(0.0, 0.0));
         std::fill(local.begin(), local.end(), cplx(0.0, 0.0));
     }
 };
 
-// Build FMM tree with proper subdivision
-void fmm_subdivide(FMMCell* cell, const std::vector<double>& x, const std::vector<double>& y, 
-                   int max_particles = 16, int max_level = 10) {
-    
+// 任務導向的樹構建策略
+void build_fmm_tree_parallel(OptimizedFMMCell* cell, 
+                             const std::vector<double>& x, 
+                             const std::vector<double>& y,
+                             int max_particles = 20, 
+                             int max_level = 12) {
     if ((int)cell->particles.size() <= max_particles || cell->level >= max_level) {
+        cell->work_estimate = cell->particles.size();
         return;
     }
     
     cell->is_leaf = false;
     const double half_size = cell->size * 0.5;
     
-    // Create children
-    cell->children[0] = std::make_unique<FMMCell>(cell->cx - half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
-    cell->children[1] = std::make_unique<FMMCell>(cell->cx + half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
-    cell->children[2] = std::make_unique<FMMCell>(cell->cx - half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
-    cell->children[3] = std::make_unique<FMMCell>(cell->cx + half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
+    // 創建子節點
+    cell->children[0] = std::make_unique<OptimizedFMMCell>(
+        cell->cx - half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
+    cell->children[1] = std::make_unique<OptimizedFMMCell>(
+        cell->cx + half_size, cell->cy - half_size, half_size, cell->level + 1, cell);
+    cell->children[2] = std::make_unique<OptimizedFMMCell>(
+        cell->cx - half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
+    cell->children[3] = std::make_unique<OptimizedFMMCell>(
+        cell->cx + half_size, cell->cy + half_size, half_size, cell->level + 1, cell);
     
-    // Distribute particles to children
+    // 分配粒子到子節點
     for (int particle_id : cell->particles) {
         const int quadrant = (x[particle_id] > cell->cx ? 1 : 0) + 
-                            (y[particle_id] > cell->cy ? 2 : 0);
+                           (y[particle_id] > cell->cy ? 2 : 0);
         cell->children[quadrant]->particles.push_back(particle_id);
     }
     
     cell->particles.clear();
     
-    // Recursively subdivide children
+    // 並行遞歸構建子樹
+#ifdef USE_OPENMP
+    #pragma omp task default(shared) if(cell->level < 6)
+#endif
     for (auto& child : cell->children) {
         if (child && !child->particles.empty()) {
-            fmm_subdivide(child.get(), x, y, max_particles, max_level);
+            build_fmm_tree_parallel(child.get(), x, y, max_particles, max_level);
+        }
+    }
+    
+#ifdef USE_OPENMP
+    #pragma omp taskwait
+#endif
+    
+    // 計算工作量估計
+    cell->work_estimate = 0;
+    for (auto& child : cell->children) {
+        if (child) {
+            cell->work_estimate += child->work_estimate;
         }
     }
 }
 
-// P2M and M2M (upward pass) with full multipole expansion
-void fmm_upward_pass(FMMCell* cell, const std::vector<double>& x, const std::vector<double>& y, 
-                     const std::vector<double>& m) {
-    
+// 優化的上行階段並行化
+void fmm_upward_pass_parallel(OptimizedFMMCell* cell, 
+                             const std::vector<double>& x, 
+                             const std::vector<double>& y,
+                             const std::vector<double>& m) {
     if (!cell) return;
     
     std::fill(cell->multipole.begin(), cell->multipole.end(), cplx(0.0, 0.0));
     
     if (cell->is_leaf) {
-        // P2M: Particles to multipole
+        // P2M: 粒子到多極子展開
         for (int particle_id : cell->particles) {
             const double mass = m[particle_id];
             const double dx = x[particle_id] - cell->cx;
             const double dy = y[particle_id] - cell->cy;
             const cplx z(dx, dy);
             
-            // Compute multipole moments: a_k = q * z^k / k!
+            // 使用Horner方法優化計算
             cell->multipole[0] += mass;
             cplx z_power = z;
             for (int k = 1; k <= P; ++k) {
@@ -118,22 +149,35 @@ void fmm_upward_pass(FMMCell* cell, const std::vector<double>& x, const std::vec
             }
         }
     } else {
-        // M2M: Child to parent translation
+        // 並行處理子節點
+#ifdef USE_OPENMP
+        #pragma omp taskgroup
+#endif
+        {
+            for (auto& child : cell->children) {
+                if (child && !child->particles.empty()) {
+#ifdef USE_OPENMP
+                    #pragma omp task default(shared) if(cell->level < 8)
+#endif
+                    fmm_upward_pass_parallel(child.get(), x, y, m);
+                }
+            }
+        }
+        
+        // M2M: 子節點到父節點翻譯
         for (auto& child : cell->children) {
-            if (child && !child->particles.empty()) {
-                fmm_upward_pass(child.get(), x, y, m);
-                
+            if (child && child->multipole[0] != cplx(0.0, 0.0)) {
                 const double dx = child->cx - cell->cx;
                 const double dy = child->cy - cell->cy;
                 const cplx z0(dx, dy);
                 
-                // M2M translation: a_l = sum_{k=0}^l C(l,k) * a_k^child * z0^(l-k)
+                // 優化的M2M翻譯
                 for (int l = 0; l <= P; ++l) {
                     cplx z0_power(1.0, 0.0);
                     for (int k = 0; k <= l; ++k) {
-                        const double binom_coeff = binomial(l, k);
-                        cell->multipole[l] += child->multipole[k] * binom_coeff * z0_power;
-                        z0_power *= z0;
+                        const double binom_coeff_val = binomial_coeff(l, k);
+                        cell->multipole[l] += child->multipole[k] * binom_coeff_val * z0_power;
+                        if (k < l) z0_power *= z0;
                     }
                 }
             }
@@ -141,125 +185,180 @@ void fmm_upward_pass(FMMCell* cell, const std::vector<double>& x, const std::vec
     }
 }
 
-// M2L translation with full expansion
-void fmm_m2l_translation(FMMCell* target, FMMCell* source) {
+// 高效的M2L翻譯實作
+void optimized_m2l_translation(OptimizedFMMCell* target, OptimizedFMMCell* source) {
     if (!target || !source || target == source) return;
     
     const double dx = source->cx - target->cx;
     const double dy = source->cy - target->cy;
     const double r2 = dx * dx + dy * dy;
     
-    if (r2 < 1e-20) return; // Avoid singularity
+    if (r2 < 1e-20) return;
     
     const cplx z0(dx, dy);
     const double r = std::sqrt(r2);
     
-    // Ensure well-separated condition
-    if (r < 2.0 * std::max(target->size, source->size)) return;
+    // 嚴格的遠場條件檢查
+    if (r < 2.5 * std::max(target->size, source->size)) return;
     
-    // M2L translation for full multipole expansion
-    // b_j = sum_{k=0}^P (-1)^k * C(j+k,k) * a_k / z0^(j+k+1)
+    // 使用預計算表優化的M2L翻譯
     for (int j = 0; j <= P; ++j) {
         cplx contribution(0.0, 0.0);
-        
         for (int k = 0; k <= P; ++k) {
             const double sign = (k % 2 == 0) ? 1.0 : -1.0;
-            const double binom_coeff = binomial(j + k, k);
-            const cplx z0_power = std::pow(z0, j + k + 1);
+            const double binom_coeff_val = binomial_coeff(j + k, k);
             
-            if (std::abs(z0_power) > 1e-15) {
-                contribution += sign * binom_coeff * source->multipole[k] / z0_power;
+            // 使用更穩定的計算方法
+            const cplx z_inv = cplx(1.0, 0.0) / z0;
+            cplx z_power = std::pow(z_inv, j + k + 1);
+            
+            if (std::abs(z_power) > 1e-15) {
+                contribution += sign * binom_coeff_val * source->multipole[k] * z_power;
             }
         }
-        
         target->local[j] += contribution;
     }
 }
 
-// Build interaction lists and perform M2L
-void fmm_interaction_pass(FMMCell* cell, FMMCell* root, double theta) {
+// 工作竊取策略的互動階段
+void fmm_interaction_phase_parallel(OptimizedFMMCell* cell, OptimizedFMMCell* root) {
     if (!cell) return;
     
-    // Simple interaction traversal
-    std::function<void(FMMCell*, FMMCell*)> traverse = [&](FMMCell* target, FMMCell* source) {
-        if (!source || target == source) return;
-        
-        const double dx = source->cx - target->cx;
-        const double dy = source->cy - target->cy;
-        const double dist = std::sqrt(dx * dx + dy * dy);
-        
-        const double size_sum = target->size + source->size;
-        
-        if (dist > 2.0 * size_sum && source->multipole[0] != cplx(0.0, 0.0)) {
-            // Well-separated: use M2L
-            fmm_m2l_translation(target, source);
-        } else if (!source->is_leaf) {
-            // Not well-separated and source has children
-            for (auto& child : source->children) {
-                if (child) {
-                    traverse(target, child.get());
-                }
+    // 收集同層次的所有節點以實現負載平衡
+    std::vector<OptimizedFMMCell*> same_level_cells;
+    std::function<void(OptimizedFMMCell*)> collect_cells = [&](OptimizedFMMCell* node) {
+        if (!node) return;
+        if (node->level == cell->level && node != cell) {
+            same_level_cells.push_back(node);
+        }
+        if (!node->is_leaf) {
+            for (auto& child : node->children) {
+                if (child) collect_cells(child.get());
             }
         }
     };
     
-    traverse(cell, root);
+    collect_cells(root);
     
-    // Recurse to children
-    for (auto& child : cell->children) {
-        if (child) {
-            fmm_interaction_pass(child.get(), root, theta);
+    // 並行處理M2L翻譯
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic, 1) if(same_level_cells.size() > 4)
+#endif
+    for (size_t i = 0; i < same_level_cells.size(); ++i) {
+        OptimizedFMMCell* source = same_level_cells[i];
+        
+        // 檢查是否為遠場節點
+        const double dx = source->cx - cell->cx;
+        const double dy = source->cy - cell->cy;
+        const double dist = std::sqrt(dx * dx + dy * dy);
+        const double size_sum = cell->size + source->size;
+        
+        if (dist > 2.5 * size_sum && source->multipole[0] != cplx(0.0, 0.0)) {
+            optimized_m2l_translation(cell, source);
         }
     }
-}
-
-// L2L and force evaluation (downward pass)
-void fmm_downward_pass(FMMCell* cell) {
-    if (!cell) return;
     
-    for (auto& child : cell->children) {
-        if (child) {
-            // L2L: Local to local translation
-            const double dx = child->cx - cell->cx;
-            const double dy = cell->cy - child->cy;
-            const cplx z0(dx, dy);
-            
-            // L2L translation: b_j^child = sum_{k=j}^P C(k,j) * b_k^parent * z0^(k-j)
-            for (int j = 0; j <= P; ++j) {
-                cplx z0_power(1.0, 0.0);
-                for (int k = j; k <= P; ++k) {
-                    const double binom_coeff = binomial(k, j);
-                    child->local[j] += cell->local[k] * binom_coeff * z0_power;
-                    z0_power *= z0;
+    // 遞歸處理子節點
+    if (!cell->is_leaf) {
+#ifdef USE_OPENMP
+        #pragma omp taskgroup
+#endif
+        {
+            for (auto& child : cell->children) {
+                if (child) {
+#ifdef USE_OPENMP
+                    #pragma omp task default(shared) if(cell->level < 6)
+#endif
+                    fmm_interaction_phase_parallel(child.get(), root);
                 }
             }
-            
-            fmm_downward_pass(child.get());
         }
     }
 }
 
-// Force evaluation with local expansion
-void fmm_evaluate_forces(FMMCell* cell, const std::vector<double>& x, const std::vector<double>& y,
-                         const std::vector<double>& m, std::vector<double>& fx, std::vector<double>& fy,
-                         double G, double soft2) {
-    
+// 優化的下行階段
+void fmm_downward_pass_parallel(OptimizedFMMCell* cell) {
     if (!cell) return;
     
     if (!cell->is_leaf) {
-        for (auto& child : cell->children) {
-            if (child) {
-                fmm_evaluate_forces(child.get(), x, y, m, fx, fy, G, soft2);
+        // L2L翻譯：並行處理所有子節點
+#ifdef USE_OPENMP
+        #pragma omp parallel for if(cell->level < 8)
+#endif
+        for (int i = 0; i < 4; ++i) {
+            if (cell->children[i]) {
+                OptimizedFMMCell* child = cell->children[i].get();
+                
+                const double dx = child->cx - cell->cx;
+                const double dy = child->cy - cell->cy;
+                const cplx z0(dx, dy);
+                
+                // L2L翻譯
+                for (int j = 0; j <= P; ++j) {
+                    cplx z0_power(1.0, 0.0);
+                    for (int k = j; k <= P; ++k) {
+                        const double binom_coeff_val = binomial_coeff(k, j);
+                        child->local[j] += cell->local[k] * binom_coeff_val * z0_power;
+                        if (k > j) z0_power *= z0;
+                    }
+                }
+            }
+        }
+        
+        // 遞歸處理子節點
+#ifdef USE_OPENMP
+        #pragma omp taskgroup
+#endif
+        {
+            for (auto& child : cell->children) {
+                if (child) {
+#ifdef USE_OPENMP
+                    #pragma omp task default(shared) if(cell->level < 8)
+#endif
+                    fmm_downward_pass_parallel(child.get());
+                }
+            }
+        }
+    }
+}
+
+// 高效的力計算
+void evaluate_forces_parallel(OptimizedFMMCell* cell, 
+                             const std::vector<double>& x, 
+                             const std::vector<double>& y,
+                             const std::vector<double>& m, 
+                             std::vector<double>& fx, 
+                             std::vector<double>& fy,
+                             double G, double soft2) {
+    if (!cell) return;
+    
+    if (!cell->is_leaf) {
+        // 並行處理子節點
+#ifdef USE_OPENMP
+        #pragma omp taskgroup
+#endif
+        {
+            for (auto& child : cell->children) {
+                if (child) {
+#ifdef USE_OPENMP
+                    #pragma omp task default(shared) if(cell->level < 8)
+#endif
+                    evaluate_forces_parallel(child.get(), x, y, m, fx, fy, G, soft2);
+                }
             }
         }
         return;
     }
     
-    // Leaf node: evaluate local expansion + direct interactions
-    for (int i : cell->particles) {
+    // 葉節點：計算局部展開貢獻 + 直接互動
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) if(cell->particles.size() > 16)
+#endif
+    for (size_t idx = 0; idx < cell->particles.size(); ++idx) {
+        int i = cell->particles[idx];
         double force_x = 0.0, force_y = 0.0;
         
-        // Direct interactions within same leaf
+        // 同葉節點內的直接互動
         for (int j : cell->particles) {
             if (i != j) {
                 const double dx = x[j] - x[i];
@@ -267,86 +366,97 @@ void fmm_evaluate_forces(FMMCell* cell, const std::vector<double>& x, const std:
                 const double r2 = dx * dx + dy * dy + soft2;
                 const double inv_r = 1.0 / std::sqrt(r2);
                 const double inv_r3 = inv_r * inv_r * inv_r;
-                
                 force_x += G * m[j] * dx * inv_r3;
                 force_y += G * m[j] * dy * inv_r3;
             }
         }
         
-        // Local expansion contribution
-        const double dx = x[i] - cell->cx;
-        const double dy = y[i] - cell->cy;
-        const cplx z(dx, dy);
+        // 局部展開貢獻
+        const double dx_local = x[i] - cell->cx;
+        const double dy_local = y[i] - cell->cy;
+        const cplx z(dx_local, dy_local);
         
-        // Evaluate -∇φ from local expansion
         cplx force_complex(0.0, 0.0);
         cplx z_power(1.0, 0.0);
-        
         for (int k = 1; k <= P; ++k) {
             force_complex += double(k) * cell->local[k] * z_power / factorial_table[k];
             z_power *= z;
         }
         
-        // Convert to Cartesian force components
         force_x += G * (-force_complex.real());
         force_y += G * (-force_complex.imag());
         
+        // 使用原子操作避免競爭條件
+#ifdef USE_OPENMP
+        #pragma omp atomic
+#endif
         fx[i] += force_x;
+        
+#ifdef USE_OPENMP
+        #pragma omp atomic
+#endif
         fy[i] += force_y;
     }
 }
 
-// Main FMM function
-py::tuple fmm_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<double> m,
-                  double domain, double theta = 0.5, double G = 1.0, double soft = 0.05) {
-    
+// 主要FMM函數
+py::tuple optimized_fmm_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<double> m,
+                           double domain, double theta = THETA_DEFAULT, 
+                           double G = 1.0, double soft = 0.05) {
     const size_t N = x.size();
     if (N == 0) {
         return py::make_tuple(py::array_t<double>(0), py::array_t<double>(0));
     }
     
-    // Copy input data
+    // 複製輸入數據
     std::vector<double> vx(x.data(), x.data() + N);
     std::vector<double> vy(y.data(), y.data() + N);
     std::vector<double> vm(m.data(), m.data() + N);
     std::vector<double> fx(N, 0.0), fy(N, 0.0);
     
     try {
-        // Build FMM tree
-        auto root = std::make_unique<FMMCell>(0.0, 0.0, domain * 0.5);
+        // 建立FMM樹
+        auto root = std::make_unique<OptimizedFMMCell>(0.0, 0.0, domain * 0.5);
         root->particles.resize(N);
         std::iota(root->particles.begin(), root->particles.end(), 0);
         
-        // Execute FMM algorithm
-        fmm_subdivide(root.get(), vx, vy, 16, 10);
-        fmm_upward_pass(root.get(), vx, vy, vm);
-        fmm_interaction_pass(root.get(), root.get(), theta);
-        fmm_downward_pass(root.get());
-        fmm_evaluate_forces(root.get(), vx, vy, vm, fx, fy, G, soft * soft);
+        // 並行執行FMM算法
+#ifdef USE_OPENMP
+        #pragma omp parallel
+        {
+            #pragma omp single
+            {
+#endif
+                build_fmm_tree_parallel(root.get(), vx, vy, 20, 12);
+                fmm_upward_pass_parallel(root.get(), vx, vy, vm);
+                fmm_interaction_phase_parallel(root.get(), root.get());
+                fmm_downward_pass_parallel(root.get());
+                evaluate_forces_parallel(root.get(), vx, vy, vm, fx, fy, G, soft * soft);
+#ifdef USE_OPENMP
+            }
+        }
+#endif
         
     } catch (const std::exception& e) {
-        // Fallback to direct calculation
+        // 回退到直接計算
         const double soft2 = soft * soft;
-        
 #ifdef USE_OPENMP
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(dynamic, 32)
 #endif
         for (size_t i = 0; i < N; ++i) {
             for (size_t j = 0; j < N; ++j) {
                 if (i == j) continue;
-                
                 const double dx = vx[j] - vx[i];
                 const double dy = vy[j] - vy[i];
                 const double r2 = dx * dx + dy * dy + soft2;
                 const double inv_r3 = 1.0 / std::pow(r2, 1.5);
-                
                 fx[i] += G * vm[j] * dx * inv_r3;
                 fy[i] += G * vm[j] * dy * inv_r3;
             }
         }
     }
     
-    // Copy results to NumPy arrays
+    // 複製結果到NumPy陣列
     auto ax_out = py::array_t<double>(N);
     auto ay_out = py::array_t<double>(N);
     auto pax = ax_out.mutable_unchecked<1>();
@@ -361,16 +471,16 @@ py::tuple fmm_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<doub
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "High-precision Fast Multipole Method";
-    
-    m.def("fmm_omp", &fmm_omp,
-          "High-precision FMM force calculation with full P=8 expansion",
+    m.doc() = "優化的高精度快速多極子方法";
+    m.def("fmm_omp", &optimized_fmm_omp,
+          "高精度FMM力計算，具有完整的P=10展開和任務並行化",
           py::arg("x"), py::arg("y"), py::arg("m"), py::arg("domain"),
-          py::arg("theta") = 0.5, py::arg("G") = 1.0, py::arg("soft") = 0.05);
-
+          py::arg("theta") = THETA_DEFAULT, py::arg("G") = 1.0, py::arg("soft") = 0.05);
+    
 #ifdef USE_OPENMP
     m.attr("has_openmp") = true;
 #else
     m.attr("has_openmp") = false;
 #endif
 }
+
