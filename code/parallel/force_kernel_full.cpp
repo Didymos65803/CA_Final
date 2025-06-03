@@ -1,191 +1,208 @@
 // force_kernel_full.cpp
 // =====================
 //
-// High-precision direct‐and‐Barnes‐Hut force kernels with OpenMP.
-// This file implements two functions, `direct_omp` and `bh_omp`, both callable from Python.
+// High‐precision Direct (O(N²)) and Barnes‐Hut (O(N log N)) force kernels with OpenMP.
+// Exports two functions to Python: direct_omp(...) and bh_omp(...), plus a flag has_openmp.
 //
-// Build command (in the same folder as setup.py):
-//     python setup.py build_ext --inplace
+// To build (in the same folder as setup.py):
+//     python3.12 setup.py build_ext --inplace
+// That produces: force_kernel.cpython-<ver>-<arch>.so.
 //
-// This will generate a shared library `force_kernel*.so`, which can be imported as `import force_kernel`
-// and will export: `direct_omp(x,y,m,G,soft)`, `bh_omp(x,y,m,domain,theta,G,soft)`, and
-// `force_kernel.has_openmp`.
-//
-// Author: Your Name (2025-06-XX)
+// Author: (Adapted for 2025 coursework)
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <vector>
-#include <memory>
 #include <cmath>
-
-#ifdef _OPENMP
-  #include <omp.h>
-  #define USE_OPENMP
-#endif
+#include <cstdlib>
+#include <limits>
+#include <omp.h>
 
 namespace py = pybind11;
 
-// -----------------------------------------------------------------------------
-// DIRECT N-BODY KERNEL (OMP-parallelized)
-// -----------------------------------------------------------------------------
-py::tuple direct_omp(
-    py::array_t<double> x,
-    py::array_t<double> y,
-    py::array_t<double> m,
-    double              G    = 1.0,
-    double              soft = 0.05
-) {
-    size_t N = x.size();
+// -----------------------------------------------------------------------------------
+// Part 1: Direct‐sum kernel (O(N²))
+// -----------------------------------------------------------------------------------
+//
+// Given N particles at positions (x[i], y[i]) with masses m[i], compute acceleration
+// on each particle via:
+//   a_i = Σ_{j≠i} G * m[j] * ( (pos_j - pos_i) / (|pos_j - pos_i|² + soft²)^(3/2) )
+//
+// We parallelize over the outer loop (each “i”) with OpenMP.  Softening length = soft.
+// Gravity constant = G.
+// -----------------------------------------------------------------------------------
+
+/**
+ * direct_omp(x, y, m, G=1.0, soft=0.01) → (ax, ay)
+ *
+ * Inputs:
+ *   x, y : numpy arrays of length N (dtype=float64)
+ *   m    : numpy array of length N (dtype=float64)
+ *   G    : double (gravitational constant, default=1.0)
+ *   soft : double (softening length, default=0.01)
+ *
+ * Returns:
+ *   (ax, ay) as two numpy arrays of length N, where each is the net acceleration
+ *   on particle i due to all others.
+ */
+py::tuple direct_omp(py::array_t<double> x_in,
+                    py::array_t<double> y_in,
+                    py::array_t<double> m_in,
+                    double G    = 1.0,
+                    double soft = 0.01)
+{
+    // Unpack input array sizes:
+    size_t N = x_in.shape(0);
+
+    // If no particles, return empty arrays:
     if (N == 0) {
-        return py::make_tuple(py::array_t<double>(0),
-                              py::array_t<double>(0));
+        return py::make_tuple(
+            py::array_t<double>(0),
+            py::array_t<double>(0)
+        );
     }
 
-    // Access raw data from NumPy
-    auto px = x.unchecked<1>();
-    auto py_ = y.unchecked<1>();
-    auto pm = m.unchecked<1>();
-
-    // Copy into std::vector<double> for contiguous OMP loops
-    std::vector<double> vx(N), vy(N), vm(N);
+    // Copy data into std::vector<double> for fast indexing:
+    std::vector<double> x(N), y(N), m(N);
+    auto xx = x_in.unchecked<1>();
+    auto yy = y_in.unchecked<1>();
+    auto mm = m_in.unchecked<1>();
     for (size_t i = 0; i < N; ++i) {
-        vx[i] = px(i);
-        vy[i] = py_(i);
-        vm[i] = pm(i);
+        x[i] = xx(i);
+        y[i] = yy(i);
+        m[i] = mm(i);
     }
 
-    // Prepare output force arrays
-    std::vector<double> fx(N, 0.0), fy(N, 0.0);
-    double soft2 = soft * soft;
+    // Prepare output arrays (ax, ay):
+    py::array_t<double> ax_out(N), ay_out(N);
+    auto ax = ax_out.mutable_unchecked<1>();
+    auto ay = ay_out.mutable_unchecked<1>();
 
-    // OMP‐parallelized double loop: each i computes force from all j≠i
-    #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
-    #endif
+    // Zero them first (parallel):
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < N; ++i) {
-        double fx_i = 0.0;
-        double fy_i = 0.0;
+        ax(i) = 0.0;
+        ay(i) = 0.0;
+    }
+
+    // Compute pairwise accelerations:
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (size_t i = 0; i < N; ++i) {
+        double xi = x[i];
+        double yi = y[i];
+        double axi = 0.0;
+        double ayi = 0.0;
         for (size_t j = 0; j < N; ++j) {
             if (i == j) continue;
-            double dx = vx[j] - vx[i];
-            double dy = vy[j] - vy[i];
-            double r2 = dx*dx + dy*dy + soft2;
-            double inv_r3 = 1.0 / std::pow(r2, 1.5);
-            fx_i += G * vm[j] * dx * inv_r3;
-            fy_i += G * vm[j] * dy * inv_r3;
+            double dx = x[j] - xi;
+            double dy = y[j] - yi;
+            double dist2 = dx*dx + dy*dy + soft*soft;
+            double invDist3 = 1.0 / (dist2 * std::sqrt(dist2));
+            double factor = G * m[j] * invDist3;
+            axi += factor * dx;
+            ayi += factor * dy;
         }
-        fx[i] = fx_i;
-        fy[i] = fy_i;
+        ax(i) = axi;
+        ay(i) = ayi;
     }
 
-    // Copy back to NumPy arrays
-    auto ax_out = py::array_t<double>(N);
-    auto ay_out = py::array_t<double>(N);
-    auto pax = ax_out.mutable_unchecked<1>();
-    auto pay = ay_out.mutable_unchecked<1>();
-    for (size_t i = 0; i < N; ++i) {
-        pax(i) = fx[i];
-        pay(i) = fy[i];
-    }
     return py::make_tuple(ax_out, ay_out);
 }
 
-// -----------------------------------------------------------------------------
-// BARNES‐HUT TREE NODE DEFINITION
-// -----------------------------------------------------------------------------
 
-/**
- * BHNode:
- *   Represents one node in the Barnes‐Hut quadtree.
- *
- *   Fields:
- *     - cx, cy       : center of this box
- *     - size         : half‐width of box
- *     - is_leaf      : true if no children
- *     - total_mass   : sum of masses in this box
- *     - com_x, com_y : center‐of‐mass of all particles in this box
- *     - children[0..3]: four child pointers (NW=0, NE=1, SW=2, SE=3)
- *     - particle_indices: if leaf, list of particles inside
- */
+// -----------------------------------------------------------------------------------
+// Part 2: Barnes‐Hut treecode (O(N log N))
+// -----------------------------------------------------------------------------------
+//
+// We build a quadtree over the 2D domain [-domain,+domain]×[-domain,+domain].  Each node
+// holds either a single particle (if leaf) or 4 children subdividing the square.  We store
+// in each node: total mass, center‐of‐mass (com_x, com_y).  Then for each target i, we
+// traverse the tree.  If (NodeSize / dist_to_node_com) < theta, we treat the entire node
+// as one “pseudo‐particle” at its COM.  Otherwise, if leaf, do direct sum over leaf’s single
+// particle (which is just itself except when the leaf holds a different particle), or recurse.
+// 
+// The user supplies “theta” (opening angle), “domain” (root half‐width), G, and softening.
+// We parallelize the per‐target loop with OpenMP.
+// -----------------------------------------------------------------------------------
+
+static const int BH_BUCKET = 1;  // max particles per leaf = 1
+
 struct BHNode {
-    double cx, cy;                // Box center
-    double size;                  // Half‐width of box
-    bool   is_leaf;               // True if no children
-
-    double total_mass;            // Sum of masses in this node
-    double com_x, com_y;          // Center‐of‐mass (over all particles)
-    std::vector<size_t> particle_indices;  // Indices if leaf
-
-    std::array<std::unique_ptr<BHNode>, 4> children;  // 0=NW,1=NE,2=SW,3=SE
+    double cx, cy, size;         // center & half‐width of this square cell
+    double mass, com_x, com_y;   // total mass & center‐of‐mass of this cell
+    bool   is_leaf;              // leaf if contains ≤ BH_BUCKET particles
+    int    particle_index;       // index of the single particle if leaf (otherwise unused)
+    BHNode* children[4];         // pointers to SW, SE, NW, NE (or nullptr)
 
     BHNode(double _cx, double _cy, double _size)
-        : cx(_cx), cy(_cy), size(_size) {
-        is_leaf = true;
-        total_mass = 0.0;  // will be set when inserting
-        com_x = com_y = 0.0;
+      : cx(_cx), cy(_cy), size(_size),
+        mass(0.0), com_x(0.0), com_y(0.0),
+        is_leaf(true), particle_index(-1)
+    {
+        for (int i = 0; i < 4; ++i) children[i] = nullptr;
+    }
+
+    ~BHNode() {
+        for (int i = 0; i < 4; ++i) {
+            if (children[i]) {
+                delete children[i];
+                children[i] = nullptr;
+            }
+        }
     }
 };
 
 /**
- * bh_insert_particle(node, pid, x, y, m):
- *   Inserts a single particle index pid (with position x[pid], y[pid], mass m[pid])
- *   into the quadtree rooted at ‘node’.  If the node is currently a leaf and already
- *   contains some other particle, it subdivides into 4 children, re‐inserts the existing
- *   particle, and then inserts the new one.  Otherwise, it just propagates downward.
+ * Insert a single particle “pi” with position (x[pi], y[pi]) and mass m[pi]
+ * into the BH‐tree rooted at “node”.  If node is leaf and empty, store the particle.
+ * If node is leaf and already contains one particle, subdivide into 4 children,
+ * move that old particle down, then insert the new one.  If node is internal,
+ * route to the correct child based on quadrant.
  */
-static void bh_insert_particle(
-    BHNode*                        node,
-    size_t                         pid,
-    const std::vector<double>&     x,
-    const std::vector<double>&     y,
-    const std::vector<double>&     m
-) {
-    // If this node has no particles yet, just add pid and update mass/COM
-    if (node->particle_indices.empty()) {
-        node->particle_indices.push_back(pid);
-        node->total_mass = m[pid];
-        node->com_x = x[pid];
-        node->com_y = y[pid];
+static void bh_insert(BHNode* node,
+                      const std::vector<double>& x,
+                      const std::vector<double>& y,
+                      const std::vector<double>& m,
+                      size_t pi)
+{
+    // If empty leaf, just store:
+    if (node->is_leaf && node->particle_index < 0) {
+        node->particle_index = (int)pi;
         return;
     }
 
-    // If this node is a leaf but already has 1 or more particles, we must subdivide
+    // If leaf & already has one particle → need to subdivide:
     if (node->is_leaf) {
-        // Grab existing list of indices (there can be >1 if we allowed >1 per leaf; adjust as you wish)
-        std::vector<size_t> existing = node->particle_indices;
-        node->particle_indices.clear();
+        // Create 4 children by splitting this square into 4:
+        double half = node->size / 2.0;
+        double x0 = node->cx, y0 = node->cy;
+        node->children[0] = new BHNode(x0 - half/2.0, y0 - half/2.0, half/2.0); // SW
+        node->children[1] = new BHNode(x0 + half/2.0, y0 - half/2.0, half/2.0); // SE
+        node->children[2] = new BHNode(x0 - half/2.0, y0 + half/2.0, half/2.0); // NW
+        node->children[3] = new BHNode(x0 + half/2.0, y0 + half/2.0, half/2.0); // NE
         node->is_leaf = false;
 
-        double half = node->size / 2.0;
+        // Re‐insert the previously stored particle into one child:
+        int old_pi = node->particle_index;
+        double ox = x[old_pi], oy = y[old_pi];
+        int octant_old = (ox > x0) + 2*(oy > y0);
+        bh_insert(node->children[octant_old], x, y, m, old_pi);
 
-        // Create 4 children
-        node->children[0] = std::make_unique<BHNode>(node->cx - half, node->cy - half, half, node);
-        node->children[1] = std::make_unique<BHNode>(node->cx + half, node->cy - half, half, node);
-        node->children[2] = std::make_unique<BHNode>(node->cx - half, node->cy + half, half, node);
-        node->children[3] = std::make_unique<BHNode>(node->cx + half, node->cy + half, half, node);
-
-        // Re-insert all existing particles
-        for (size_t old_pid : existing) {
-            double ex = x[old_pid], ey = y[old_pid];
-            int child_idx = (ex > node->cx ? 1 : 0) + (ey > node->cy ? 2 : 0);
-            bh_insert_particle(node->children[child_idx].get(),
-                               old_pid, x, y, m);
-        }
+        // Clear this node’s stored index
+        node->particle_index = -1;
     }
 
-    // If node now has children, insert pid downward
-    if (!node->is_leaf) {
-        double px = x[pid];
-        double py = y[pid];
-        int child_idx = (px > node->cx ? 1 : 0) + (py > node->cy ? 2 : 0);
-        bh_insert_particle(node->children[child_idx].get(), pid, x, y, m);
-    }
+    // Now node is definitely internal → insert “pi” into correct child:
+    double tx = x[pi], ty = y[pi];
+    double x0 = node->cx, y0 = node->cy;
+    int oct = (tx > x0) + 2*(ty > y0);
+    bh_insert(node->children[oct], x, y, m, pi);
 }
 
 /**
- * After building the entire tree (all insertions), we do a post-order traversal
- * to compute total_mass and center‐of‐mass (com_x, com_y) at every internal node.
+ * After having inserted all particles, we run a post‐order traversal to compute
+ * mass and center‐of‐mass at each node.  At a leaf with one particle, simply store
+ * m and com=(x[pi], y[pi]).  At an internal node, sum children’s mass and COMs.
  */
 static void bh_compute_mass_distribution(
     BHNode* node,
@@ -195,202 +212,221 @@ static void bh_compute_mass_distribution(
 ) {
     if (!node) return;
 
+    // If leaf and holds a particle:
     if (node->is_leaf) {
-        // Leaf: particle_indices has exactly one element
-        size_t pid = node->particle_indices[0];
-        node->total_mass = m[pid];
-        node->com_x = x[pid];
-        node->com_y = y[pid];
-    } else {
-        // Internal: sum up children
-        double sum_m = 0.0;
-        double sum_x = 0.0;
-        double sum_y = 0.0;
-        for (int c = 0; c < 4; ++c) {
-            if (node->children[c]) {
-                bh_compute_mass_distribution(node->children[c].get(), x, y, m);
-                sum_m += node->children[c]->total_mass;
-                sum_x += node->children[c]->com_x * node->children[c]->total_mass;
-                sum_y += node->children[c]->com_y * node->children[c]->total_mass;
-            }
-        }
-        if (sum_m > 0.0) {
-            node->total_mass = sum_m;
-            node->com_x = sum_x / sum_m;
-            node->com_y = sum_y / sum_m;
-        } else {
-            node->total_mass = 0.0;
+        int pi = node->particle_index;
+        if (pi < 0) {
+            // empty leaf (shouldn’t happen in our code)
+            node->mass = 0.0;
             node->com_x = node->cx;
             node->com_y = node->cy;
-        }
-    }
-}
-
-/**
- * bh_compute_force(node, px, py, pid, x,y,m,theta,G,soft2, &fx, &fy)
- *   Recursively traverse the Barnes‐Hut tree “node” to compute force on a
- *   test particle at (px,py) with ID=pid.  If node is far enough (s/r < theta),
- *   approximate entire node as its center‐of‐mass.  Otherwise, descend into children.
- */
-static void bh_compute_force(
-    const BHNode*                   node,
-    double                           px,
-    double                           py,
-    size_t                           pid,
-    const std::vector<double>&       x,
-    const std::vector<double>&       y,
-    const std::vector<double>&       m,
-    double                           theta,
-    double                           G,
-    double                           soft2,
-    double&                          fx,
-    double&                          fy
-) {
-    if (!node || node->total_mass == 0.0) return;
-
-    if (node->is_leaf) {
-        // Direct sum over all particles in this leaf (there may be only 1)
-        for (size_t other : node->particle_indices) {
-            if (other == pid) continue;
-            double dx = x[other] - px;
-            double dy = y[other] - py;
-            double r2 = dx*dx + dy*dy + soft2;
-            if (r2 < 1e-20) continue;
-            double inv_r = 1.0 / std::sqrt(r2);
-            double inv_r3 = inv_r * inv_r * inv_r;
-            fx += G * m[other] * dx * inv_r3;
-            fy += G * m[other] * dy * inv_r3;
-        }
-    } else {
-        // Internal node: check opening criterion
-        double dx = node->com_x - px;
-        double dy = node->com_y - py;
-        double r2 = dx*dx + dy*dy + soft2;
-        double r  = std::sqrt(r2);
-        if (node->size / r < theta && r2 > 1e-20) {
-            // Approximate entire node by its COM
-            double inv_r = 1.0 / r;
-            double inv_r3 = inv_r * inv_r * inv_r;
-            fx += G * node->total_mass * dx * inv_r3;
-            fy += G * node->total_mass * dy * inv_r3;
         } else {
-            // Recurse into children
-            for (int c = 0; c < 4; ++c) {
-                if (node->children[c]) {
-                    bh_compute_force(node->children[c].get(), px, py, pid,
-                                     x, y, m, theta, G, soft2, fx, fy);
-                }
-            }
+            // exactly one particle here
+            node->mass  = m[pi];
+            node->com_x = x[pi];
+            node->com_y = y[pi];
+        }
+        return;
+    }
+
+    // Internal node: traverse children first
+    double Mtot = 0.0;
+    double sumX = 0.0, sumY = 0.0;
+    for (int c = 0; c < 4; ++c) {
+        if (node->children[c]) {
+            bh_compute_mass_distribution(node->children[c], x, y, m);
+            Mtot += node->children[c]->mass;
+            sumX += node->children[c]->mass * node->children[c]->com_x;
+            sumY += node->children[c]->mass * node->children[c]->com_y;
+        }
+    }
+    node->mass  = Mtot;
+    if (Mtot > 0.0) {
+        node->com_x = sumX / Mtot;
+        node->com_y = sumY / Mtot;
+    } else {
+        node->com_x = node->cx;
+        node->com_y = node->cy;
+    }
+}
+
+/**
+ * Build a Barnes‐Hut quadtree over domain [-domain, +domain]×[-domain,+domain]:
+ *   - Insert each particle i into the tree,
+ *   - Then do mass & COM pass.
+ * Returns root pointer.
+ */
+static BHNode* bh_build_tree(const std::vector<double>& x,
+                             const std::vector<double>& y,
+                             const std::vector<double>& m,
+                             double domain)
+{
+    BHNode* root = new BHNode(0.0, 0.0, domain);
+    size_t N = x.size();
+    for (size_t i = 0; i < N; ++i) {
+        bh_insert(root, x, y, m, i);
+    }
+    bh_compute_mass_distribution(root, x, y, m);
+    return root;
+}
+
+/**
+ * Evaluate acceleration at target (tx, ty) by traversing the BH‐tree.
+ * - If (node->size / dist_to_node_COM) < theta → treat node as single mass at COM.
+ * - Else if leaf → direct‐sum with that one particle.
+ * - Else → recurse into all children.
+ */
+static void bh_evaluate_target(
+    const BHNode* node,
+    double tx, double ty,
+    const std::vector<double>& x,
+    const std::vector<double>& y,
+    const std::vector<double>& m,
+    double G, double soft, double theta,
+    double& axi, double& ayi
+) {
+    if (!node || node->mass == 0.0) return;
+
+    double dx = node->com_x - tx;
+    double dy = node->com_y - ty;
+    double dist2 = dx*dx + dy*dy + soft*soft;
+    double dist = std::sqrt(dist2);
+
+    // Multipole condition:
+    if (node->size / dist < theta) {
+        // Treat entire node as one mass at COM:
+        double invDist3 = 1.0 / (dist2 * dist);
+        double factor = G * node->mass * invDist3;
+        axi += factor * dx;
+        ayi += factor * dy;
+        return;
+    }
+
+    // If leaf, do direct sum with that one particle (unless that particle is ourselves; skip if same index)
+    if (node->is_leaf) {
+        int pi = node->particle_index;
+        if (pi >= 0) {
+            double ddx = x[pi] - tx;
+            double ddy = y[pi] - ty;
+            double d2 = ddx*ddx + ddy*ddy + soft*soft;
+            double invD3 = 1.0 / (d2 * std::sqrt(d2));
+            axi += G * m[pi] * invD3 * ddx;
+            ayi += G * m[pi] * invD3 * ddy;
+        }
+        return;
+    }
+
+    // Otherwise, internal node not far enough → recurse into children
+    for (int c = 0; c < 4; ++c) {
+        if (node->children[c]) {
+            bh_evaluate_target(node->children[c], tx, ty, x, y, m, G, soft, theta, axi, ayi);
         }
     }
 }
 
 /**
- * bh_omp(x, y, m, domain, theta, G, soft)
- *   Build a Barnes‐Hut quadtree, compute mass distribution, then evaluate
- *   force on each particle (i=0..N-1) using bh_compute_force(...).  The outer
- *   loop over i is OpenMP‐parallelized.  Returns (ax, ay) arrays.
+ * bh_omp(x, y, m, domain, theta=0.5, G=1.0, soft=0.01) → (ax, ay)
+ *
+ * Builds a Barnes‐Hut tree over [-domain, +domain]², with opening angle “theta”.
+ * Returns accelerations (ax, ay) in two numpy arrays of length N, computed in parallel.
  */
-py::tuple bh_omp(
-    py::array_t<double> x,
-    py::array_t<double> y,
-    py::array_t<double> m,
-    double              domain,
-    double              theta = 0.5,
-    double              G     = 1.0,
-    double              soft  = 0.05
-) {
-    size_t N = x.size();
+py::tuple bh_omp(py::array_t<double> x_in,
+                 py::array_t<double> y_in,
+                 py::array_t<double> m_in,
+                 double domain,
+                 double theta = 0.5,
+                 double G     = 1.0,
+                 double soft  = 0.01)
+{
+    size_t N = x_in.shape(0);
     if (N == 0) {
-        return py::make_tuple(py::array_t<double>(0),
-                              py::array_t<double>(0));
+        return py::make_tuple(
+            py::array_t<double>(0),
+            py::array_t<double>(0)
+        );
     }
 
-    auto px = x.unchecked<1>();
-    auto py_ = y.unchecked<1>();
-    auto pm = m.unchecked<1>();
-
-    // Copy into vectors for easier indexing
-    std::vector<double> vx(N), vy(N), vm(N);
+    // Copy arrays into std::vector:
+    std::vector<double> x(N), y(N), m(N);
+    auto xx = x_in.unchecked<1>();
+    auto yy = y_in.unchecked<1>();
+    auto mm = m_in.unchecked<1>();
     for (size_t i = 0; i < N; ++i) {
-        vx[i] = px(i);
-        vy[i] = py_(i);
-        vm[i] = pm(i);
+        x[i] = xx(i);
+        y[i] = yy(i);
+        m[i] = mm(i);
     }
 
-    // Build root node
-    auto root = std::make_unique<BHNode>(0.0, 0.0, domain * 0.5);
+    // Build the tree (serially):
+    BHNode* root = bh_build_tree(x, y, m, domain);
 
-    // Insert all particles into the tree
+    // Prepare outputs and zero them:
+    py::array_t<double> ax_out(N), ay_out(N);
+    auto ax = ax_out.mutable_unchecked<1>();
+    auto ay = ay_out.mutable_unchecked<1>();
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < N; ++i) {
-        bh_insert_particle(root.get(), i, vx, vy, vm);
+        ax(i) = 0.0;
+        ay(i) = 0.0;
     }
 
-    // Compute mass-distribution (total_mass, COM) in each internal node
-    bh_compute_mass_distribution(root.get(), vx, vy, vm);
-
-    // Prepare output arrays
-    std::vector<double> fx(N, 0.0), fy(N, 0.0);
-    double soft2 = soft * soft;
-
-    // Compute force on each particle using BH
-    #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
-    #endif
+    // Evaluate each target i in parallel:
+    #pragma omp parallel for schedule(dynamic, 16)
     for (size_t i = 0; i < N; ++i) {
-        double fx_i = 0.0;
-        double fy_i = 0.0;
-        bh_compute_force(root.get(), vx[i], vy[i], i,
-                         vx, vy, vm, theta, G, soft2, fx_i, fy_i);
-        fx[i] = fx_i;
-        fy[i] = fy_i;
+        double axi = 0.0, ayi = 0.0;
+        bh_evaluate_target(root, x[i], y[i], x, y, m, G, soft, theta, axi, ayi);
+        ax(i) = axi;
+        ay(i) = ayi;
     }
 
-    // Copy back to NumPy arrays
-    auto ax_out = py::array_t<double>(N);
-    auto ay_out = py::array_t<double>(N);
-    auto pax = ax_out.mutable_unchecked<1>();
-    auto pay = ay_out.mutable_unchecked<1>();
-    for (size_t i = 0; i < N; ++i) {
-        pax(i) = fx[i];
-        pay(i) = fy[i];
-    }
-
+    // Free the tree:
+    delete root;
     return py::make_tuple(ax_out, ay_out);
 }
 
-// ============================================================================
+
+// -----------------------------------------------------------------------------------
 // PYBIND11 MODULE DEFINITION
-// ============================================================================
-
+// -----------------------------------------------------------------------------------
 PYBIND11_MODULE(force_kernel, m) {
-    m.doc() = "High-precision N-body force kernels (Direct & Barnes-Hut) with OpenMP";
+    m.doc() = "2D Direct (O(N^2)) and Barnes-Hut (O(N log N)) force kernels (OpenMP)";
 
-    m.def("direct_omp", &direct_omp,
-          "Direct N-body (O(N^2)) force calculation (with OpenMP).\n"
-          "Args: x, y, m (length N),\n"
-          "      G    : gravitational constant (default=1.0),\n"
-          "      soft : softening length (default=0.05).\n"
-          "Returns: (ax, ay) arrays of length N.",
-          py::arg("x"), py::arg("y"), py::arg("m"),
-          py::arg("G") = 1.0, py::arg("soft") = 0.05);
+    // export direct_omp and bh_omp to Python:
+    m.def("direct_omp",
+          &direct_omp,
+          py::arg("x"),
+          py::arg("y"),
+          py::arg("m"),
+          py::arg("G")    = 1.0,
+          py::arg("soft") = 0.01,
+          R"doc(
+            Compute accelerations via the direct O(N^2) method (OpenMP parallelized).
+            Returns (ax, ay) arrays of length N.
+          )doc"
+    );
 
-    m.def("bh_omp", &bh_omp,
-          "Barnes-Hut O(N log N) force calculation (with OpenMP).\n"
-          "Args: x, y, m (length N),\n"
-          "      domain : half-width of bounding box,\n"
-          "      theta  : opening angle (default=0.5),\n"
-          "      G      : gravitational constant (default=1.0),\n"
-          "      soft   : softening length (default=0.05).\n"
-          "Returns: (ax, ay) arrays of length N.",
-          py::arg("x"), py::arg("y"), py::arg("m"),
-          py::arg("domain"), py::arg("theta") = 0.5,
-          py::arg("G") = 1.0, py::arg("soft") = 0.05);
+    m.def("bh_omp",
+          &bh_omp,
+          py::arg("x"),
+          py::arg("y"),
+          py::arg("m"),
+          py::arg("domain"),
+          py::arg("theta") = 0.5,
+          py::arg("G")     = 1.0,
+          py::arg("soft")  = 0.01,
+          R"doc(
+            Compute accelerations via Barnes-Hut treecode (OpenMP parallelized).
+            domain : half-width of root quadtree cell.
+            theta  : opening angle parameter.
+            Returns (ax, ay) arrays of length N.
+          )doc"
+    );
 
-    #ifdef USE_OPENMP
-    m.attr("has_openmp") = true;
+    // Flag to indicate whether OpenMP is enabled:
+    #ifdef _OPENMP
+      m.attr("has_openmp") = true;
     #else
-    m.attr("has_openmp") = false;
+      m.attr("has_openmp") = false;
     #endif
 }
 

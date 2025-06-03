@@ -1,62 +1,55 @@
 #!/usr/bin/env python3
 """
-setup.py - Optimized build script for high-precision N-body kernels
-Usage: python setup.py build_ext --inplace
+setup.py - Build both force_kernel and fmm_kernel as pybind11 extensions with OpenMP.
+
+Usage:
+    python3.12 setup.py build_ext --inplace
+
+This will produce:
+    - force_kernel.cpython-<ver>-<arch>.so 
+    - fmm_kernel.cpython-<ver>-<arch>.so
+
+which can be imported in Python via:
+    import force_kernel
+    import fmm_kernel
 """
 
-from pybind11.setup_helpers import Pybind11Extension, build_ext
-from setuptools import setup
-import pybind11
 import platform
-import os
+from setuptools import setup
+from pybind11.setup_helpers import Pybind11Extension, build_ext
 
-# Detect system and set compiler flags
+# Detect system (for logging)
 system = platform.system()
 print(f"Building for {system}")
 
-# Base compiler arguments
-base_args = ["-std=c++17", "-O3", "-DNDEBUG"]
-base_link_args = []
+# Common compiler arguments: C++17, O3, native, fast‐math, and link with OpenMP
+base_compile_args = [
+    "-std=c++17",
+    "-O3",
+    "-march=native",
+    "-ffast-math",
+    "-fopenmp"
+]
+base_link_args = [
+    "-fopenmp"
+]
 
-# System-specific optimizations
-if system == "Linux":
-    base_args.extend(["-march=native", "-ffast-math", "-fopenmp"])
-    base_link_args.extend(["-fopenmp"])
-elif system == "Darwin":  # macOS
-    base_args.extend(["-march=native", "-ffast-math"])
-    # Try to find OpenMP
-    omp_paths = ["/opt/homebrew", "/usr/local", "/opt/local"]
-    for path in omp_paths:
-        if os.path.exists(f"{path}/include/omp.h"):
-            base_args.extend(["-Xpreprocessor", "-fopenmp", f"-I{path}/include"])
-            base_link_args.extend([f"-L{path}/lib", "-lomp"])
-            print(f"Found OpenMP at {path}")
-            break
-    else:
-        print("OpenMP not found - compiling without parallel support")
-elif system == "Windows":
-    base_args.extend(["/O2", "/openmp"])
-
-print(f"Compiler flags: {base_args}")
-
-# Define extensions
 ext_modules = [
+    # 1) Direct‐and‐Barnes‐Hut force kernel
     Pybind11Extension(
-        "force_kernel",
-        ["force_kernel_full.cpp"],
-        include_dirs=[pybind11.get_include()],
-        language='c++',
+        name="force_kernel",                  # Module name: import force_kernel
+        sources=["force_kernel_full.cpp"],    # Source file (must exist in same folder)
         cxx_std=17,
-        extra_compile_args=base_args,
+        extra_compile_args=base_compile_args,
         extra_link_args=base_link_args,
     ),
+
+    # 2) Fast Multipole Method kernel
     Pybind11Extension(
-        "fmm_kernel", 
-        ["fmm_kernel_full.cpp"],
-        include_dirs=[pybind11.get_include()],
-        language='c++',
+        name="fmm_kernel",                    # Module name: import fmm_kernel
+        sources=["fmm_kernel_full.cpp"],      # Source file (must exist in same folder)
         cxx_std=17,
-        extra_compile_args=base_args,
+        extra_compile_args=base_compile_args,
         extra_link_args=base_link_args,
     ),
 ]
@@ -64,9 +57,10 @@ ext_modules = [
 setup(
     name="nbody_kernels",
     version="1.0.0",
-    description="High-precision N-body simulation kernels",
+    description="High-precision N-body simulation kernels (Direct, Barnes‐Hut, FMM) with OpenMP",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     zip_safe=False,
     python_requires=">=3.7",
 )
+
