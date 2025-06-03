@@ -4,13 +4,16 @@
 main_program_parallel_final.py
 ==============================
 Interactive 2-D N-body playground with optimized high-precision kernels
-（已对 comprehensive_test.py 中的函数名称做匹配与容错）
 
-功能：
- 1) Quick benchmark scaling  → 调用 test_scaling()
- 2) Save trajectory + energy plot
- 3) Live simulation animation
- 4) Demo comparison (performance vs accuracy)  → 调用 test_accuracy() + test_scaling()
+支持菜单（共 8 个选项）：
+ 1) Quick benchmark scaling              → test_scaling() 输出 performance_comparison.png + scaling_smallN.csv
+ 2) Save trajectory + energy plot        → 生成 trajectory.gif + energy_vs_time.png
+ 3) Live animation (real-time)           → 生成 live.gif
+ 4) Large-N scaling test                 → test_largeN_scaling() 输出 scaling_largeN.png + scaling_largeN.csv
+ 5) Energy conservation test             → test_energy_conservation() 输出 energy_conservation.png
+ 6) Parameter optimization               → optimize_parameters() 输出 parameter_optimization.png
+ 7) OpenMP thread benchmark              → thread_benchmark() 输出 openmp_thread_benchmark.png + openmp_thread_benchmark.csv
+ 8) System information                   → show_system_info() 打印 OpenMP/CPU/系统信息
   q) Quit
 """
 
@@ -44,23 +47,31 @@ except ImportError:
     bh_omp     = None
 
 # ----------------------------
+# 导入本地测试模块 comprehensive_test.py
+# ----------------------------
+try:
+    import comprehensive_test as ctest
+except ImportError:
+    ctest = None
+
+# ----------------------------
 # 全局物理常数与默认参数
 # ----------------------------
 G = 1.0
-SOFT = 0.005               # 近场软化长度
-DOMAIN = 100.0             # 模拟域边长：[-50, 50] × [-50, 50]
+SOFT = 0.005               # 近场 softening
+DOMAIN = 100.0             # 模拟域：[-50,50]^2
 DT = 0.0005                # Leapfrog 时步
-STAR_M = 100.0             # 固定中心恒星的质量
+STAR_M = 100.0             # 固定中心恒星质量
 
 OPTIMIZED_PARAMS = {
-    'bh_theta': 0.3,
-    'fmm_theta': 0.2,
+    'bh_theta': 0.3,       # BH 开放角 (accuracy vs speed)
+    'fmm_theta': 0.2,      # FMM 开放角
     'bh_domain': DOMAIN,
     'fmm_domain': DOMAIN,
     'distribution_size': 50.0,
 }
 
-# 默认求力方法：DIRECT、BH 或 FMM
+# 默认使用哪种求力方法 (DIRECT / BH / FMM)
 USE_SOLVER = "DIRECT"
 
 
@@ -70,8 +81,8 @@ USE_SOLVER = "DIRECT"
 def leapfrog_step(bodies, ax, ay, include_central=False):
     """
     bodies: numpy ndarray (N,5) → [x, y, vx, vy, m]
-    ax, ay: list 或 numpy 数组 (N,) → 初始加速度
-    include_central: True 则第 0 号恒星固定（不更新位置、速度）
+    ax, ay: list 或 numpy 数组 (N,) → 当前加速度
+    include_central: True 时第 0 号当作固定恒星
     """
     N = bodies.shape[0]
 
@@ -133,8 +144,8 @@ def leapfrog_step(bodies, ax, ay, include_central=False):
 
 
 # ----------------------------
-# 计算系统总能量 (动能 + 位能)
-# include_central=True 时，第 0 号当作固定恒星
+# Total Energy 计算 (动能 + 位能)
+# include_central=True 时第 0 号当作固定恒星
 # ----------------------------
 def total_energy(bodies, include_central=False):
     N = bodies.shape[0]
@@ -146,7 +157,7 @@ def total_energy(bodies, include_central=False):
 
     PE = 0.0
     for i in range(N):
-        for j in range(i + 1, N):
+        for j in range(i+1, N):
             if include_central and (i == 0 or j == 0):
                 if i == 0:
                     dx = bodies[j, 0] - bodies[i, 0]
@@ -167,25 +178,20 @@ def total_energy(bodies, include_central=False):
     return KE + PE
 
 
-# ----------------------------
-# 随机生成 n 颗粒子，分布在半径 radius 的圆盘内
-# 如果 include_central=True，会把第 0 号留给恒星
-# 返回 bodies: shape (N_total, 5)，列顺序：x, y, vx, vy, m
-# ----------------------------
 def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_central=False):
+    """
+    随机生成 n 颗粒子（圆盘分布），质心在 (0,0)，
+    如果 include_central=True，则第 0 号为质量 STAR_M 的固定恒星。
+    返回 bodies: ndarray (N_total, 5) → [x, y, vx, vy, m]
+    """
     if include_central:
         N_total = n + 1
     else:
         N_total = n
 
     bodies = np.zeros((N_total, 5), dtype=np.float64)
-
     if include_central:
-        bodies[0, 0] = 0.0
-        bodies[0, 1] = 0.0
-        bodies[0, 2] = 0.0
-        bodies[0, 3] = 0.0
-        bodies[0, 4] = STAR_M
+        bodies[0] = [0.0, 0.0, 0.0, 0.0, STAR_M]
 
     for i in range(1 if include_central else 0, N_total):
         r = random.random()**0.5 * radius
@@ -206,32 +212,35 @@ def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_centr
 # ----------------------------
 def main_menu():
     global USE_SOLVER
-    print("\n=== 2D N-body Playground (Parallel, High-Precision) ===")
-    print("Select option:")
-    print(" 1) Quick benchmark scaling")
-    print(" 2) Save trajectory + energy plot")
-    print(" 3) Live simulation animation")
-    print(" 4) Demo comparison (performance vs accuracy)")
-    print("  q) Quit")
-    print("==============================================")
+
+    menu_text = """
+=== 2D N-body Playground (Parallel, High-Precision) ===
+Select option:
+ 1) Quick benchmark scaling
+ 2) Save trajectory + energy plot
+ 3) Live animation (real-time)
+ 4) Large-N scaling test
+ 5) Energy conservation test
+ 6) Parameter optimization
+ 7) OpenMP thread benchmark
+ 8) System information
+  q) Quit
+==============================================
+"""
+    print(menu_text)
 
     while True:
         try:
-            choice = input("\nEnter choice: ").strip().lower()
+            choice = input("Enter choice: ").strip().lower()
             if choice in ["1", "benchmark"]:
-                # --------------------------------------------------------------
-                # Option 1: 调用 comprehensive_test.py 中的 test_scaling()
-                # --------------------------------------------------------------
-                try:
-                    from comprehensive_test import test_scaling
-                    test_scaling()
-                except ImportError:
-                    print("Error: 无法导入 'test_scaling'，请检查 comprehensive_test.py。")
+                # Option 1: Quick benchmark scaling
+                if ctest is not None:
+                    ctest.test_scaling()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法执行 Quick benchmark。\n")
 
             elif choice in ["2", "save", "save trajectory"]:
-                # --------------------------------------------------------------
-                # Option 2: 存储轨迹 + 能量-时间曲线
-                # --------------------------------------------------------------
+                # Option 2: Save trajectory + energy plot
                 print("\nSave trajectory + energy plot")
                 parser = argparse.ArgumentParser()
                 parser.add_argument("--solver", type=str, default="direct",
@@ -254,16 +263,11 @@ def main_menu():
                 fixed_star = args.fixed_star
 
                 os.environ["OMP_NUM_THREADS"] = str(THREADS)
-
                 bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
+                total_N = bodies.shape[0]
                 E0 = total_energy(bodies, include_central=fixed_star)
 
-                xs = []
-                ys = []
-                E_list = []
-                total_N = bodies.shape[0]
-
-                # 第一次计算加速度
+                # 初始加速度
                 x0 = bodies[:, 0].tolist()
                 y0 = bodies[:, 1].tolist()
                 m0 = bodies[:, 4].tolist()
@@ -280,14 +284,16 @@ def main_menu():
                     if not HAS_FMM:
                         raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
                     theta = OPTIMIZED_PARAMS['fmm_theta']
-                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0,
-                                                  OPTIMIZED_PARAMS['fmm_domain'],
-                                                  theta, G, SOFT)
+                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
                 else:
                     raise ValueError(f"Unknown solver: {USE_SOLVER}")
 
                 ax = ax0
                 ay = ay0
+
+                xs = []
+                ys = []
+                E_list = []
 
                 try:
                     for s in range(STEPS):
@@ -299,16 +305,15 @@ def main_menu():
 
                         if s % 10 == 0:
                             E = total_energy(bodies, include_central=fixed_star)
-                            rel_error = (E - E0) / abs(E0) if E0 != 0 else 0.0
+                            rel_error = abs(E - E0) / (abs(E0) + 1e-16)
                             E_list.append((s * DT, E, rel_error))
-
                 except KeyboardInterrupt:
                     print("\nIntegration interrupted by user.")
                 except Exception as e:
-                    print(f"\nError during integration: {e}")
+                    print(f"\nError during integration: {e}\n")
                     return
 
-                # 保存轨迹动画 (GIF)
+                # (a) 保存轨迹动画
                 if xs and ys:
                     print("Creating animation GIF...")
                     fig, axg = plt.subplots(figsize=(8, 8))
@@ -338,9 +343,9 @@ def main_menu():
                     gif_name = f"trajectory_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
                     ani.save(gif_name, fps=20, dpi=80)
                     plt.close(fig)
-                    print(f"Saved trajectory GIF: {gif_name}")
+                    print(f"✓ Saved trajectory GIF: {gif_name}")
 
-                # 保存能量-时间曲线
+                # (b) 保存能量-时间曲线
                 if E_list:
                     print("Creating energy vs time plot...")
                     times = [item[0] for item in E_list]
@@ -358,12 +363,10 @@ def main_menu():
                     fig.tight_layout()
                     fig.savefig(energy_plot, dpi=150)
                     plt.close(fig)
-                    print(f"Saved energy plot: {energy_plot}")
+                    print(f"✓ Saved energy plot: {energy_plot}\n")
 
-            elif choice in ["3", "live", "live simulation"]:
-                # --------------------------------------------------------------
-                # Option 3: 实时模拟动画
-                # --------------------------------------------------------------
+            elif choice in ["3", "live", "live animation"]:
+                # Option 3: Live animation (real-time)
                 print("\nLive simulation animation")
                 parser = argparse.ArgumentParser()
                 parser.add_argument("--solver", type=str, default="fmm",
@@ -405,9 +408,7 @@ def main_menu():
                     if not HAS_FMM:
                         raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
                     theta = OPTIMIZED_PARAMS['fmm_theta']
-                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0,
-                                                  OPTIMIZED_PARAMS['fmm_domain'],
-                                                  theta, G, SOFT)
+                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
                 else:
                     raise ValueError(f"Unknown solver: {USE_SOLVER}")
 
@@ -444,34 +445,59 @@ def main_menu():
                 gif_name = f"live_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
                 ani.save(gif_name, fps=20, dpi=80)
                 plt.close(fig)
-                print(f"Saved live simulation GIF: {gif_name}")
+                print(f"✓ Saved live simulation GIF: {gif_name}\n")
 
-            elif choice in ["4", "demo", "comparison"]:
-                # --------------------------------------------------------------
-                # Option 4: Demo comparison: accuracy + scaling
-                # --------------------------------------------------------------
-                print("\nDemo: Performance vs Accuracy")
-                try:
-                    from comprehensive_test import test_accuracy, test_scaling
-                    print("\n--- Running test_accuracy() ---")
-                    test_accuracy()
-                    print("\n--- Running test_scaling() ---")
-                    test_scaling()
-                except ImportError:
-                    print("Error: 无法导入 'test_accuracy' 或 'test_scaling'，请检查 comprehensive_test.py。")
+            elif choice in ["4", "large-n", "large-n scaling"]:
+                # Option 4: Large-N scaling test
+                print("\nLarge-N Scaling Test")
+                if ctest is not None:
+                    ctest.test_largeN_scaling()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法执行 Large-N scaling。\n")
+
+            elif choice in ["5", "energy", "energy conservation"]:
+                # Option 5: Energy conservation test
+                print("\nEnergy conservation test")
+                if ctest is not None:
+                    ctest.test_energy_conservation()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法执行 Energy conservation test。\n")
+
+            elif choice in ["6", "optimize", "parameter optimization"]:
+                # Option 6: Parameter optimization
+                print("\nParameter optimization")
+                if ctest is not None:
+                    ctest.optimize_parameters()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法执行 Parameter optimization。\n")
+
+            elif choice in ["7", "thread", "openmp thread benchmark"]:
+                # Option 7: OpenMP thread benchmark
+                print("\nOpenMP thread benchmark")
+                if ctest is not None:
+                    ctest.thread_benchmark()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法执行 Thread benchmark。\n")
+
+            elif choice in ["8", "system", "system information"]:
+                # Option 8: System information
+                print("\nSystem information")
+                if ctest is not None:
+                    ctest.show_system_info()
+                else:
+                    print("Error: comprehensive_test.py 未找到，无法显示 System information。\n")
 
             elif choice in ["q", "quit", "exit"]:
                 print("Goodbye!")
                 break
 
             else:
-                print("Invalid choice. Please try again.")
+                print("Invalid choice. Please try again.\n")
 
         except KeyboardInterrupt:
-            print("\n\nOperation interrupted by user.")
+            print("\n\nOperation interrupted by user. Returning to menu...\n")
         except Exception as e:
-            print(f"\nError: {e}")
-            print("Please try again or choose a different option.")
+            print(f"\nError: {e}\nPlease try again or choose a different option.\n")
 
 
 if __name__ == "__main__":
