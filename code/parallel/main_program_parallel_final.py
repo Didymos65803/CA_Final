@@ -1,1101 +1,487 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 main_program_parallel_final.py
 ==============================
 Interactive 2-D N-body playground with optimized high-precision kernels
-Fixed Barnes-Hut parameters and enhanced user experience
-
-ENHANCED VERSION WITH:
-- OpenMP thread detection and benchmarking
-- Unique output filenames for each method
-- Thread performance comparison
-
-Menu
------
-1. Quick benchmark               → benchmark_scaling.png
-2. Save trajectory + energy plot → trajectory.gif  + energy_vs_time.png
-3. Live animation (real-time)    → live.gif
-4. Large-N scaling test          → scaling_largeN.png + scaling_largeN.csv
-5. Energy conservation test      → energy_conservation.png
-6. Parameter optimization        → Find best settings
-7. OpenMP thread benchmark       → Compare single vs multi-threaded
-8. System information           → Show OpenMP details
-q. Quit
+（完整版，已修正动画 “x must be a sequence” 问题以及缺少 comprehensive_test 函数时的容错）
 """
 
 import os
-import argparse
 import sys
-import math
 import time
-import csv
-from collections import defaultdict
+import math
+import random
+import argparse
+import itertools
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-from tqdm import trange
 
-# Set OpenMP threads
-_cli = argparse.ArgumentParser(add_help=False)
-_cli.add_argument("--threads", type=int, default=8)
-_args, _ = _cli.parse_known_args()
-os.environ["OMP_NUM_THREADS"] = str(_args.threads)
-os.environ.setdefault("OMP_STACKSIZE", "64M")
-
-# Import compiled kernels
+# ----------------------------
+# 导入 C++ 模块
+# ----------------------------
 try:
-    from force_kernel import direct_omp, bh_omp
-    from fmm_kernel import fmm_omp
-    SOLVERS = dict(direct=direct_omp, bh=bh_omp, fmm=fmm_omp)
-    print(f"✓ Loaded N-body kernels with {_args.threads} OpenMP threads")
-except ImportError as e:
-    print(f"✗ Error importing kernels: {e}")
-    sys.exit(1)
+    import fmm_kernel
+    HAS_FMM = True
+except ImportError:
+    HAS_FMM = False
 
-# Physical constants
+try:
+    import force_kernel
+    direct_omp = force_kernel.direct_omp
+    bh_omp     = force_kernel.bh_omp
+    HAS_DIRECT_BH = True
+except ImportError:
+    HAS_DIRECT_BH = False
+    direct_omp = None
+    bh_omp     = None
+
+# ----------------------------
+# 全局物理常数与默认参数（已修正）
+# ----------------------------
 G = 1.0
-SOFT = 0.1
-DOMAIN = 100.0
-DT = 0.001
-STAR_M = 100.0
+SOFT = 0.005               # 近场软化长度，由 0.1 改为 0.005
+DOMAIN = 100.0             # 空间范围：[-50, 50] × [-50, 50]
+DT = 0.0005                # Leapfrog 时步，由 0.001 改为 0.0005
+STAR_M = 100.0             # 中心恒星质量（如果 include_central=True）
 
-# Optimized parameters (from testing)
+# 优化参数
 OPTIMIZED_PARAMS = {
-    'bh_theta': 0.3,        # More accurate than default 0.5
-    'fmm_theta': 0.4,       # Optimized for FMM
-    'bh_domain': 100.0,     # Adequate domain size
-    'fmm_domain': 100.0,
-    'distribution_size': 50.0,  # Reduced clustering
-    'mass_range': (0.5, 2.0),   # Reduced mass variation
+    'bh_theta': 0.3,       # BH 开放角度
+    'fmm_theta': 0.2,      # FMM 开放角度，由 0.4 改为 0.2
+    'bh_domain': DOMAIN,
+    'fmm_domain': DOMAIN,
+    'distribution_size': 50.0,  # 初始圆盘分布半径
 }
 
-def get_unique_filename(base_name, solver=None, N=None, steps=None, extension=None):
-    """Generate unique filenames for different methods and parameters"""
-    if extension and not base_name.endswith(extension):
-        base_name = base_name.replace('.png', '').replace('.gif', '')
-    
-    parts = [base_name]
-    if solver:
-        parts.append(solver)
-    if N:
-        parts.append(f"N{N}")
-    if steps:
-        parts.append(f"steps{steps}")
-    
-    filename = "_".join(parts)
-    if extension:
-        filename += extension
-    elif '.png' in base_name or '.gif' in base_name:
-        filename += '.png' if 'png' in base_name else '.gif'
-    
-    return filename
+# 默认使用 DIRECT 求力，用户可在菜单中修改
+USE_SOLVER = "DIRECT"
 
-def get_openmp_info():
-    """Get OpenMP information from the compiled modules"""
-    info = {
-        'threads_available': int(os.environ.get('OMP_NUM_THREADS', 1)),
-        'has_openmp': False,
-        'max_threads': 1
-    }
-    
-    try:
-        # Check if modules have OpenMP support
-        if hasattr(direct_omp, '__module__'):
-            # Try to get OpenMP info from the compiled module
-            import force_kernel
-            if hasattr(force_kernel, 'has_openmp'):
-                info['has_openmp'] = force_kernel.has_openmp
-        
-        # Get system thread count
-        import multiprocessing
-        info['max_threads'] = multiprocessing.cpu_count()
-        
-    except Exception as e:
-        print(f"Warning: Could not detect OpenMP info: {e}")
-    
-    return info
 
-def system_info():
-    """Display system and OpenMP information"""
-    print("\n" + "="*60)
-    print("SYSTEM INFORMATION")
-    print("="*60)
-    
-    info = get_openmp_info()
-    
-    print(f"OpenMP Threads Set: {info['threads_available']}")
-    print(f"System CPU Cores: {info['max_threads']}")
-    print(f"OpenMP Support: {'✓ Yes' if info['has_openmp'] else '❌ No'}")
-    
-    # Test kernel performance
-    print(f"\nTesting kernel performance...")
-    try:
-        N = 100
-        x = np.random.random(N)
-        y = np.random.random(N)
-        m = np.ones(N)
-        
-        t0 = time.time()
-        direct_omp(x, y, m, G=1.0, soft=0.01)
-        direct_time = time.time() - t0
-        
-        t0 = time.time()
-        bh_omp(x, y, m, domain=100.0, theta=0.5, G=1.0, soft=0.01)
-        bh_time = time.time() - t0
-        
-        print(f"Direct kernel: {direct_time*1000:.2f} ms")
-        print(f"Barnes-Hut kernel: {bh_time*1000:.2f} ms")
-        print(f"Performance ratio: {direct_time/bh_time:.1f}x")
-        
-    except Exception as e:
-        print(f"Performance test failed: {e}")
-    
-    print("\nEnvironment Variables:")
-    for var in ['OMP_NUM_THREADS', 'OMP_STACKSIZE', 'OMP_SCHEDULE']:
-        value = os.environ.get(var, 'Not set')
-        print(f"  {var}: {value}")
+# ----------------------------
+# Leapfrog 积分步骤
+# ----------------------------
+def leapfrog_step(bodies, ax, ay, include_central=False):
+    """
+    bodies: numpy ndarray (N,5) → [x, y, vx, vy, m]
+    ax, ay: list 或 numpy 数组 (N,) → 上一步算出的加速度
+    include_central: True 则第 0 号当作固定中心(质量很大，不更新其位置/速度)
+    """
+    N = bodies.shape[0]
 
-def openmp_benchmark():
-    """Compare single-threaded vs multi-threaded performance"""
-    print("\n" + "="*60)
-    print("OPENMP THREAD BENCHMARK")
-    print("="*60)
-    
-    # Get current thread count
-    current_threads = int(os.environ.get('OMP_NUM_THREADS', 1))
-    
-    print(f"Current OpenMP threads: {current_threads}")
-    print("Testing different thread counts...")
-    
-    # Test parameters
-    N = int(input("Number of particles for benchmark [500]: ") or "500")
-    solver = (input("Solver to test (direct/bh/fmm) [bh]: ") or "bh").lower()
-    
-    if solver not in SOLVERS:
-        solver = "bh"
-    
-    # Create test data
-    np.random.seed(42)
-    x = (np.random.random(N) - 0.5) * 50.0
-    y = (np.random.random(N) - 0.5) * 50.0
-    m = np.random.uniform(0.5, 2.0, N)
-    
-    # Test different thread counts
-    thread_counts = [1, 2, 4, current_threads] if current_threads > 4 else [1, 2, current_threads]
-    thread_counts = sorted(list(set(thread_counts)))  # Remove duplicates
-    
-    results = []
-    
-    print(f"\nBenchmarking {solver.upper()} with N={N}:")
-    print("Threads  Time (s)  Speedup  Efficiency")
-    print("-" * 40)
-    
-    for threads in thread_counts:
-        # Set thread count
-        os.environ["OMP_NUM_THREADS"] = str(threads)
-        
-        # Warmup
-        try:
-            if solver == "direct":
-                direct_omp(x[:10], y[:10], m[:10], G=1.0, soft=0.01)
-            elif solver == "bh":
-                bh_omp(x[:10], y[:10], m[:10], domain=100.0, theta=0.5, G=1.0, soft=0.01)
-            elif solver == "fmm":
-                fmm_omp(x[:10], y[:10], m[:10], domain=100.0, theta=0.4, G=1.0, soft=0.01)
-        except:
-            pass
-        
-        # Benchmark
-        times = []
-        for _ in range(3):  # Run 3 times for stability
-            t0 = time.time()
-            
-            try:
-                if solver == "direct":
-                    direct_omp(x, y, m, G=1.0, soft=0.01)
-                elif solver == "bh":
-                    bh_omp(x, y, m, domain=100.0, theta=0.5, G=1.0, soft=0.01)
-                elif solver == "fmm":
-                    fmm_omp(x, y, m, domain=100.0, theta=0.4, G=1.0, soft=0.01)
-                
-                elapsed = time.time() - t0
-                times.append(elapsed)
-                
-            except Exception as e:
-                print(f"Error with {threads} threads: {e}")
-                times.append(float('inf'))
-        
-        avg_time = min(times)  # Use best time
-        results.append((threads, avg_time))
-        
-        # Calculate speedup and efficiency
-        if threads == 1:
-            baseline_time = avg_time
-            speedup = 1.0
-            efficiency = 1.0
-        else:
-            speedup = baseline_time / avg_time if avg_time > 0 else 0
-            efficiency = speedup / threads
-        
-        print(f"{threads:7d}  {avg_time:7.4f}  {speedup:7.2f}  {efficiency:8.1%}")
-    
-    # Restore original thread count
-    os.environ["OMP_NUM_THREADS"] = str(current_threads)
-    
-    # Create performance plot
-    if len(results) > 1:
-        try:
-            threads_list, times_list = zip(*results)
-            
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-            
-            # Time vs threads
-            ax1.plot(threads_list, times_list, 'bo-', linewidth=2, markersize=8)
-            ax1.set_xlabel('Number of Threads', fontsize=12)
-            ax1.set_ylabel('Time (s)', fontsize=12)
-            ax1.set_title(f'{solver.upper()} Performance vs Thread Count (N={N})', fontsize=14)
-            ax1.grid(True, alpha=0.3)
-            ax1.set_yscale('log')
-            
-            # Speedup vs threads
-            baseline = times_list[0]
-            speedups = [baseline / t for t in times_list]
-            ideal_speedup = threads_list
-            
-            ax2.plot(threads_list, speedups, 'ro-', linewidth=2, markersize=8, label='Actual Speedup')
-            ax2.plot(threads_list, ideal_speedup, 'k--', alpha=0.7, label='Ideal Speedup')
-            ax2.set_xlabel('Number of Threads', fontsize=12)
-            ax2.set_ylabel('Speedup', fontsize=12)
-            ax2.set_title('Speedup vs Thread Count', fontsize=14)
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            # Use unique filename
-            plot_filename = get_unique_filename(f"openmp_benchmark_{solver}", N=N, extension=".png")
-            plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
-            plt.show()
-            print(f"\n✓ Saved {plot_filename}")
-            
-            # Summary
-            max_speedup = max(speedups)
-            best_threads = threads_list[speedups.index(max_speedup)]
-            
-            print(f"\nBenchmark Summary:")
-            print(f"  Best performance: {best_threads} threads")
-            print(f"  Maximum speedup: {max_speedup:.2f}x")
-            print(f"  Current setting: {current_threads} threads")
-            
-            if best_threads != current_threads:
-                print(f"\n💡 Suggestion: Use {best_threads} threads for optimal performance")
-                print(f"   Run with: --threads {best_threads}")
-            
-        except Exception as e:
-            print(f"Could not create plot: {e}")
-    
-    print(f"\nOpenMP analysis complete!")
+    # (1) 半步速度更新 (kick)
+    for i in range(N):
+        if include_central and i == 0:
+            continue
+        bodies[i, 2] += 0.5 * DT * ax[i]
+        bodies[i, 3] += 0.5 * DT * ay[i]
 
-class Body:
-    """Particle container"""
-    __slots__ = ("x", "y", "vx", "vy", "m")
+    # (2) 全步位置更新 (drift)
+    for i in range(N):
+        if include_central and i == 0:
+            continue
+        bodies[i, 0] += DT * bodies[i, 2]
+        bodies[i, 1] += DT * bodies[i, 3]
 
-    def __init__(self, x=0.0, y=0.0, m=1.0, vx=0.0, vy=0.0):
-        self.x, self.y = float(x), float(y)
-        self.vx, self.vy = float(vx), float(vy)
-        self.m = float(m)
+    # (3) 重新计算加速度
+    x_list = bodies[:, 0].tolist()
+    y_list = bodies[:, 1].tolist()
+    m_list = bodies[:, 4].tolist()
 
-def init_system(N: int, with_central: bool = True, rng_seed: int = 0, distribution: str = "disc"):
-    """Create initial conditions with optimized parameters"""
-    rng = np.random.default_rng(rng_seed)
-    bodies = []
+    if USE_SOLVER.upper() == 'DIRECT':
+        if not HAS_DIRECT_BH:
+            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+        ax_new, ay_new = direct_omp(x_list, y_list, m_list, G=G, soft=SOFT)
 
-    if distribution == "random":
-        # Optimized random distribution - less clustered
-        size = OPTIMIZED_PARAMS['distribution_size']
-        mass_min, mass_max = OPTIMIZED_PARAMS['mass_range']
-        
-        for i in range(N):
-            x = (rng.random() - 0.5) * size
-            y = (rng.random() - 0.5) * size
-            mass = rng.uniform(mass_min, mass_max)
-            bodies.append(Body(x, y, mass, 0.0, 0.0))
-    
-    elif distribution == "disc":
-        if with_central:
-            bodies.append(Body(0.0, 0.0, STAR_M, 0.0, 0.0))
+    elif USE_SOLVER.upper() == 'BH':
+        if not HAS_DIRECT_BH:
+            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+        theta = OPTIMIZED_PARAMS['bh_theta']
+        ax_new, ay_new = bh_omp(x_list, y_list, m_list,
+                                OPTIMIZED_PARAMS['bh_domain'],
+                                theta, G, SOFT)
 
-        for _ in range(N):
-            r = rng.uniform(8.0, 30.0)
-            ang = rng.uniform(0.0, 2.0 * math.pi)
-            x, y = r * math.cos(ang), r * math.sin(ang)
-            v = math.sqrt(G * STAR_M / r)
-            vx, vy = -v * math.sin(ang), v * math.cos(ang)
-            bodies.append(Body(x, y, 1.0, vx, vy))
-    
-    elif distribution == "cluster":
-        # Compact cluster
-        for i in range(N):
-            r = abs(rng.normal(0, 5.0))
-            ang = rng.uniform(0.0, 2.0 * math.pi)
-            x, y = r * math.cos(ang), r * math.sin(ang)
-            mass = rng.uniform(0.8, 1.2)
-            vx = rng.normal(0, 0.5)
-            vy = rng.normal(0, 0.5)
-            bodies.append(Body(x, y, mass, vx, vy))
+    elif USE_SOLVER.upper() == 'FMM':
+        if not HAS_FMM:
+            raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
+        theta = OPTIMIZED_PARAMS['fmm_theta']
+        ax_new, ay_new = fmm_kernel.fmm_omp(x_list, y_list, m_list,
+                                            OPTIMIZED_PARAMS['fmm_domain'],
+                                            theta, G, SOFT)
+    else:
+        raise ValueError(f"Unknown solver: {USE_SOLVER}")
+
+    # (4) 半步速度更新 (kick)
+    for i in range(N):
+        if include_central and i == 0:
+            continue
+        bodies[i, 2] += 0.5 * DT * ax_new[i]
+        bodies[i, 3] += 0.5 * DT * ay_new[i]
+
+    return ax_new, ay_new
+
+
+# ----------------------------
+# 计算系统总能量 (动能 + 位能)
+# include_central=True 时，第 0 号当作恒星
+# ----------------------------
+def total_energy(bodies, include_central=False):
+    N = bodies.shape[0]
+    # 动能
+    KE = 0.0
+    for i in range(N):
+        if include_central and i == 0:
+            continue
+        KE += 0.5 * bodies[i, 4] * (bodies[i, 2]**2 + bodies[i, 3]**2)
+
+    # 位能
+    PE = 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            if include_central and (i == 0 or j == 0):
+                # 如果第0号为恒星，只算其与其他的位能
+                if i == 0:
+                    dx = bodies[j, 0] - bodies[i, 0]
+                    dy = bodies[j, 1] - bodies[i, 1]
+                    dist = math.hypot(dx, dy) + SOFT
+                    PE -= G * bodies[i, 4] * bodies[j, 4] / dist
+                elif j == 0:
+                    dx = bodies[i, 0] - bodies[j, 0]
+                    dy = bodies[i, 1] - bodies[j, 1]
+                    dist = math.hypot(dx, dy) + SOFT
+                    PE -= G * bodies[i, 4] * bodies[j, 4] / dist
+                continue
+            # 普通两两相互作用
+            dx = bodies[i, 0] - bodies[j, 0]
+            dy = bodies[i, 1] - bodies[j, 1]
+            dist = math.hypot(dx, dy) + SOFT
+            PE -= G * bodies[i, 4] * bodies[j, 4] / dist
+
+    return KE + PE
+
+
+# ----------------------------
+# 随机生成 n 颗粒子，分布在半径 radius 的圆盘内
+# 如果 include_central=True，会把第0号留给恒星
+# 返回 bodies: shape (N_total, 5)，列顺序：x, y, vx, vy, m
+# ----------------------------
+def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_central=False):
+    if include_central:
+        N_total = n + 1
+    else:
+        N_total = n
+
+    bodies = np.zeros((N_total, 5), dtype=np.float64)
+
+    if include_central:
+        # 第 0 号当作不动的恒星
+        bodies[0, 0] = 0.0
+        bodies[0, 1] = 0.0
+        bodies[0, 2] = 0.0
+        bodies[0, 3] = 0.0
+        bodies[0, 4] = STAR_M
+
+    for i in range(1 if include_central else 0, N_total):
+        r = random.random()**0.5 * radius
+        theta = random.random() * 2.0 * math.pi
+        x = r * math.cos(theta)
+        y = r * math.sin(theta)
+        bodies[i, 0] = x
+        bodies[i, 1] = y
+        bodies[i, 4] = 1.0  # 每个粒子质量 1.0
+        # 初始速度设为 0
+        bodies[i, 2] = 0.0
+        bodies[i, 3] = 0.0
 
     return bodies
 
-def compute_acc(bodies, solver: str, theta: float = None):
-    """Compute accelerations with optimized parameters"""
-    if not bodies:
-        return np.array([]), np.array([])
-    
-    x = np.array([b.x for b in bodies], dtype=np.float64)
-    y = np.array([b.y for b in bodies], dtype=np.float64)
-    m = np.array([b.m for b in bodies], dtype=np.float64)
-    
-    try:
-        if solver == "direct":
-            return direct_omp(x, y, m, G, SOFT)
-        elif solver == "bh":
-            theta_use = theta if theta is not None else OPTIMIZED_PARAMS['bh_theta']
-            domain_use = OPTIMIZED_PARAMS['bh_domain']
-            return bh_omp(x, y, m, domain_use, theta_use, G, SOFT)
-        elif solver == "fmm":
-            theta_use = theta if theta is not None else OPTIMIZED_PARAMS['fmm_theta']
-            domain_use = OPTIMIZED_PARAMS['fmm_domain']
-            return fmm_omp(x, y, m, domain_use, theta_use, G, SOFT)
-        else:
-            raise ValueError(f"Unknown solver: {solver}")
-    except Exception as e:
-        print(f"Error in compute_acc with solver {solver}: {e}")
-        return np.zeros_like(x), np.zeros_like(y)
 
-def leapfrog(bodies, solver: str, fixed_star: bool = True, theta: float = None):
-    """Leapfrog integration"""
-    if not bodies:
-        return
-    
-    try:
-        ax, ay = compute_acc(bodies, solver, theta)
-        if len(ax) != len(bodies):
-            return
-        
-        start_idx = 1 if fixed_star else 0
-        
-        # First half-kick + drift
-        for i in range(start_idx, len(bodies)):
-            b = bodies[i]
-            b.vx += ax[i] * DT * 0.5
-            b.vy += ay[i] * DT * 0.5
-            b.x += b.vx * DT
-            b.y += b.vy * DT
-        
-        # Second half-kick
-        ax, ay = compute_acc(bodies, solver, theta)
-        if len(ax) != len(bodies):
-            return
-            
-        for i in range(start_idx, len(bodies)):
-            b = bodies[i]
-            b.vx += ax[i] * DT * 0.5
-            b.vy += ay[i] * DT * 0.5
-            
-    except Exception as e:
-        print(f"Error in leapfrog: {e}")
-
-def total_energy(bodies, include_central: bool = True):
-    """Calculate total energy"""
-    if not bodies:
-        return 0.0
-    
-    try:
-        ke, pe = 0.0, 0.0
-        start_idx = 0 if include_central else 1
-        
-        # Kinetic energy
-        for i in range(start_idx, len(bodies)):
-            b = bodies[i]
-            ke += 0.5 * b.m * (b.vx**2 + b.vy**2)
-        
-        # Potential energy
-        for i in range(start_idx, len(bodies)):
-            for j in range(i + 1, len(bodies)):
-                bi, bj = bodies[i], bodies[j]
-                dx, dy = bi.x - bj.x, bi.y - bj.y
-                r = math.sqrt(dx*dx + dy*dy + SOFT*SOFT)
-                if r > 0:
-                    pe -= G * bi.m * bj.m / r
-        
-        return ke + pe
-        
-    except Exception as e:
-        print(f"Error calculating energy: {e}")
-        return 0.0
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                          MENU FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def quick_benchmark():
-    """Benchmark with optimized parameters"""
-    print("Running optimized benchmark...")
-    
-    # Show thread info
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    Ns = [100, 200, 500, 1000]
-    times = defaultdict(list)
-    errors = defaultdict(list)
-
-    for N in Ns:
-        print(f"\nTesting N = {N}")
-        bodies = init_system(N, with_central=False, distribution="random")
-        
-        # Reference (direct)
-        if N <= 1000:
-            t0 = time.time()
-            ax_ref, ay_ref = compute_acc(bodies, "direct")
-            direct_time = time.time() - t0
-            times['direct'].append(direct_time)
-            print(f"  Direct:    {direct_time:.4e} s ({thread_count} threads)")
-        else:
-            ax_ref, ay_ref = None, None
-        
-        # Test other methods
-        for solver in ["bh", "fmm"]:
-            t0 = time.time()
-            ax, ay = compute_acc(bodies, solver)
-            solver_time = time.time() - t0
-            times[solver].append(solver_time)
-            print(f"  {solver.upper():8}: {solver_time:.4e} s ({thread_count} threads)")
-            
-            # Calculate error relative to direct method
-            if ax_ref is not None and len(ax) > 0:
-                error = np.mean(np.sqrt((ax - ax_ref)**2 + (ay - ay_ref)**2) / 
-                               (np.sqrt(ax_ref**2 + ay_ref**2) + 1e-10))
-                errors[solver].append(error)
-                print(f"    Error: {error:.4e}")
-            else:
-                errors[solver].append(np.nan)
-
-    # Plot results with unique filename
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Performance plot
-    colors = {"direct": "red", "bh": "blue", "fmm": "green"}
-    markers = {"direct": "o", "bh": "s", "fmm": "^"}
-    
-    for solver in SOLVERS.keys():
-        valid_data = [(n, t) for n, t in zip(Ns, times[solver]) if not np.isnan(t)]
-        if valid_data:
-            ns, ts = zip(*valid_data)
-            ax1.loglog(ns, ts, markers[solver] + "-", label=solver.upper(), 
-                      color=colors[solver], linewidth=2, markersize=8)
-    
-    ax1.set_xlabel("N particles", fontsize=12)
-    ax1.set_ylabel("Wall-clock time (s)", fontsize=12)
-    ax1.set_title(f"Performance with {thread_count} OpenMP Threads", fontsize=14)
-    ax1.grid(True, which="both", alpha=0.3)
-    ax1.legend(fontsize=11)
-    
-    # Error plot
-    for solver in ["bh", "fmm"]:
-        valid_data = [(n, e) for n, e in zip(Ns, errors[solver]) if not np.isnan(e)]
-        if valid_data:
-            ns, es = zip(*valid_data)
-            ax2.loglog(ns, es, markers[solver] + "-", label=f"{solver.upper()} Error", 
-                      color=colors[solver], linewidth=2, markersize=8)
-    
-    # Add reference lines
-    ax2.axhline(y=0.01, color='orange', linestyle='--', alpha=0.7, label='1% Target')
-    ax2.axhline(y=0.1, color='red', linestyle='--', alpha=0.7, label='10% Limit')
-    
-    ax2.set_xlabel("N particles", fontsize=12)
-    ax2.set_ylabel("Relative Error", fontsize=12)
-    ax2.set_title("Accuracy vs Direct Method", fontsize=14)
-    ax2.grid(True, which="both", alpha=0.3)
-    ax2.legend(fontsize=11)
-    
-    plt.tight_layout()
-    
-    # Use unique filename
-    plot_filename = get_unique_filename("benchmark_scaling", N=Ns[-1], extension=".png")
-    plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
-    plt.show()
-    print(f"Saved {plot_filename}")
-
-def save_trajectory():
-    """Save trajectory with optimized settings"""
-    print("\n=== Trajectory + Energy Analysis ===")
-    
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    N = int(input("Number of particles [100]: ") or "100")
-    steps = int(input("Integration steps [600]: ") or "600")
-    solver = (input("Solver direct/bh/fmm [fmm]: ") or "fmm").lower()
-    distribution = (input("Distribution disc/random/cluster [disc]: ") or "disc").lower()
-    gif = (input("Output GIF filename [trajectory.gif]: ") or "trajectory.gif")
-    
-    # Ask for custom parameters
-    if solver == "bh":
-        theta_input = input(f"Barnes-Hut theta parameter [{OPTIMIZED_PARAMS['bh_theta']}]: ")
-        theta = float(theta_input) if theta_input else None
-    elif solver == "fmm":
-        theta_input = input(f"FMM theta parameter [{OPTIMIZED_PARAMS['fmm_theta']}]: ")
-        theta = float(theta_input) if theta_input else None
-    else:
-        theta = None
-    
-    if solver not in SOLVERS:
-        print(f"Unknown solver {solver}, using fmm")
-        solver = "fmm"
-    
-    print(f"\nInitializing {N} particles with {distribution} distribution...")
-    fixed_star = distribution == "disc"
-    bodies = init_system(N, with_central=fixed_star, distribution=distribution)
-    
-    print(f"Integrating for {steps} steps using {solver.upper()} solver with {thread_count} threads...")
-    if theta is not None:
-        print(f"Using custom theta = {theta}")
-    
-    # Storage
-    xs = [[] for _ in bodies]
-    ys = [[] for _ in bodies]
-    E_list = []
-    E0 = total_energy(bodies, include_central=fixed_star)
-    
-    try:
-        for s in trange(steps, desc="Integrating"):
-            # Save coordinates
-            for i, b in enumerate(bodies):
-                xs[i].append(b.x)
-                ys[i].append(b.y)
-            
-            # Advance
-            leapfrog(bodies, solver, fixed_star=fixed_star, theta=theta)
-            
-            # Log energy
-            if s % 10 == 0:
-                E = total_energy(bodies, include_central=fixed_star)
-                rel_error = (E - E0) / abs(E0) if E0 != 0 else 0
-                E_list.append((s * DT, E, rel_error))
-    
-    except KeyboardInterrupt:
-        print("\nIntegration interrupted")
-    except Exception as e:
-        print(f"\nError during integration: {e}")
-        return
-
-    # Energy plot with unique filename
-    if E_list:
-        times, energies, rel_errors = zip(*E_list)
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        
-        ax1.plot(times, energies, 'b-', linewidth=2, label='Total Energy')
-        ax1.axhline(y=E0, color='r', linestyle='--', alpha=0.7, label='Initial Energy')
-        ax1.set_xlabel("Time", fontsize=12)
-        ax1.set_ylabel("Total Energy", fontsize=12)
-        ax1.set_title(f"Energy vs Time ({solver.upper()}, θ={theta if theta else 'default'}, {thread_count} threads)", fontsize=14)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        ax2.semilogy(times, np.abs(rel_errors), 'r-', linewidth=2)
-        ax2.set_xlabel("Time", fontsize=12)
-        ax2.set_ylabel("Absolute Relative Energy Error", fontsize=12)
-        ax2.set_title("Energy Conservation", fontsize=14)
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Use unique filename
-        energy_filename = get_unique_filename("energy_vs_time", solver, N, extension=".png")
-        plt.savefig(energy_filename, dpi=180, bbox_inches='tight')
-        plt.close()
-        print(f"Saved {energy_filename}")
-        
-        final_error = abs(rel_errors[-1]) if rel_errors else 0
-        print(f"Final energy error: {final_error:.6f}")
-
-    # Create animation using individual points with unique filename
-    if len(xs) > 0 and len(xs[0]) > 0:
-        print("Creating animation...")
-        try:
-            fig, ax = plt.subplots(figsize=(10, 10))
-            
-            # Create individual plot points
-            points = []
-            if fixed_star:
-                colors = ["red"] + ["blue"] * (len(bodies) - 1)
-                sizes = [10] + [3] * (len(bodies) - 1)
-            else:
-                colors = ["blue"] * len(bodies)
-                sizes = [3] * len(bodies)
-            
-            for i in range(len(bodies)):
-                point, = ax.plot([], [], 'o', color=colors[i], markersize=sizes[i], alpha=0.8)
-                points.append(point)
-            
-            # Set limits
-            all_x = [x for particle_x in xs for x in particle_x[::10]]  # Sample every 10th frame
-            all_y = [y for particle_y in ys for y in particle_y[::10]]
-            if all_x and all_y:
-                margin = 0.1
-                x_range = max(all_x) - min(all_x)
-                y_range = max(all_y) - min(all_y)
-                ax.set_xlim(min(all_x) - margin * x_range, max(all_x) + margin * x_range)
-                ax.set_ylim(min(all_y) - margin * y_range, max(all_y) + margin * y_range)
-            else:
-                ax.set_xlim(-60, 60)
-                ax.set_ylim(-60, 60)
-            
-            ax.set_aspect('equal')
-            ax.grid(True, alpha=0.3)
-            ax.set_title(f"{solver.upper()} N-body simulation (N={len(bodies)}, {thread_count} threads)")
-
-            def init():
-                for point in points:
-                    point.set_data([], [])
-                return points
-
-            def update(frame):
-                if frame < len(xs[0]):
-                    for i, point in enumerate(points):
-                        if i < len(xs):
-                            point.set_data([xs[i][frame]], [ys[i][frame]])
-                return points
-
-            ani = FuncAnimation(fig, update, frames=len(xs[0]), init_func=init, 
-                              blit=True, interval=50)
-            
-            # Use unique filename for GIF
-            if gif == "trajectory.gif":  # Default name
-                gif = get_unique_filename("trajectory", solver, len(bodies), extension=".gif")
-            elif not gif.endswith('.gif'):
-                gif += '.gif'
-                
-            ani.save(gif, writer=PillowWriter(fps=20))
-            plt.close(fig)
-            print(f"Saved {gif}")
-            
-        except Exception as e:
-            print(f"Error creating animation: {e}")
-
-def live_animation():
-    """Live animation with optimized parameters"""
-    print("\n=== Live Animation ===")
-    
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    N = int(input("Number of particles [50]: ") or "50")
-    solver = (input("Solver direct/bh/fmm [fmm]: ") or "fmm").lower()
-    distribution = (input("Distribution disc/random/cluster [disc]: ") or "disc").lower()
-    frames = int(input("Number of frames [500]: ") or "500")
-    
-    if solver not in SOLVERS:
-        solver = "fmm"
-    
-    fixed_star = distribution == "disc"
-    bodies = init_system(N, with_central=fixed_star, distribution=distribution)
-    
-    fig, ax = plt.subplots(figsize=(10, 10))
-    
-    # Create points
-    points = []
-    if fixed_star:
-        colors = ["red"] + ["blue"] * (len(bodies) - 1)
-        sizes = [10] + [3] * (len(bodies) - 1)
-    else:
-        colors = ["blue"] * len(bodies)
-        sizes = [3] * len(bodies)
-    
-    for i in range(len(bodies)):
-        point, = ax.plot([bodies[i].x], [bodies[i].y], 'o', 
-                        color=colors[i], markersize=sizes[i], alpha=0.8)
-        points.append(point)
-    
-    ax.set_xlim(-70, 70)
-    ax.set_ylim(-70, 70)
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)}, {thread_count} threads)")
-
-    def update(frame):
-        try:
-            leapfrog(bodies, solver, fixed_star=fixed_star)
-            
-            for i, point in enumerate(points):
-                if i < len(bodies):
-                    point.set_data([bodies[i].x], [bodies[i].y])
-            
-            ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)}, frame={frame}, {thread_count} threads)")
-            return points
-        except Exception as e:
-            print(f"Error in frame {frame}: {e}")
-            return points
-
-    ani = FuncAnimation(fig, update, frames=frames, interval=50, blit=True)
-    
-    gif_name = input("Save as GIF? (filename or Enter to skip): ").strip()
-    if gif_name:
-        if not gif_name.endswith('.gif'):
-            gif_name += '.gif'
-        # Add unique identifier
-        gif_name = get_unique_filename(gif_name.replace('.gif', ''), solver, len(bodies), extension=".gif")
-        try:
-            ani.save(gif_name, writer=PillowWriter(fps=20))
-            print(f"Saved {gif_name}")
-        except Exception as e:
-            print(f"Error saving GIF: {e}")
-    
-    plt.show()
-
-def scaling_test():
-    """Large-N scaling test with optimized parameters"""
-    print("\n=== Large-N Scaling Test ===")
-    
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    choice = input("Test (1) small N with all methods or (2) large N with BH/FMM [1]: ").strip()
-    
-    if choice == "2":
-        Ns = [1000, 2000, 5000, 10000, 20000]
-        methods = ["bh", "fmm"]
-    else:
-        Ns = [100, 200, 500, 1000, 2000]
-        methods = ["direct", "bh", "fmm"]
-    
-    times = defaultdict(list)
-    
-    for N in Ns:
-        print(f"\nN = {N} ({thread_count} threads)")
-        bodies = init_system(N, with_central=False, distribution="random")
-        
-        for method in methods:
-            if method == "direct" and N > 2000:
-                continue
-                
-            try:
-                t0 = time.time()
-                compute_acc(bodies, method)
-                elapsed = time.time() - t0
-                times[method].append(elapsed)
-                print(f"  {method.upper():6}: {elapsed:.4f} s")
-            except Exception as e:
-                print(f"  {method.upper():6}: ERROR - {e}")
-
-    # Save and plot results with unique filename
-    size_type = 'large' if choice == '2' else 'small'
-    csv_file = get_unique_filename(f"scaling_{size_type}N", N=Ns[-1], extension=".csv")
-    
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["N"] + [m.upper() for m in methods] + [f"OpenMP_Threads"])
-        
-        for i, N in enumerate(Ns):
-            row = [N]
-            for method in methods:
-                if i < len(times[method]):
-                    row.append(times[method][i])
-                else:
-                    row.append("")
-            row.append(thread_count)
-            writer.writerow(row)
-    
-    print(f"Saved {csv_file}")
-
-    # Plot with unique filename
-    plt.figure(figsize=(12, 8))
-    colors = {"direct": "red", "bh": "blue", "fmm": "green"}
-    markers = {"direct": "o", "bh": "s", "fmm": "^"}
-    
-    for method in methods:
-        if times[method]:
-            valid_data = [(N, t) for N, t in zip(Ns, times[method]) if not np.isnan(t)]
-            if valid_data:
-                ns, ts = zip(*valid_data)
-                plt.loglog(ns, ts, markers[method] + "-", 
-                          label=method.upper(), color=colors[method], 
-                          linewidth=2, markersize=8)
-    
-    # Theoretical scaling
-    if times.get("fmm"):
-        N_ref, t_ref = Ns[0], times["fmm"][0]
-        plt.loglog(Ns, [t_ref * N / N_ref for N in Ns], 
-                  "--", color="green", alpha=0.5, label="O(N) theory")
-    
-    if times.get("bh"):
-        N_ref, t_ref = Ns[0], times["bh"][0]
-        plt.loglog(Ns, [t_ref * N * np.log(N) / (N_ref * np.log(N_ref)) for N in Ns], 
-                  "--", color="blue", alpha=0.5, label="O(N log N) theory")
-    
-    plt.xlabel("Number of Particles", fontsize=12)
-    plt.ylabel("Computation Time (s)", fontsize=12)
-    plt.title(f"Scaling Comparison ({thread_count} OpenMP threads)", fontsize=14)
-    plt.grid(True, which="both", alpha=0.3)
-    plt.legend(fontsize=11)
-    plt.tight_layout()
-    
-    png_file = get_unique_filename(f"scaling_{size_type}N", N=Ns[-1], extension=".png")
-    plt.savefig(png_file, dpi=200, bbox_inches='tight')
-    plt.show()
-    print(f"Saved {png_file}")
-
-def energy_conservation_test():
-    """Enhanced energy conservation test"""
-    print("\n=== Energy Conservation Test ===")
-    
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    N = int(input("Number of particles [100]: ") or "100")
-    steps = int(input("Integration steps [1000]: ") or "1000")
-    
-    bodies_init = init_system(N, with_central=True, distribution="disc")
-    E0 = total_energy(bodies_init, include_central=True)
-    
-    solvers = ["direct", "bh", "fmm"]
-    results = {}
-    
-    for solver in solvers:
-        if solver == "direct" and N > 1000:
-            print(f"Skipping direct solver for N={N}")
-            continue
-            
-        print(f"\nTesting {solver.upper()} solver with {thread_count} threads...")
-        bodies = [Body(b.x, b.y, b.m, b.vx, b.vy) for b in bodies_init]
-        
-        times, energies, errors = [], [], []
-        
-        try:
-            for step in trange(steps, desc=f"{solver.upper()}"):
-                if step % 25 == 0:
-                    E = total_energy(bodies, include_central=True)
-                    times.append(step * DT)
-                    energies.append(E)
-                    errors.append(abs(E - E0) / abs(E0) if E0 != 0 else 0)
-                
-                leapfrog(bodies, solver, fixed_star=True)
-            
-            results[solver] = (times, energies, errors)
-            
-        except Exception as e:
-            print(f"Error testing {solver}: {e}")
-    
-    # Plot results with unique filename
-    if results:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        colors = {"direct": "red", "bh": "blue", "fmm": "green"}
-        
-        for solver, (times, energies, errors) in results.items():
-            color = colors[solver]
-            ax1.plot(times, energies, label=f"{solver.upper()}", color=color, linewidth=2)
-            ax2.semilogy(times, errors, label=f"{solver.upper()}", color=color, linewidth=2)
-        
-        ax1.axhline(y=E0, color='black', linestyle='--', alpha=0.7, label='Initial Energy')
-        ax1.set_xlabel("Time", fontsize=12)
-        ax1.set_ylabel("Total Energy", fontsize=12)
-        ax1.set_title(f"Energy vs Time ({thread_count} OpenMP threads)", fontsize=14)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        ax2.set_xlabel("Time", fontsize=12)
-        ax2.set_ylabel("Relative Energy Error", fontsize=12)
-        ax2.set_title("Energy Conservation", fontsize=14)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Use unique filename
-        energy_filename = get_unique_filename("energy_conservation", N=N, steps=steps, extension=".png")
-        plt.savefig(energy_filename, dpi=200, bbox_inches='tight')
-        plt.show()
-        print(f"Saved {energy_filename}")
-        
-        # Print final errors
-        print("\nFinal energy errors:")
-        for solver, (_, _, errors) in results.items():
-            if errors:
-                print(f"  {solver.upper():6}: {errors[-1]:.2e}")
-
-def parameter_optimization():
-    """Interactive parameter optimization"""
-    print("\n=== Parameter Optimization ===")
-    
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    print(f"Using {thread_count} OpenMP threads")
-    
-    N = int(input("Number of particles for testing [100]: ") or "100")
-    solver = input("Solver to optimize (bh/fmm) [bh]: ").strip().lower() or "bh"
-    
-    if solver not in ["bh", "fmm"]:
-        print("Invalid solver")
-        return
-    
-    print(f"\nOptimizing {solver.upper()} parameters with {thread_count} threads...")
-    
-    # Create test system
-    bodies = init_system(N, with_central=False, distribution="random")
-    
-    # Reference solution
-    print("Computing reference solution...")
-    ax_ref, ay_ref = compute_acc(bodies, "direct")
-    
-    # Parameter ranges
-    if solver == "bh":
-        theta_values = [0.1, 0.3, 0.5, 0.7, 1.0]
-        domain_values = [50.0, 100.0, 150.0, 200.0]
-    else:  # fmm
-        theta_values = [0.2, 0.4, 0.6, 0.8, 1.0]
-        domain_values = [50.0, 100.0, 150.0, 200.0]
-    
-    best_error = float('inf')
-    best_params = {}
-    results = []
-    
-    print(f"\nTesting parameter combinations:")
-    print("Theta  Domain  Error      Time (ms)")
-    print("-" * 40)
-    
-    for domain in domain_values:
-        for theta in theta_values:
-            t0 = time.time()
-            
-            if solver == "bh":
-                ax, ay = bh_omp(np.array([b.x for b in bodies]), 
-                               np.array([b.y for b in bodies]),
-                               np.array([b.m for b in bodies]),
-                               domain, theta, G, SOFT)
-            else:
-                ax, ay = fmm_omp(np.array([b.x for b in bodies]), 
-                                np.array([b.y for b in bodies]),
-                                np.array([b.m for b in bodies]),
-                                domain, theta, G, SOFT)
-            
-            t_elapsed = (time.time() - t0) * 1000  # ms
-            
-            error = np.mean(np.sqrt((ax - ax_ref)**2 + (ay - ay_ref)**2) / 
-                           (np.sqrt(ax_ref**2 + ay_ref**2) + 1e-10))
-            
-            results.append((theta, domain, error, t_elapsed))
-            print(f"{theta:5.1f}  {domain:6.1f}  {error:8.2e}  {t_elapsed:8.2f}")
-            
-            if error < best_error:
-                best_error = error
-                best_params = {'theta': theta, 'domain': domain, 'time': t_elapsed}
-    
-    print(f"\nBest parameters:")
-    print(f"  Theta: {best_params['theta']}")
-    print(f"  Domain: {best_params['domain']}")
-    print(f"  Error: {best_error:.2e}")
-    print(f"  Time: {best_params['time']:.2f} ms ({thread_count} threads)")
-    
-    # Create parameter space plot with unique filename
-    try:
-        # Reshape results for plotting
-        theta_grid = np.array([r[0] for r in results])
-        domain_grid = np.array([r[1] for r in results])
-        error_grid = np.array([r[2] for r in results])
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # Create scatter plot
-        scatter = ax.scatter(theta_grid, domain_grid, c=np.log10(error_grid), 
-                           s=100, cmap='viridis', alpha=0.8)
-        
-        # Mark best point
-        ax.scatter(best_params['theta'], best_params['domain'], 
-                  c='red', s=200, marker='*', label='Best')
-        
-        ax.set_xlabel('Theta Parameter', fontsize=12)
-        ax.set_ylabel('Domain Size', fontsize=12)
-        ax.set_title(f'{solver.upper()} Parameter Optimization ({thread_count} threads)', fontsize=14)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Add colorbar
-        cbar = plt.colorbar(scatter)
-        cbar.set_label('log10(Relative Error)', fontsize=12)
-        
-        plt.tight_layout()
-        
-        # Use unique filename - this one already was correct!
-        plot_filename = get_unique_filename(f'{solver}_parameter_optimization', N=N, extension=".png")
-        plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
-        plt.show()
-        print(f"Saved {plot_filename}")
-        
-    except Exception as e:
-        print(f"Could not create plot: {e}")
-
+# ----------------------------
+# 交互式菜单主程序
+# ----------------------------
 def main_menu():
-    """Enhanced main menu with OpenMP information"""
-    print("\n" + "="*60)
-    print("    2-D High-Precision N-body Simulation")
-    print("    Optimized Barnes-Hut and FMM kernels")
-    print("="*60)
-    
-    # Show OpenMP info
-    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
-    openmp_info = get_openmp_info()
-    
-    print(f"\nCurrent OpenMP configuration:")
-    print(f"  Threads: {thread_count} (max available: {openmp_info['max_threads']})")
-    print(f"  OpenMP support: {'✓ Yes' if openmp_info['has_openmp'] else '❌ No'}")
-    
-    print(f"\nOptimized parameters:")
-    print(f"  Barnes-Hut: θ={OPTIMIZED_PARAMS['bh_theta']}, domain={OPTIMIZED_PARAMS['bh_domain']}")
-    print(f"  FMM: θ={OPTIMIZED_PARAMS['fmm_theta']}, domain={OPTIMIZED_PARAMS['fmm_domain']}")
-    
+    global USE_SOLVER
+    print("\n=== 2D N-body Playground (Parallel, High-Precision) ===")
+    print("Select option:")
+    print(" 1) Quick benchmark scaling")
+    print(" 2) Save trajectory + energy plot")
+    print(" 3) Live simulation animation")
+    print(" 4) Demo comparison (performance vs accuracy)")
+    print("  q) Quit")
+    print("==============================================")
+
     while True:
-        print("\n=== Main Menu ===")
-        print("1) Quick benchmark (with OpenMP)")
-        print("2) Save trajectory + energy plot")
-        print("3) Live animation")
-        print("4) Large-N scaling test")
-        print("5) Energy conservation test")
-        print("6) Parameter optimization")
-        print("7) OpenMP thread benchmark")
-        print("8) System information")
-        print("q) Quit")
-        
-        choice = input("\nSelect option: ").strip().lower()
-        
         try:
-            if choice == "1":
-                quick_benchmark()
-            elif choice == "2":
-                save_trajectory()
-            elif choice == "3":
-                live_animation()
-            elif choice == "4":
-                scaling_test()
-            elif choice == "5":
-                energy_conservation_test()
-            elif choice == "6":
-                parameter_optimization()
-            elif choice == "7":
-                openmp_benchmark()
-            elif choice == "8":
-                system_info()
+            choice = input("\nEnter choice: ").strip().lower()
+            if choice in ["1", "benchmark"]:
+                # --------------------------------------------------------------
+                # Option 1: Quick benchmark scaling
+                # --------------------------------------------------------------
+                try:
+                    from comprehensive_test import benchmark_scaling
+                    benchmark_scaling(distr_size=OPTIMIZED_PARAMS['distribution_size'],
+                                      domain=DOMAIN)
+                except ImportError:
+                    print("Error: 无法导入 'benchmark_scaling'，请检查 comprehensive_test.py。")
+
+            elif choice in ["2", "save", "save trajectory"]:
+                # --------------------------------------------------------------
+                # Option 2: 存储轨迹 + 能量-时间曲线
+                # --------------------------------------------------------------
+                print("\nSave trajectory + energy plot")
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--solver", type=str, default="direct",
+                                    choices=["direct", "bh", "fmm"],
+                                    help="Solver to use: direct / bh / fmm")
+                parser.add_argument("--n", type=int, default=200,
+                                    help="Number of particles (excluding central star)")
+                parser.add_argument("--steps", type=int, default=2000,
+                                    help="Number of integration steps")
+                parser.add_argument("--threads", type=int, default=4,
+                                    help="Number of OpenMP threads")
+                parser.add_argument("--fixed-star", action="store_true",
+                                    help="Include a fixed central star at index 0")
+                args = parser.parse_args()
+
+                USE_SOLVER = args.solver
+                N = args.n
+                STEPS = args.steps
+                THREADS = args.threads
+                fixed_star = args.fixed_star
+
+                # 设置 OpenMP 线程数
+                os.environ["OMP_NUM_THREADS"] = str(THREADS)
+
+                # 生成初始分布
+                bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
+
+                # 记录初始能量
+                E0 = total_energy(bodies, include_central=fixed_star)
+
+                xs = []
+                ys = []
+                E_list = []
+
+                total_N = bodies.shape[0]
+
+                # 第一次计算初始加速度
+                x0 = bodies[:, 0].tolist()
+                y0 = bodies[:, 1].tolist()
+                m0 = bodies[:, 4].tolist()
+                if USE_SOLVER.upper() == 'DIRECT':
+                    if not HAS_DIRECT_BH:
+                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                    ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
+                elif USE_SOLVER.upper() == 'BH':
+                    if not HAS_DIRECT_BH:
+                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                    theta = OPTIMIZED_PARAMS['bh_theta']
+                    ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
+                elif USE_SOLVER.upper() == 'FMM':
+                    if not HAS_FMM:
+                        raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
+                    theta = OPTIMIZED_PARAMS['fmm_theta']
+                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0,
+                                                  OPTIMIZED_PARAMS['fmm_domain'],
+                                                  theta, G, SOFT)
+                else:
+                    raise ValueError(f"Unknown solver: {USE_SOLVER}")
+
+                ax = ax0
+                ay = ay0
+
+                try:
+                    for s in range(STEPS):
+                        if s % 10 == 0:
+                            xs.append(bodies[:, 0].copy())
+                            ys.append(bodies[:, 1].copy())
+
+                        ax, ay = leapfrog_step(bodies, ax, ay, include_central=fixed_star)
+
+                        if s % 10 == 0:
+                            E = total_energy(bodies, include_central=fixed_star)
+                            rel_error = (E - E0) / abs(E0) if E0 != 0 else 0.0
+                            E_list.append((s * DT, E, rel_error))
+
+                except KeyboardInterrupt:
+                    print("\nIntegration interrupted by user.")
+                except Exception as e:
+                    print(f"\nError during integration: {e}")
+                    return
+
+                # 保存轨迹动画 (GIF)
+                if xs and ys:
+                    print("Creating animation GIF...")
+                    fig, axg = plt.subplots(figsize=(8, 8))
+                    points = []
+                    if fixed_star:
+                        colors = ["red"] + ["blue"] * (total_N - 1)
+                        sizes = [10] + [3] * (total_N - 1)
+                    else:
+                        colors = ["blue"] * total_N
+                        sizes = [3] * total_N
+
+                    for i in range(total_N):
+                        # 先画一个空点
+                        pt, = axg.plot([], [], 'o', color=colors[i], markersize=sizes[i], alpha=0.8)
+                        points.append(pt)
+
+                    axg.set_xlim(-DOMAIN, DOMAIN)
+                    axg.set_ylim(-DOMAIN, DOMAIN)
+                    axg.set_title(f"Trajectory ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
+
+                    def update(frame):
+                        # 由于 set_data 要求传入序列，所以把每个坐标用 [x], [y] 包起来
+                        for i, pt in enumerate(points):
+                            pt.set_data([xs[frame][i]], [ys[frame][i]])
+                        return points
+
+                    import matplotlib.animation as animation
+                    ani = animation.FuncAnimation(fig, update, frames=len(xs), interval=50, blit=True)
+                    gif_name = f"trajectory_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
+                    ani.save(gif_name, fps=20, dpi=80)
+                    plt.close(fig)
+                    print(f"Saved trajectory GIF: {gif_name}")
+
+                # 保存能量-时间曲线
+                if E_list:
+                    print("Creating energy vs time plot...")
+                    times = [item[0] for item in E_list]
+                    energies = [item[1] for item in E_list]
+                    rel_errors = [item[2] for item in E_list]
+
+                    fig, axp = plt.subplots(figsize=(8, 4))
+                    axp.plot(times, energies, label="Total Energy")
+                    axp.axhline(E0, color="gray", linestyle="--", label="Initial Energy")
+                    axp.set_xlabel("Time")
+                    axp.set_ylabel("Energy")
+                    axp.set_title(f"Energy vs Time ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
+                    axp.legend()
+
+                    energy_plot = f"energy_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+                    fig.tight_layout()
+                    fig.savefig(energy_plot, dpi=150)
+                    plt.close(fig)
+                    print(f"Saved energy plot: {energy_plot}")
+
+            elif choice in ["3", "live", "live simulation"]:
+                # --------------------------------------------------------------
+                # Option 3: 实时模拟动画 → 直接输出 GIF
+                # --------------------------------------------------------------
+                print("\nLive simulation animation")
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--solver", type=str, default="fmm",
+                                    choices=["direct", "bh", "fmm"],
+                                    help="Solver to use: direct / bh / fmm")
+                parser.add_argument("--n", type=int, default=100,
+                                    help="Number of particles (excluding central star)")
+                parser.add_argument("--steps", type=int, default=500,
+                                    help="Number of integration steps")
+                parser.add_argument("--threads", type=int, default=8,
+                                    help="Number of OpenMP threads")
+                parser.add_argument("--fixed-star", action="store_true",
+                                    help="Include a fixed central star at index 0")
+                args = parser.parse_args()
+
+                USE_SOLVER = args.solver
+                N = args.n
+                STEPS = args.steps
+                THREADS = args.threads
+                fixed_star = args.fixed_star
+
+                os.environ["OMP_NUM_THREADS"] = str(THREADS)
+                bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
+                total_N = bodies.shape[0]
+
+                x0 = bodies[:, 0].tolist()
+                y0 = bodies[:, 1].tolist()
+                m0 = bodies[:, 4].tolist()
+                if USE_SOLVER.upper() == 'DIRECT':
+                    if not HAS_DIRECT_BH:
+                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                    ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
+                elif USE_SOLVER.upper() == 'BH':
+                    if not HAS_DIRECT_BH:
+                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                    theta = OPTIMIZED_PARAMS['bh_theta']
+                    ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
+                elif USE_SOLVER.upper() == 'FMM':
+                    if not HAS_FMM:
+                        raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
+                    theta = OPTIMIZED_PARAMS['fmm_theta']
+                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0,
+                                                  OPTIMIZED_PARAMS['fmm_domain'],
+                                                  theta, G, SOFT)
+                else:
+                    raise ValueError(f"Unknown solver: {USE_SOLVER}")
+
+                ax = ax0
+                ay = ay0
+
+                print("Creating live simulation GIF...")
+                fig, ax_live = plt.subplots(figsize=(8, 8))
+                points = []
+                if fixed_star:
+                    colors = ["red"] + ["blue"] * (total_N - 1)
+                    sizes = [10] + [3] * (total_N - 1)
+                else:
+                    colors = ["blue"] * total_N
+                    sizes = [3] * total_N
+
+                for i in range(total_N):
+                    # 先画一个空点
+                    pt, = ax_live.plot([], [], 'o', color=colors[i], markersize=sizes[i], alpha=0.8)
+                    points.append(pt)
+
+                ax_live.set_xlim(-DOMAIN, DOMAIN)
+                ax_live.set_ylim(-DOMAIN, DOMAIN)
+                ax_live.set_title(f"Live Simulation ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
+
+                def update(frame):
+                    nonlocal ax, ay
+                    ax, ay = leapfrog_step(bodies, ax, ay, include_central=fixed_star)
+                    for idx, pt in enumerate(points):
+                        # 同样 wrap 成列表
+                        pt.set_data([bodies[idx, 0]], [bodies[idx, 1]])
+                    return points
+
+                import matplotlib.animation as animation
+                ani = animation.FuncAnimation(fig, update, frames=STEPS, interval=50, blit=True)
+                gif_name = f"live_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
+                ani.save(gif_name, fps=20, dpi=80)
+                plt.close(fig)
+                print(f"Saved live simulation GIF: {gif_name}")
+
+            elif choice in ["4", "demo", "comparison"]:
+                # --------------------------------------------------------------
+                # Option 4: Performance vs Accuracy 示意图
+                # --------------------------------------------------------------
+                print("\nDemo: Performance vs Accuracy")
+                try:
+                    from comprehensive_test import test_performance_comparison, test_accuracy_comparison
+                    print("Generating performance comparison figure ...")
+                    test_performance_comparison()
+                    print("Generating accuracy comparison figure ...")
+                    test_accuracy_comparison()
+                except ImportError:
+                    print("Error: 无法导入 'test_performance_comparison' 或 'test_accuracy_comparison'，请检查 comprehensive_test.py。")
+
             elif choice in ["q", "quit", "exit"]:
                 print("Goodbye!")
                 break
+
             else:
                 print("Invalid choice. Please try again.")
-                
+
         except KeyboardInterrupt:
             print("\n\nOperation interrupted by user.")
         except Exception as e:
             print(f"\nError: {e}")
             print("Please try again or choose a different option.")
 
+
 if __name__ == "__main__":
     main_menu()
+
