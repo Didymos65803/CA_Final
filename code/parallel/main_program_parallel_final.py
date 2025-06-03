@@ -4,16 +4,21 @@
 main_program_parallel_final.py
 ==============================
 Interactive 2-D N-body playground with optimized high-precision kernels
-（完整版，已修正动画 “x must be a sequence” 问题以及缺少 comprehensive_test 函数时的容错）
+（已对 comprehensive_test.py 中的函数名称做匹配与容错）
+
+功能：
+ 1) Quick benchmark scaling  → 调用 test_scaling()
+ 2) Save trajectory + energy plot
+ 3) Live simulation animation
+ 4) Demo comparison (performance vs accuracy)  → 调用 test_accuracy() + test_scaling()
+  q) Quit
 """
 
 import os
 import sys
-import time
 import math
 import random
 import argparse
-import itertools
 from datetime import datetime
 
 import numpy as np
@@ -39,24 +44,23 @@ except ImportError:
     bh_omp     = None
 
 # ----------------------------
-# 全局物理常数与默认参数（已修正）
+# 全局物理常数与默认参数
 # ----------------------------
 G = 1.0
-SOFT = 0.005               # 近场软化长度，由 0.1 改为 0.005
-DOMAIN = 100.0             # 空间范围：[-50, 50] × [-50, 50]
-DT = 0.0005                # Leapfrog 时步，由 0.001 改为 0.0005
-STAR_M = 100.0             # 中心恒星质量（如果 include_central=True）
+SOFT = 0.005               # 近场软化长度
+DOMAIN = 100.0             # 模拟域边长：[-50, 50] × [-50, 50]
+DT = 0.0005                # Leapfrog 时步
+STAR_M = 100.0             # 固定中心恒星的质量
 
-# 优化参数
 OPTIMIZED_PARAMS = {
-    'bh_theta': 0.3,       # BH 开放角度
-    'fmm_theta': 0.2,      # FMM 开放角度，由 0.4 改为 0.2
+    'bh_theta': 0.3,
+    'fmm_theta': 0.2,
     'bh_domain': DOMAIN,
     'fmm_domain': DOMAIN,
-    'distribution_size': 50.0,  # 初始圆盘分布半径
+    'distribution_size': 50.0,
 }
 
-# 默认使用 DIRECT 求力，用户可在菜单中修改
+# 默认求力方法：DIRECT、BH 或 FMM
 USE_SOLVER = "DIRECT"
 
 
@@ -66,8 +70,8 @@ USE_SOLVER = "DIRECT"
 def leapfrog_step(bodies, ax, ay, include_central=False):
     """
     bodies: numpy ndarray (N,5) → [x, y, vx, vy, m]
-    ax, ay: list 或 numpy 数组 (N,) → 上一步算出的加速度
-    include_central: True 则第 0 号当作固定中心(质量很大，不更新其位置/速度)
+    ax, ay: list 或 numpy 数组 (N,) → 初始加速度
+    include_central: True 则第 0 号恒星固定（不更新位置、速度）
     """
     N = bodies.shape[0]
 
@@ -99,17 +103,22 @@ def leapfrog_step(bodies, ax, ay, include_central=False):
         if not HAS_DIRECT_BH:
             raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
         theta = OPTIMIZED_PARAMS['bh_theta']
-        ax_new, ay_new = bh_omp(x_list, y_list, m_list,
-                                OPTIMIZED_PARAMS['bh_domain'],
-                                theta, G, SOFT)
+        ax_new, ay_new = bh_omp(
+            x_list, y_list, m_list,
+            OPTIMIZED_PARAMS['bh_domain'],
+            theta, G, SOFT
+        )
 
     elif USE_SOLVER.upper() == 'FMM':
         if not HAS_FMM:
             raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
         theta = OPTIMIZED_PARAMS['fmm_theta']
-        ax_new, ay_new = fmm_kernel.fmm_omp(x_list, y_list, m_list,
-                                            OPTIMIZED_PARAMS['fmm_domain'],
-                                            theta, G, SOFT)
+        ax_new, ay_new = fmm_kernel.fmm_omp(
+            x_list, y_list, m_list,
+            OPTIMIZED_PARAMS['fmm_domain'],
+            theta, G, SOFT
+        )
+
     else:
         raise ValueError(f"Unknown solver: {USE_SOLVER}")
 
@@ -125,35 +134,31 @@ def leapfrog_step(bodies, ax, ay, include_central=False):
 
 # ----------------------------
 # 计算系统总能量 (动能 + 位能)
-# include_central=True 时，第 0 号当作恒星
+# include_central=True 时，第 0 号当作固定恒星
 # ----------------------------
 def total_energy(bodies, include_central=False):
     N = bodies.shape[0]
-    # 动能
     KE = 0.0
     for i in range(N):
         if include_central and i == 0:
             continue
         KE += 0.5 * bodies[i, 4] * (bodies[i, 2]**2 + bodies[i, 3]**2)
 
-    # 位能
     PE = 0.0
     for i in range(N):
         for j in range(i + 1, N):
             if include_central and (i == 0 or j == 0):
-                # 如果第0号为恒星，只算其与其他的位能
                 if i == 0:
                     dx = bodies[j, 0] - bodies[i, 0]
                     dy = bodies[j, 1] - bodies[i, 1]
                     dist = math.hypot(dx, dy) + SOFT
                     PE -= G * bodies[i, 4] * bodies[j, 4] / dist
-                elif j == 0:
+                else:  # j == 0
                     dx = bodies[i, 0] - bodies[j, 0]
                     dy = bodies[i, 1] - bodies[j, 1]
                     dist = math.hypot(dx, dy) + SOFT
                     PE -= G * bodies[i, 4] * bodies[j, 4] / dist
                 continue
-            # 普通两两相互作用
             dx = bodies[i, 0] - bodies[j, 0]
             dy = bodies[i, 1] - bodies[j, 1]
             dist = math.hypot(dx, dy) + SOFT
@@ -164,7 +169,7 @@ def total_energy(bodies, include_central=False):
 
 # ----------------------------
 # 随机生成 n 颗粒子，分布在半径 radius 的圆盘内
-# 如果 include_central=True，会把第0号留给恒星
+# 如果 include_central=True，会把第 0 号留给恒星
 # 返回 bodies: shape (N_total, 5)，列顺序：x, y, vx, vy, m
 # ----------------------------
 def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_central=False):
@@ -176,7 +181,6 @@ def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_centr
     bodies = np.zeros((N_total, 5), dtype=np.float64)
 
     if include_central:
-        # 第 0 号当作不动的恒星
         bodies[0, 0] = 0.0
         bodies[0, 1] = 0.0
         bodies[0, 2] = 0.0
@@ -190,8 +194,7 @@ def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_centr
         y = r * math.sin(theta)
         bodies[i, 0] = x
         bodies[i, 1] = y
-        bodies[i, 4] = 1.0  # 每个粒子质量 1.0
-        # 初始速度设为 0
+        bodies[i, 4] = 1.0
         bodies[i, 2] = 0.0
         bodies[i, 3] = 0.0
 
@@ -217,14 +220,13 @@ def main_menu():
             choice = input("\nEnter choice: ").strip().lower()
             if choice in ["1", "benchmark"]:
                 # --------------------------------------------------------------
-                # Option 1: Quick benchmark scaling
+                # Option 1: 调用 comprehensive_test.py 中的 test_scaling()
                 # --------------------------------------------------------------
                 try:
-                    from comprehensive_test import benchmark_scaling
-                    benchmark_scaling(distr_size=OPTIMIZED_PARAMS['distribution_size'],
-                                      domain=DOMAIN)
+                    from comprehensive_test import test_scaling
+                    test_scaling()
                 except ImportError:
-                    print("Error: 无法导入 'benchmark_scaling'，请检查 comprehensive_test.py。")
+                    print("Error: 无法导入 'test_scaling'，请检查 comprehensive_test.py。")
 
             elif choice in ["2", "save", "save trajectory"]:
                 # --------------------------------------------------------------
@@ -251,22 +253,17 @@ def main_menu():
                 THREADS = args.threads
                 fixed_star = args.fixed_star
 
-                # 设置 OpenMP 线程数
                 os.environ["OMP_NUM_THREADS"] = str(THREADS)
 
-                # 生成初始分布
                 bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
-
-                # 记录初始能量
                 E0 = total_energy(bodies, include_central=fixed_star)
 
                 xs = []
                 ys = []
                 E_list = []
-
                 total_N = bodies.shape[0]
 
-                # 第一次计算初始加速度
+                # 第一次计算加速度
                 x0 = bodies[:, 0].tolist()
                 y0 = bodies[:, 1].tolist()
                 m0 = bodies[:, 4].tolist()
@@ -324,7 +321,6 @@ def main_menu():
                         sizes = [3] * total_N
 
                     for i in range(total_N):
-                        # 先画一个空点
                         pt, = axg.plot([], [], 'o', color=colors[i], markersize=sizes[i], alpha=0.8)
                         points.append(pt)
 
@@ -333,7 +329,6 @@ def main_menu():
                     axg.set_title(f"Trajectory ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
 
                     def update(frame):
-                        # 由于 set_data 要求传入序列，所以把每个坐标用 [x], [y] 包起来
                         for i, pt in enumerate(points):
                             pt.set_data([xs[frame][i]], [ys[frame][i]])
                         return points
@@ -350,7 +345,6 @@ def main_menu():
                     print("Creating energy vs time plot...")
                     times = [item[0] for item in E_list]
                     energies = [item[1] for item in E_list]
-                    rel_errors = [item[2] for item in E_list]
 
                     fig, axp = plt.subplots(figsize=(8, 4))
                     axp.plot(times, energies, label="Total Energy")
@@ -368,7 +362,7 @@ def main_menu():
 
             elif choice in ["3", "live", "live simulation"]:
                 # --------------------------------------------------------------
-                # Option 3: 实时模拟动画 → 直接输出 GIF
+                # Option 3: 实时模拟动画
                 # --------------------------------------------------------------
                 print("\nLive simulation animation")
                 parser = argparse.ArgumentParser()
@@ -431,7 +425,6 @@ def main_menu():
                     sizes = [3] * total_N
 
                 for i in range(total_N):
-                    # 先画一个空点
                     pt, = ax_live.plot([], [], 'o', color=colors[i], markersize=sizes[i], alpha=0.8)
                     points.append(pt)
 
@@ -443,7 +436,6 @@ def main_menu():
                     nonlocal ax, ay
                     ax, ay = leapfrog_step(bodies, ax, ay, include_central=fixed_star)
                     for idx, pt in enumerate(points):
-                        # 同样 wrap 成列表
                         pt.set_data([bodies[idx, 0]], [bodies[idx, 1]])
                     return points
 
@@ -456,17 +448,17 @@ def main_menu():
 
             elif choice in ["4", "demo", "comparison"]:
                 # --------------------------------------------------------------
-                # Option 4: Performance vs Accuracy 示意图
+                # Option 4: Demo comparison: accuracy + scaling
                 # --------------------------------------------------------------
                 print("\nDemo: Performance vs Accuracy")
                 try:
-                    from comprehensive_test import test_performance_comparison, test_accuracy_comparison
-                    print("Generating performance comparison figure ...")
-                    test_performance_comparison()
-                    print("Generating accuracy comparison figure ...")
-                    test_accuracy_comparison()
+                    from comprehensive_test import test_accuracy, test_scaling
+                    print("\n--- Running test_accuracy() ---")
+                    test_accuracy()
+                    print("\n--- Running test_scaling() ---")
+                    test_scaling()
                 except ImportError:
-                    print("Error: 无法导入 'test_performance_comparison' 或 'test_accuracy_comparison'，请检查 comprehensive_test.py。")
+                    print("Error: 无法导入 'test_accuracy' 或 'test_scaling'，请检查 comprehensive_test.py。")
 
             elif choice in ["q", "quit", "exit"]:
                 print("Goodbye!")
