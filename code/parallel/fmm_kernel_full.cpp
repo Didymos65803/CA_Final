@@ -1,5 +1,5 @@
 // fmm_kernel_full.cpp
-// HW6-inspired grid-based FMM with proper parallelization
+// Optimized with proper loop reorganization (參考 MLFMA 論文)
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -15,15 +15,16 @@
 
 namespace py = pybind11;
 
-// 參考 HW6 的規律網格方法
-class GridBasedFMM {
+// 修正6: 參考 MLFMA 論文的 transition level 策略
+class OptimizedFMM {
 private:
     struct GridCell {
         std::vector<int> particles;
         double total_mass;
         double center_x, center_y;
+        bool computed;
         
-        GridCell() : total_mass(0.0), center_x(0.0), center_y(0.0) {}
+        GridCell() : total_mass(0.0), center_x(0.0), center_y(0.0), computed(false) {}
     };
     
     const double* x_data;
@@ -34,16 +35,23 @@ private:
     double eps;
     double G;
     
-    // 參考 HW6 的規律網格方法
-    void compute_forces_grid_based(double* ax, double* ay) {
-        // 使用固定大小的網格，類似 HW6 的格點
-        const int grid_size = 16;  // 固定網格大小，避免動態分配
+    // 修正7: 動態決定轉換層級
+    int determine_transition_level(int particle_count) {
+        if (particle_count < 500) return 1;      // 小問題用直接計算
+        else if (particle_count < 2000) return 2; // 中等問題用簡單網格
+        else return 3;                            // 大問題用複雜網格
+    }
+    
+    // 修正8: 重組迴圈結構（參考 MLFMA 論文的 loop reorganization）
+    void compute_forces_reorganized(double* ax, double* ay) {
+        const int transition_level = determine_transition_level(N);
+        const int grid_size = 4 << transition_level; // 2^(2+transition_level)
         const double cell_size = domain_size * 2.0 / grid_size;
         
-        // 創建規律的網格結構
+        // 創建網格
         std::vector<GridCell> grid(grid_size * grid_size);
         
-        // 第一階段：分配粒子到網格（順序執行，避免競爭）
+        // 階段1: 分配粒子（順序執行避免競爭）
         for (int i = 0; i < N; ++i) {
             int grid_x = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((x_data[i] + domain_size) / cell_size)));
@@ -54,11 +62,18 @@ private:
             grid[cell_idx].particles.push_back(i);
         }
         
-        // 第二階段：計算網格質心（參考 HW6 的並行化模式）
+        // 階段2: 計算質心（並行化非空網格）
+        std::vector<int> non_empty_cells;
+        for (int i = 0; i < grid_size * grid_size; ++i) {
+            if (!grid[i].particles.empty()) {
+                non_empty_cells.push_back(i);
+            }
+        }
+        
         #pragma omp parallel for schedule(static)
-        for (int cell_idx = 0; cell_idx < grid_size * grid_size; ++cell_idx) {
+        for (size_t idx = 0; idx < non_empty_cells.size(); ++idx) {
+            int cell_idx = non_empty_cells[idx];
             GridCell& cell = grid[cell_idx];
-            if (cell.particles.empty()) continue;
             
             double total_mass = 0.0;
             double mx_sum = 0.0;
@@ -76,11 +91,11 @@ private:
                 cell.center_x = mx_sum / total_mass;
                 cell.center_y = my_sum / total_mass;
             }
+            cell.computed = true;
         }
         
-        // 第三階段：計算力（參考 HW6 的成功模式）
-        // 使用靜態排程，類似 HW6 的 red-black 模式
-        #pragma omp parallel for schedule(static)
+        // 階段3: 力計算（修正9: 重組迴圈以改善負載平衡）
+        #pragma omp parallel for schedule(guided, 8)
         for (int i = 0; i < N; ++i) {
             ax[i] = 0.0;
             ay[i] = 0.0;
@@ -88,51 +103,58 @@ private:
             const double xi = x_data[i];
             const double yi = y_data[i];
             
-            // 找到粒子所在的網格
+            // 找到粒子所在網格
             int grid_x = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((xi + domain_size) / cell_size)));
             int grid_y = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((yi + domain_size) / cell_size)));
             
-            // 與鄰近網格直接計算（類似 HW6 的五點模板）
-            for (int dy = -2; dy <= 2; ++dy) {
-                for (int dx = -2; dx <= 2; ++dx) {
+            // 近場交互作用
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
                     int nx = grid_x + dx;
                     int ny = grid_y + dy;
                     
                     if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size) {
                         const GridCell& cell = grid[ny * grid_size + nx];
                         
-                        if (std::abs(dx) <= 1 && std::abs(dy) <= 1) {
-                            // 鄰近網格：直接計算
-                            for (int j : cell.particles) {
-                                if (i == j) continue;
-                                
-                                const double dx_val = xi - x_data[j];
-                                const double dy_val = yi - y_data[j];
-                                const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
-                                
-                                if (r2 > eps*eps) {
-                                    const double inv_r3 = G / (r2 * std::sqrt(r2));
-                                    const double mj = m_data[j];
-                                    ax[i] += mj * dx_val * inv_r3;
-                                    ay[i] += mj * dy_val * inv_r3;
-                                }
-                            }
-                        } else {
-                            // 遠距離網格：使用多極近似
-                            if (cell.total_mass > 0.0) {
-                                const double dx_val = xi - cell.center_x;
-                                const double dy_val = yi - cell.center_y;
-                                const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
-                                
-                                if (r2 > eps*eps) {
-                                    const double inv_r3 = G / (r2 * std::sqrt(r2));
-                                    ax[i] += cell.total_mass * dx_val * inv_r3;
-                                    ay[i] += cell.total_mass * dy_val * inv_r3;
-                                }
+                        for (int j : cell.particles) {
+                            if (i == j) continue;
+                            
+                            const double dx_val = xi - x_data[j];
+                            const double dy_val = yi - y_data[j];
+                            const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
+                            
+                            if (r2 > eps*eps) {
+                                const double inv_r3 = G / (r2 * std::sqrt(r2));
+                                const double mj = m_data[j];
+                                ax[i] += mj * dx_val * inv_r3;
+                                ay[i] += mj * dy_val * inv_r3;
                             }
                         }
+                    }
+                }
+            }
+            
+            // 遠場交互作用（多極近似）
+            for (int cy = 0; cy < grid_size; ++cy) {
+                for (int cx = 0; cx < grid_size; ++cx) {
+                    // 跳過近場網格
+                    if (std::abs(cx - grid_x) <= 1 && std::abs(cy - grid_y) <= 1) {
+                        continue;
+                    }
+                    
+                    const GridCell& cell = grid[cy * grid_size + cx];
+                    if (!cell.computed || cell.total_mass == 0.0) continue;
+                    
+                    const double dx_val = xi - cell.center_x;
+                    const double dy_val = yi - cell.center_y;
+                    const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
+                    
+                    if (r2 > eps*eps) {
+                        const double inv_r3 = G / (r2 * std::sqrt(r2));
+                        ax[i] += cell.total_mass * dx_val * inv_r3;
+                        ay[i] += cell.total_mass * dy_val * inv_r3;
                     }
                 }
             }
@@ -153,8 +175,8 @@ public:
         eps = epsilon;
         G = gravity;
         
-        if (N < 200) {
-            // 小問題：參考 HW6 的簡單並行化
+        if (N < 100) {
+            // 小問題：直接計算
             #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; ++i) {
                 ax[i] = 0.0;
@@ -176,8 +198,8 @@ public:
                 }
             }
         } else {
-            // 大問題：使用網格方法
-            compute_forces_grid_based(ax, ay);
+            // 大問題：使用重組的迴圈結構
+            compute_forces_reorganized(ax, ay);
         }
     }
 };
@@ -206,7 +228,7 @@ void fmm_force(const py::array_t<double>& x_arr,
     }
     
     try {
-        GridBasedFMM fmm;
+        OptimizedFMM fmm;
         
         const double* x_ptr = x.data(0);
         const double* y_ptr = y.data(0);
@@ -224,7 +246,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "2D Grid-based FMM kernel (HW6-inspired)";
+    m.doc() = "2D Optimized FMM kernel (Loop reorganized)";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),
