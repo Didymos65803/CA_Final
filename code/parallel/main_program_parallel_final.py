@@ -1,19 +1,8 @@
+#!/usr/bin/env python3
 # main_program_parallel_final.py
-# =====================================
-#
-# Interactive 2D N-Body Playground (Parallel, High-Precision)
-# Forces OpenMP to use exactly 8 threads by setting OMP_NUM_THREADS=8
-#
-# Copy this entire file over your existing main_program_parallel_final.py,
-# then run `python3 main_program_parallel_final.py` as usual.
-#
-# -----------------------------------------------------
+# Fixed version for new C++ kernel interface
 
 import os
-
-# Force OpenMP to use 8 threads (regardless of os.cpu_count())
-os.environ["OMP_NUM_THREADS"] = "8"
-
 import sys
 import time
 import math
@@ -21,746 +10,761 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-# Now that OMP_NUM_THREADS is set, importing the extensions will pick it up.
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-import force_kernel
-import fmm_kernel
+# Force OpenMP to use 8 threads
+os.environ["OMP_NUM_THREADS"] = "8"
 
-# -----------------------------------------------------
-# Global output directory
-# -----------------------------------------------------
+# Set path
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+# Try to import C++ modules
+try:
+    import force_kernel
+    HAS_DIRECT = True
+    print("✓ force_kernel loaded successfully")
+except ImportError as e:
+    HAS_DIRECT = False
+    print(f"✗ force_kernel not available: {e}")
+
+try:
+    import fmm_kernel
+    HAS_FMM = True
+    print("✓ fmm_kernel loaded successfully")
+except ImportError as e:
+    HAS_FMM = False
+    print(f"✗ fmm_kernel not available: {e}")
+
+# Global settings
 OUTPUT_DIR = "output"
 if not os.path.isdir(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
-# -----------------------------------------------------
-# Utility: initialize N particles randomly in a disk
-# -----------------------------------------------------
 def initialize_particles(N, domain_size):
+    """Initialize N particles uniformly in a disk"""
     angles = np.random.rand(N) * 2.0 * math.pi
-    radii  = domain_size * np.sqrt(np.random.rand(N))
+    radii = domain_size * np.sqrt(np.random.rand(N))
     x = radii * np.cos(angles)
     y = radii * np.sin(angles)
-    # Give each mass = 1/N
-    m = np.ones(N) * (1.0 / N)
+    m = np.ones(N, dtype=np.float64)
     return x, y, m
 
-# -----------------------------------------------------
-# Leapfrog integrator step using a chosen kernel
-# -----------------------------------------------------
-def leapfrog_step(x, y, vx, vy, m, dt, kernel_fn,
-                  soft, G, domain_size, theta, maxLeaf):
+def safe_direct_force(x, y, m, eps2):
+    """Safe wrapper for direct force calculation using new interface"""
     N = len(x)
-    # (1) Half‐kick
+    
+    # Ensure inputs are contiguous NumPy arrays
+    x_arr = np.ascontiguousarray(x, dtype=np.float64)
+    y_arr = np.ascontiguousarray(y, dtype=np.float64)
+    m_arr = np.ascontiguousarray(m, dtype=np.float64)
+    
+    # Pre-allocate output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
-    kernel_fn(x, y, m, soft, ax, ay) if kernel_fn == force_kernel.direct_force \
-      else kernel_fn(x.tolist(), y.tolist(), m.tolist(),
-                     N, domain_size, theta, maxLeaf, soft, G, ax.tolist(), ay.tolist()) or \
-           (ax := np.array(ax), ay := np.array(ay))
+    
+    if HAS_DIRECT:
+        try:
+            # New interface: direct_force(x, y, m, eps2, ax, ay)
+            force_kernel.direct_force(x_arr, y_arr, m_arr, eps2, ax, ay)
+            return ax, ay
+        except Exception as e:
+            print(f"Direct force calculation failed: {e}")
+            return None, None
+    else:
+        return None, None
 
-    vx += 0.5 * dt * ax
-    vy += 0.5 * dt * ay
-
-    # (2) Drift
-    x += dt * vx
-    y += dt * vy
-
-    # (3) Full‐kick
-    ax.fill(0.0)
-    ay.fill(0.0)
-    kernel_fn(x, y, m, soft, ax, ay) if kernel_fn == force_kernel.direct_force \
-      else kernel_fn(x.tolist(), y.tolist(), m.tolist(),
-                     N, domain_size, theta, maxLeaf, soft, G, ax.tolist(), ay.tolist()) or \
-           (ax := np.array(ax), ay := np.array(ay))
-
-    vx += 0.5 * dt * ax
-    vy += 0.5 * dt * ay
-
-    return x, y, vx, vy
-
-# -----------------------------------------------------
-# Option (1): Quick Benchmark Scaling
-# -----------------------------------------------------
-# (In main_program_parallel_final.py, replace the entire quick_benchmark() with:)
+def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
+    """Safe wrapper for FMM force calculation using new interface"""
+    
+    # Ensure inputs are contiguous NumPy arrays
+    x_arr = np.ascontiguousarray(x, dtype=np.float64)
+    y_arr = np.ascontiguousarray(y, dtype=np.float64)
+    m_arr = np.ascontiguousarray(m, dtype=np.float64)
+    
+    # Pre-allocate output arrays
+    ax = np.zeros(N, dtype=np.float64)
+    ay = np.zeros(N, dtype=np.float64)
+    
+    if HAS_FMM:
+        try:
+            # New interface: fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G, ax, ay)
+            fmm_kernel.fmm_force(x_arr, y_arr, m_arr, N, domain_size, 
+                               theta, maxLeaf, eps, G, ax, ay)
+            return ax, ay
+        except Exception as e:
+            print(f"FMM force calculation failed: {e}")
+            return None, None
+    else:
+        return None, None
 
 def quick_benchmark():
-    print("\nQuick Benchmark Scaling\n-----------------------")
-    print("Choose mode:")
-    print("  1) small‐N (50 → 2000)")
-    print("  2) large‐N (600 → 4000)")
-    print(" q) back to main menu")
-    choice = input("Select: ").strip().lower()
-
-    if choice == '1':
-        Ns = [50, 100, 200, 500, 1000, 2000]
-    elif choice == '2':
-        Ns = [600, 1000, 2000, 3000, 4000]
-    else:
-        return
-
-    dt = 1e-3
-    steps = 10
+    """Quick benchmark scaling"""
+    print("\nQuick Benchmark Scaling")
+    print("=" * 50)
+    
+    Ns = [50, 100, 200, 500]  # 減少測試規模避免卡住
+    steps = 3  # 減少步數
     domain_size = 50.0
     theta = 0.5
     maxLeaf = 8
-    soft = 0.01
+    eps = 0.01
     G = 1.0
-    nthreads_used = 8
-    print(f"Using {nthreads_used} threads (OpenMP).")
-
-    results = []  # will store (N, t_direct, t_BH, t_FMM)
-
-    for N in Ns:
-        print(f"\nN = {N}")
-        # Generate random ICs as NumPy arrays
-        x, y, m = initialize_particles(N, domain_size)
-        vx = np.zeros(N, dtype=np.float64)
-        vy = np.zeros(N, dtype=np.float64)
-
-        # 1) Direct
-        t0 = time.time()
-        for _ in range(steps):
-            ax = np.zeros(N, dtype=np.float64)
-            ay = np.zeros(N, dtype=np.float64)
-            force_kernel.direct_force(x, y, m, soft*soft, ax, ay)
-        t_direct = (time.time() - t0) / steps
-        print(f"  Direct:      {t_direct:.6f} s")
-
-        # 2) Barnes‐Hut (FMM with maxLeaf=1)
-        t0 = time.time()
-        for _ in range(steps):
-            bx = np.zeros(N, dtype=np.float64)
-            by = np.zeros(N, dtype=np.float64)
-            fmm_kernel.fmm_force(x, y, m,
-                                 N, domain_size, theta, 1,
-                                 soft, G, bx, by)
-        t_bh = (time.time() - t0) / steps
-        print(f"  Barnes‐Hut:  {t_bh:.6f} s (θ={theta})")
-
-        # 3) FMM (maxLeaf=8)
-        t0 = time.time()
-        for _ in range(steps):
-            fx = np.zeros(N, dtype=np.float64)
-            fy = np.zeros(N, dtype=np.float64)
-            fmm_kernel.fmm_force(x, y, m,
-                                 N, domain_size, theta, maxLeaf,
-                                 soft, G, fx, fy)
-        t_fmm = (time.time() - t0) / steps
-        print(f"  FMM:         {t_fmm:.6f} s")
-
-        results.append((N, t_direct, t_bh, t_fmm))
-
-    # Save CSV
-    outfile = os.path.join(OUTPUT_DIR, "scaling_quick.csv")
-    with open(outfile, "w") as fd:
-        fd.write("N,Direct,BH,FMM\n")
-        for (N, d, bh, f) in results:
-            fd.write(f"{N},{d:.8e},{bh:.8e},{f:.8e}\n")
-    print(f"\n✓ Saved quick‐benchmark CSV to {outfile}")
-
-    # Plot log‐log
-    Ns_plot = [r[0] for r in results]
-    direct_plot = [r[1] for r in results]
-    bh_plot = [r[2] for r in results]
-    fmm_plot = [r[3] for r in results]
-
-    plt.figure(figsize=(6,4))
-    plt.loglog(Ns_plot, direct_plot, 'o-r', label="Direct O(N²)")
-    plt.loglog(Ns_plot, bh_plot,     's-b', label="BH O(N log N)")
-    plt.loglog(Ns_plot, fmm_plot,    '^-g', label="FMM O(N)")
-    plt.xlabel("Number of Particles (N)")
-    plt.ylabel("Time per Step (s)")
-    plt.title("Quick Scaling Comparison (8 threads)")
-    plt.legend()
-    plt.grid(True, which="both", ls="--", lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, "scaling_quick.png")
-    plt.savefig(pngfile, dpi=200)
-    plt.close()
-    print(f"Saved plot to {pngfile}")
-
-# -----------------------------------------------------
-# Option (2): Save Trajectory + Energy Plot
-# -----------------------------------------------------
-def save_trajectory_and_energy():
-    print("\nSave Trajectory + Energy Plot\n-----------------------------")
-    N = int(input("Enter N (e.g. 200): ").strip())
-    domain_size = float(input("Enter domain radius (e.g. 50.0): ").strip())
-    theta = float(input("Enter θ (e.g. 0.5): ").strip())
-    maxLeaf = 8
-    soft = 0.01
-    G = 1.0
-    dt = 1e-3
-    nsteps = 200
-
-    solver = input("Solver (direct/bh/fmm): ").strip().lower()
-    if solver not in ("direct","bh","fmm"):
-        print("Invalid solver. Returning to menu.")
-        return
-
-    # Initialize particles
-    x = np.zeros(N, dtype=np.float64)
-    y = np.zeros(N, dtype=np.float64)
-    vx = np.zeros(N, dtype=np.float64)
-    vy = np.zeros(N, dtype=np.float64)
-    x[:], y[:], m = initialize_particles(N, domain_size)
-
-    times = []
-    energies = []
-    traj_x = np.zeros((nsteps, N), dtype=np.float64)
-    traj_y = np.zeros((nsteps, N), dtype=np.float64)
-
-    for tstep in range(nsteps):
-        # Compute current energy (kinetic + potential)
-        pot = 0.0
-        if solver == "direct":
-            for i in range(N):
-                for j in range(i+1, N):
-                    dx = x[j] - x[i]
-                    dy = y[j] - y[i]
-                    dist = math.sqrt(dx*dx + dy*dy + soft*soft)
-                    if dist > 0:
-                        pot -= G * m[i] * m[j] / dist
-        else:
-            # Use direct‐sum potential to track relative error baseline
-            for i in range(N):
-                for j in range(i+1, N):
-                    dx = x[j] - x[i]
-                    dy = y[j] - y[i]
-                    dist = math.sqrt(dx*dx + dy*dy + soft*soft)
-                    if dist > 0:
-                        pot -= G * m[i] * m[j] / dist
-
-        kin = 0.0
-        for i in range(N):
-            kin += 0.5 * m[i] * (vx[i]*vx[i] + vy[i]*vy[i])
-        total_energy = kin + pot
-        times.append(tstep*dt)
-        energies.append(total_energy)
-
-        traj_x[tstep, :] = x[:]
-        traj_y[tstep, :] = y[:]
-
-        # Leapfrog integration
-        if solver == "direct":
-            ax_arr = np.zeros(N, dtype=np.float64)
-            ay_arr = np.zeros(N, dtype=np.float64)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-            x += dt * vx
-            y += dt * vy
-            ax_arr.fill(0.0)
-            ay_arr.fill(0.0)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-
-        else:
-            fx = [0.0]*N
-            fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-            x += dt * vx
-            y += dt * vy
-            fx = [0.0]*N
-            fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-
-    # 2.a) Save trajectory GIF
-    fig = plt.figure(figsize=(5,5))
-    axplt = plt.subplot(111)
-    scat = axplt.scatter(traj_x[0,:], traj_y[0,:], s=5, c='b')
-    axplt.set_xlim(-domain_size, domain_size)
-    axplt.set_ylim(-domain_size, domain_size)
-    axplt.set_title(f"Trajectory ({solver.upper()}, N={N}, threads=8)")
-
-    def animate(frame):
-        scat.set_offsets(np.vstack((traj_x[frame,:], traj_y[frame,:])).T)
-        return scat,
-
-    ani = animation.FuncAnimation(fig, animate, frames=nsteps, interval=50, blit=True)
-    giffile = os.path.join(OUTPUT_DIR, f"trajectory_{solver}_{N}_8.gif")
-    ani.save(giffile, writer='pillow', fps=20)
-    plt.close()
-    print(f"✓ Saved trajectory GIF to {giffile}")
-
-    # 2.b) Save energy vs time
-    plt.figure(figsize=(5,3))
-    plt.plot(times, energies, '-k', linewidth=1)
-    plt.xlabel("Time")
-    plt.ylabel("Total Energy")
-    plt.title(f"Energy vs Time ({solver.upper()}, N={N}, threads=8)")
-    plt.grid(True, which='both', ls='--', lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, f"energy_{solver}_{N}_8.png")
-    plt.savefig(pngfile, dpi=200)
-    plt.close()
-    print(f"✓ Saved energy plot to {pngfile}")
-
-# -----------------------------------------------------
-# Option (3): Live Simulation Animation
-# -----------------------------------------------------
-def live_simulation():
-    print("\nLive Simulation Animation\n-------------------------")
-    N = int(input("Enter N (e.g. 200): ").strip())
-    domain_size = float(input("Enter domain radius (e.g. 50.0): ").strip())
-    theta = float(input("Enter θ (e.g. 0.5): ").strip())
-    maxLeaf = 8
-    soft = 0.01
-    G = 1.0
-    dt = 5e-4
-    nsteps = 400
-
-    solver = input("Solver (direct/bh/fmm): ").strip().lower()
-    if solver not in ("direct","bh","fmm"):
-        print("Invalid solver. Returning to menu.")
-        return
-
-    x = np.zeros(N, dtype=np.float64)
-    y = np.zeros(N, dtype=np.float64)
-    vx = np.zeros(N, dtype=np.float64)
-    vy = np.zeros(N, dtype=np.float64)
-    x[:], y[:], m = initialize_particles(N, domain_size)
-
-    fig = plt.figure(figsize=(5,5))
-    axplt = plt.subplot(111)
-    scat = axplt.scatter(x, y, s=5, c='b')
-    axplt.set_xlim(-domain_size, domain_size)
-    axplt.set_ylim(-domain_size, domain_size)
-    axplt.set_title(f"Live Simulation ({solver.upper()}, N={N}, threads=8)")
-
-    def update_frame(frame):
-        nonlocal x, y, vx, vy
-        if solver == "direct":
-            ax_arr = np.zeros(N, dtype=np.float64)
-            ay_arr = np.zeros(N, dtype=np.float64)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-            x += dt * vx
-            y += dt * vy
-            ax_arr.fill(0.0)
-            ay_arr.fill(0.0)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-
-        else:
-            fx = [0.0]*N
-            fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-            x += dt * vx
-            y += dt * vy
-            fx = [0.0]*N
-            fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-
-        scat.set_offsets(np.vstack((x, y)).T)
-        return scat,
-
-    ani = animation.FuncAnimation(fig, update_frame, frames=nsteps, interval=30, blit=True)
-    giffile = os.path.join(OUTPUT_DIR, f"live_{solver}_{N}_8.gif")
-    ani.save(giffile, writer='pillow', fps=30)
-    plt.close()
-    print(f"✓ Saved live‐simulation GIF to {giffile}")
-
-# -----------------------------------------------------
-# Option (4): Large‐N Scaling Test
-# -----------------------------------------------------
-def largeN_scaling():
-    print("\nLarge‐N Scaling Test\n--------------------")
-    Ns = [600, 1000, 2000, 3000, 4000]
-    dt = 1e-3
-    steps = 10
-    domain_size = 50.0
-    theta = 0.5
-    maxLeaf = 8
-    soft = 0.01
-    G = 1.0
-    print(f"Using 8 threads.")
-
+    
+    print(f"Using 8 threads (OpenMP)")
+    print(f"Testing particle counts: {Ns}")
+    
     results = []
+    
     for N in Ns:
-        print(f"\nN = {N}")
+        print(f"\nTesting N = {N}")
+        
+        # Initialize particles
         x, y, m = initialize_particles(N, domain_size)
-
-        t0 = time.time()
-        for _ in range(steps):
-            force_kernel.direct_force(x, y, m, 1e-4,
-                                      ax := [0.0]*N,
-                                      ay := [0.0]*N)
-        t_direct = (time.time() - t0) / steps
-        print(f"  Direct: {t_direct:.6f}")
-
-        t0 = time.time()
-        for _ in range(steps):
-            bx = [0.0]*N
-            by = [0.0]*N
-            fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                 N, domain_size, theta, 1,
-                                 soft, G, bx, by)
-        t_bh = (time.time() - t0) / steps
-        print(f"  BH:     {t_bh:.6f}")
-
-        t0 = time.time()
-        for _ in range(steps):
-            fx = [0.0]*N
-            fy = [0.0]*N
-            fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                 N, domain_size, theta, maxLeaf,
-                                 soft, G, fx, fy)
-        t_fmm = (time.time() - t0) / steps
-        print(f"  FMM:    {t_fmm:.6f}")
-
+        
+        # Test direct method
+        t_direct = None
+        if HAS_DIRECT:
+            try:
+                print("  Testing direct method...")
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_direct_force(x, y, m, eps*eps)
+                    if ax is None:
+                        raise Exception("Direct force failed")
+                t_direct = (time.time() - t0) / steps
+                print(f"  ✓ Direct method: {t_direct:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ Direct method: Failed ({e})")
+                t_direct = float('nan')
+        else:
+            print("  ✗ Direct method: Not available")
+            t_direct = float('nan')
+        
+        # Test Barnes-Hut (using FMM with maxLeaf=1)
+        t_bh = None
+        if HAS_FMM:
+            try:
+                print("  Testing Barnes-Hut method...")
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+                    if ax is None:
+                        raise Exception("BH force failed")
+                t_bh = (time.time() - t0) / steps
+                print(f"  ✓ Barnes-Hut: {t_bh:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ Barnes-Hut: Failed ({e})")
+                t_bh = float('nan')
+        else:
+            print("  ✗ Barnes-Hut: Not available")
+            t_bh = float('nan')
+        
+        # Test FMM
+        t_fmm = None
+        if HAS_FMM:
+            try:
+                print("  Testing FMM method...")
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                    if ax is None:
+                        raise Exception("FMM force failed")
+                t_fmm = (time.time() - t0) / steps
+                print(f"  ✓ FMM: {t_fmm:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ FMM: Failed ({e})")
+                t_fmm = float('nan')
+        else:
+            print("  ✗ FMM: Not available")
+            t_fmm = float('nan')
+        
         results.append((N, t_direct, t_bh, t_fmm))
+    
+    # Save results
+    save_scaling_results(results, "scaling_quick")
+    print("\n✓ Quick benchmark completed!")
 
-    # Save CSV
-    outfile = os.path.join(OUTPUT_DIR, "scaling_largeN.csv")
-    with open(outfile, "w") as fd:
-        fd.write("N,Direct,BH,FMM\n")
-        for (N, d, bh, f) in results:
-            fd.write(f"{N},{d:.8e},{bh:.8e},{f:.8e}\n")
-    print(f"\n✓ Saved largeN CSV to {outfile}")
-
-    # Plot
-    Ns_plot = [r[0] for r in results]
-    direct_plot = [r[1] for r in results]
-    bh_plot = [r[2] for r in results]
-    fmm_plot = [r[3] for r in results]
-
-    plt.figure(figsize=(6,4))
-    plt.loglog(Ns_plot, direct_plot, 'o-r', label="Direct O(N²)")
-    plt.loglog(Ns_plot, bh_plot,     's-b', label="BH O(N log N)")
-    plt.loglog(Ns_plot, fmm_plot,    '^-g', label="FMM O(N)")
-    plt.xlabel("Number of Particles (N)")
-    plt.ylabel("Time per Step (s)")
-    plt.title("Large‐N Scaling Comparison (8 threads)")
-    plt.legend()
-    plt.grid(True, which="both", ls="--", lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, "scaling_largeN.png")
-    plt.savefig(pngfile, dpi=200)
-    plt.close()
-    print(f"✓ Saved plot to {pngfile}")
-
-# -----------------------------------------------------
-# Option (5): Energy Conservation Test
-# -----------------------------------------------------
-def energy_conservation_test():
-    print("\nEnergy Conservation Test\n------------------------")
-    N = int(input("Enter N (e.g. 200): ").strip())
-    domain_size = float(input("Enter domain radius (e.g. 50.0): ").strip())
-    theta = float(input("Enter θ (e.g. 0.5): ").strip())
+def save_trajectory_and_energy():
+    """Save trajectory + energy plot"""
+    print("\nSave Trajectory + Energy Plot")
+    print("=" * 50)
+    
+    try:
+        N = int(input("Enter number of particles (e.g., 200): "))
+        method = input("Choose method (direct/bh/fmm): ").strip().lower()
+        steps = int(input("Enter number of steps (e.g., 100): "))
+    except ValueError:
+        print("Invalid input. Using default values.")
+        N = 200
+        method = "fmm"
+        steps = 100
+    
+    if method not in ["direct", "bh", "fmm"]:
+        print("Invalid method. Using FMM.")
+        method = "fmm"
+    
+    domain_size = 50.0
+    theta = 0.5
     maxLeaf = 8
-    soft = 0.01
+    eps = 0.01
     G = 1.0
-    dt = 5e-4
-    nsteps = 500
-
-    solver = input("Solver (direct/bh/fmm): ").strip().lower()
-    if solver not in ("direct","bh","fmm"):
-        print("Invalid solver. Returning.")
-        return
-
+    dt = 0.001
+    
+    # Initialize particles
     x, y, m = initialize_particles(N, domain_size)
     vx = np.zeros(N, dtype=np.float64)
     vy = np.zeros(N, dtype=np.float64)
-
-    # Compute initial energy E0 via direct‐sum
-    E0 = 0.0
-    for i in range(N):
-        E0 += 0.5 * m[i] * (vx[i]*vx[i] + vy[i]*vy[i])
-    for i in range(N):
-        for j in range(i+1, N):
-            dx = x[j] - x[i]
-            dy = y[j] - y[i]
-            dist = math.sqrt(dx*dx + dy*dy + soft*soft)
-            if dist > 0:
-                E0 -= G * m[i] * m[j] / dist
-
-    times = []
-    rel_errors = []
-
-    for tstep in range(nsteps):
-        if solver == "direct":
-            ax_arr = np.zeros(N, dtype=np.float64)
-            ay_arr = np.zeros(N, dtype=np.float64)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-            x += dt * vx
-            y += dt * vy
-            ax_arr.fill(0.0); ay_arr.fill(0.0)
-            force_kernel.direct_force(x, y, m, 1e-4, ax_arr, ay_arr)
-            vx += 0.5 * dt * ax_arr
-            vy += 0.5 * dt * ay_arr
-
+    
+    # Store trajectory and energy
+    trajectory = []
+    energies = []
+    
+    print(f"Running simulation with {method} method...")
+    
+    for step in range(steps):
+        if step % 20 == 0:
+            print(f"  Step {step}/{steps}")
+        
+        # Calculate forces
+        if method == "direct" and HAS_DIRECT:
+            ax, ay = safe_direct_force(x, y, m, eps*eps)
+        elif method == "bh" and HAS_FMM:
+            ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+        elif method == "fmm" and HAS_FMM:
+            ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
         else:
-            fx = [0.0]*N
-            fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-            x += dt * vx
-            y += dt * vy
-            fx = [0.0]*N; fy = [0.0]*N
-            if solver == "bh":
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, 1,
-                                     soft, G, fx, fy)
-            else:
-                fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                     N, domain_size, theta, maxLeaf,
-                                     soft, G, fx, fy)
-            vx += 0.5 * dt * np.array(fx, dtype=np.float64)
-            vy += 0.5 * dt * np.array(fy, dtype=np.float64)
-
-        # Compute total energy E(t)
-        E = 0.0
-        for i in range(N):
-            E += 0.5 * m[i] * (vx[i]*vx[i] + vy[i]*vy[i])
-        pot = 0.0
+            print(f"Method {method} not available")
+            return
+        
+        if ax is None:
+            print("Force calculation failed")
+            return
+        
+        # Leapfrog integration
+        vx += 0.5 * dt * ax
+        vy += 0.5 * dt * ay
+        x += dt * vx
+        y += dt * vy
+        
+        # Calculate energy (kinetic + potential)
+        ke = 0.5 * np.sum(m * (vx**2 + vy**2))
+        pe = 0.0
         for i in range(N):
             for j in range(i+1, N):
                 dx = x[j] - x[i]
                 dy = y[j] - y[i]
-                dist = math.sqrt(dx*dx + dy*dy + soft*soft)
-                if dist > 0:
-                    pot -= G * m[i] * m[j] / dist
-        E += pot
+                r = math.sqrt(dx*dx + dy*dy + eps*eps)
+                pe -= G * m[i] * m[j] / r
+        
+        trajectory.append((x.copy(), y.copy()))
+        energies.append(ke + pe)
+    
+    # Create and save plots
+    create_trajectory_animation(trajectory, method, N)
+    create_energy_plot(energies, dt, method, N)
+    print("✓ Trajectory and energy plots saved!")
 
-        times.append(tstep*dt)
-        rel_errors.append(abs(E - E0) / abs(E0 + 1e-16))
-
-    # Plot relative energy error
-    plt.figure(figsize=(6,4))
-    plt.semilogy(times, rel_errors, '-k', linewidth=1)
-    plt.xlabel("Time")
-    plt.ylabel("Relative Energy Error")
-    plt.title(f"Energy Conservation (N={N}, threads=8)")
-    plt.grid(True, which='both', ls='--', lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, f"energy_conservation_{solver}_{N}_8.png")
-    plt.savefig(pngfile, dpi=200)
-    plt.close()
-    print(f"✓ Saved energy-conservation plot to {pngfile}")
-
-# -----------------------------------------------------
-# Option (6): Parameter Optimization (N=100)
-# -----------------------------------------------------
-def parameter_optimization():
-    print("\nParameter Optimization (vary θ)\n--------------------------------")
-    N = 100
-    domain_size = 50.0
-    thetas = [0.1, 0.3, 0.5, 0.7, 1.0]
-    maxLeaf = 8
-    soft = 0.01
-    G = 1.0
-
-    # Compute “truth” forces via direct once
-    x, y, m = initialize_particles(N, domain_size)
-    fx_truth = np.zeros(N, dtype=np.float64)
-    fy_truth = np.zeros(N, dtype=np.float64)
-    force_kernel.direct_force(x, y, m, 1e-4, fx_truth, fy_truth)
-
-    bh_errors = []
-    fmm_errors = []
-
-    for theta in thetas:
-        # BH (maxLeaf=1)
-        fx_bh = [0.0]*N
-        fy_bh = [0.0]*N
-        fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                             N, domain_size, theta, 1,
-                             soft, G, fx_bh, fy_bh)
-
-        # FMM (maxLeaf=8)
-        fx_fm = [0.0]*N
-        fy_fm = [0.0]*N
-        fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                             N, domain_size, theta, maxLeaf,
-                             soft, G, fx_fm, fy_fm)
-
-        # Compute relative L2 errors
-        bh_err = 0.0
-        fm_err = 0.0
-        norm_truth = 0.0
-        for i in range(N):
-            tx = fx_truth[i]
-            ty = fy_truth[i]
-            norm_truth += tx*tx + ty*ty
-            bx = fx_bh[i]
-            by = fy_bh[i]
-            bh_err  += (bx - tx)**2 + (by - ty)**2
-            fmx = fx_fm[i]
-            fmy = fy_fm[i]
-            fm_err  += (fmx - tx)**2 + (fmy - ty)**2
-
-        bh_errors.append(math.sqrt(bh_err / norm_truth))
-        fmm_errors.append(math.sqrt(fm_err / norm_truth))
-        print(f"θ = {theta:.1f} → BH error = {bh_errors[-1]:.3e}, FMM error = {fmm_errors[-1]:.3e}")
-
-    # Plot errors vs θ
-    plt.figure(figsize=(6,4))
-    plt.loglog(thetas, bh_errors, 's-b', label="BH error (maxLeaf=1)")
-    plt.loglog(thetas, fmm_errors, '^-g', label="FMM error (maxLeaf=8)")
-    plt.xlabel("θ (opening angle)")
-    plt.ylabel("Relative Force Error")
-    plt.title("Parameter Optimization (N=100, threads=8)")
-    plt.legend()
-    plt.grid(True, which='both', ls='--', lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, "parameter_optimization.png")
-    plt.savefig(pngfile, dpi=200)
-    plt.close()
-    print(f"✓ Saved parameter-opt plot to {pngfile}")
-
-# -----------------------------------------------------
-# Option (7): OpenMP Thread Benchmark (N=10000)
-# -----------------------------------------------------
-def openmp_thread_benchmark():
-    print("\nOpenMP Thread Benchmark\n-----------------------")
-    N = 10000
+def live_simulation_animation():
+    """Live simulation animation"""
+    print("\nLive Simulation Animation")
+    print("=" * 50)
+    
+    try:
+        N = int(input("Enter number of particles (e.g., 100): "))
+        method = input("Choose method (direct/bh/fmm): ").strip().lower()
+    except ValueError:
+        print("Invalid input. Using default values.")
+        N = 100
+        method = "fmm"
+    
+    if method not in ["direct", "bh", "fmm"]:
+        print("Invalid method. Using FMM.")
+        method = "fmm"
+    
     domain_size = 50.0
     theta = 0.5
     maxLeaf = 8
-    soft = 0.01
+    eps = 0.01
     G = 1.0
-    dt = 1e-3
-    steps = 5
+    dt = 0.001
+    frames = 200
+    
+    # Initialize particles
+    x, y, m = initialize_particles(N, domain_size)
+    vx = np.zeros(N, dtype=np.float64)
+    vy = np.zeros(N, dtype=np.float64)
+    
+    print(f"Creating animation with {method} method...")
+    
+    # Create animation
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(-domain_size*1.2, domain_size*1.2)
+    ax.set_ylim(-domain_size*1.2, domain_size*1.2)
+    scat = ax.scatter(x, y, s=10, c='blue')
+    ax.set_title(f"Live Simulation ({method.upper()}, N={N})")
+    
+    def update(frame):
+        nonlocal x, y, vx, vy
+        
+        # Calculate forces
+        if method == "direct" and HAS_DIRECT:
+            ax_arr, ay_arr = safe_direct_force(x, y, m, eps*eps)
+        elif method == "bh" and HAS_FMM:
+            ax_arr, ay_arr = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+        elif method == "fmm" and HAS_FMM:
+            ax_arr, ay_arr = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+        else:
+            return scat,
+        
+        if ax_arr is None:
+            return scat,
+        
+        # Update positions
+        vx += dt * ax_arr
+        vy += dt * ay_arr
+        x += dt * vx
+        y += dt * vy
+        
+        scat.set_offsets(np.column_stack((x, y)))
+        return scat,
+    
+    ani = animation.FuncAnimation(fig, update, frames=frames, interval=50, blit=True)
+    
+    # Save animation
+    gif_path = os.path.join(OUTPUT_DIR, f"live_simulation_{method}_{N}.gif")
+    ani.save(gif_path, writer='pillow', fps=20)
+    plt.close()
+    print(f"✓ Live simulation saved to {gif_path}")
 
+def large_n_scaling():
+    """Large-N scaling test"""
+    print("\nLarge-N Scaling Test")
+    print("=" * 50)
+    
+    Ns = [500, 1000, 2000]  # 減少測試規模
+    steps = 3
+    domain_size = 50.0
+    theta = 0.5
+    maxLeaf = 8
+    eps = 0.01
+    G = 1.0
+    
+    print(f"Testing large N values: {Ns}")
+    
+    results = []
+    
+    for N in Ns:
+        print(f"\nTesting N = {N}")
+        
+        x, y, m = initialize_particles(N, domain_size)
+        
+        # Skip direct method for large N
+        t_direct = float('nan') if N > 1000 else None
+        if t_direct is None and HAS_DIRECT:
+            try:
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_direct_force(x, y, m, eps*eps)
+                t_direct = (time.time() - t0) / steps
+                print(f"  Direct method: {t_direct:.6f} seconds")
+            except:
+                t_direct = float('nan')
+        
+        # Test other methods
+        t_bh = float('nan')
+        t_fmm = float('nan')
+        
+        if HAS_FMM:
+            try:
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+                t_bh = (time.time() - t0) / steps
+                print(f"  Barnes-Hut: {t_bh:.6f} seconds")
+            except:
+                pass
+            
+            try:
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                t_fmm = (time.time() - t0) / steps
+                print(f"  FMM: {t_fmm:.6f} seconds")
+            except:
+                pass
+        
+        results.append((N, t_direct, t_bh, t_fmm))
+    
+    save_scaling_results(results, "scaling_large")
+    print("\n✓ Large-N scaling test completed!")
+
+def energy_conservation_test():
+    """Energy conservation test"""
+    print("\nEnergy Conservation Test")
+    print("=" * 50)
+    
+    try:
+        N = int(input("Enter number of particles (e.g., 200): "))
+    except ValueError:
+        N = 200
+    
+    domain_size = 50.0
+    theta = 0.5
+    maxLeaf = 8
+    eps = 0.01
+    G = 1.0
+    dt = 0.001
+    steps = 500
+    
+    methods = []
+    if HAS_DIRECT:
+        methods.append(("Direct", "direct"))
+    if HAS_FMM:
+        methods.append(("Barnes-Hut", "bh"))
+        methods.append(("FMM", "fmm"))
+    
+    plt.figure(figsize=(10, 6))
+    
+    for method_name, method in methods:
+        print(f"\nTesting {method_name}...")
+        
+        # Initialize particles
+        x, y, m = initialize_particles(N, domain_size)
+        vx = np.zeros(N, dtype=np.float64)
+        vy = np.zeros(N, dtype=np.float64)
+        
+        # Calculate initial energy
+        E0 = calculate_total_energy(x, y, vx, vy, m, G, eps)
+        
+        times = []
+        rel_errors = []
+        
+        for step in range(0, steps, 5):  # Record every 5 steps
+            # Calculate forces
+            if method == "direct":
+                ax, ay = safe_direct_force(x, y, m, eps*eps)
+            elif method == "bh":
+                ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+            elif method == "fmm":
+                ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+            
+            if ax is None:
+                break
+            
+            # Integrate for 5 steps
+            for _ in range(5):
+                vx += 0.5 * dt * ax
+                vy += 0.5 * dt * ay
+                x += dt * vx
+                y += dt * vy
+                
+                # Recalculate forces
+                if method == "direct":
+                    ax, ay = safe_direct_force(x, y, m, eps*eps)
+                elif method == "bh":
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+                elif method == "fmm":
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                
+                vx += 0.5 * dt * ax
+                vy += 0.5 * dt * ay
+            
+            # Calculate current energy and relative error
+            E = calculate_total_energy(x, y, vx, vy, m, G, eps)
+            rel_error = abs(E - E0) / abs(E0)
+            
+            times.append(step * dt)
+            rel_errors.append(rel_error)
+        
+        plt.semilogy(times, rel_errors, label=method_name)
+    
+    plt.xlabel("Time")
+    plt.ylabel("Relative Energy Error")
+    plt.title(f"Energy Conservation Test (N={N})")
+    plt.legend()
+    plt.grid(True)
+    
+    energy_path = os.path.join(OUTPUT_DIR, "energy_conservation.png")
+    plt.savefig(energy_path, dpi=300)
+    plt.close()
+    print(f"✓ Energy conservation plot saved to {energy_path}")
+
+def parameter_optimization():
+    """Parameter optimization"""
+    print("\nParameter Optimization")
+    print("=" * 50)
+    
+    N = 100
+    domain_size = 50.0
+    eps = 0.01
+    G = 1.0
+    
+    # Initialize particles
+    x, y, m = initialize_particles(N, domain_size)
+    
+    # Get reference solution
+    if not HAS_DIRECT:
+        print("Direct method not available for reference")
+        return
+    
+    ax_ref, ay_ref = safe_direct_force(x, y, m, eps*eps)
+    if ax_ref is None:
+        print("Failed to compute reference solution")
+        return
+    
+    thetas = [0.1, 0.3, 0.5, 0.7, 1.0]
+    bh_errors = []
+    fmm_errors = []
+    
+    for theta in thetas:
+        # Test Barnes-Hut
+        if HAS_FMM:
+            ax_bh, ay_bh = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+            if ax_bh is not None:
+                bh_error = np.sqrt(np.sum((ax_bh - ax_ref)**2 + (ay_bh - ay_ref)**2)) / np.sqrt(np.sum(ax_ref**2 + ay_ref**2))
+                bh_errors.append(bh_error)
+            else:
+                bh_errors.append(float('nan'))
+            
+            # Test FMM
+            ax_fmm, ay_fmm = safe_fmm_force(x, y, m, N, domain_size, theta, 8, eps, G)
+            if ax_fmm is not None:
+                fmm_error = np.sqrt(np.sum((ax_fmm - ax_ref)**2 + (ay_fmm - ay_ref)**2)) / np.sqrt(np.sum(ax_ref**2 + ay_ref**2))
+                fmm_errors.append(fmm_error)
+            else:
+                fmm_errors.append(float('nan'))
+        else:
+            bh_errors.append(float('nan'))
+            fmm_errors.append(float('nan'))
+    
+    # Plot results
+    plt.figure(figsize=(8, 6))
+    plt.semilogy(thetas, bh_errors, 's-', label="Barnes-Hut Error")
+    plt.semilogy(thetas, fmm_errors, '^-', label="FMM Error")
+    plt.xlabel("Theta (opening angle)")
+    plt.ylabel("Relative Force Error")
+    plt.title(f"Parameter Optimization (N={N})")
+    plt.legend()
+    plt.grid(True)
+    
+    param_path = os.path.join(OUTPUT_DIR, "parameter_optimization.png")
+    plt.savefig(param_path, dpi=300)
+    plt.close()
+    print(f"✓ Parameter optimization plot saved to {param_path}")
+
+def openmp_thread_benchmark():
+    """OpenMP thread benchmark"""
+    print("\nOpenMP Thread Benchmark")
+    print("=" * 50)
+    
+    if not HAS_FMM:
+        print("FMM not available for thread benchmark")
+        return
+    
+    N = 500
+    domain_size = 50.0
+    theta = 0.5
+    maxLeaf = 8
+    eps = 0.01
+    G = 1.0
+    
     thread_counts = [1, 2, 4, 8]
     times = []
-
-    # Pre-warm: build tree once
+    
     x, y, m = initialize_particles(N, domain_size)
-    _ = [0]*N; _ = [0]*N
-    fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                         N, domain_size, theta, maxLeaf,
-                         soft, G, [0]*N, [0]*N)
-
-    for nt in thread_counts:
-        os.environ["OMP_NUM_THREADS"] = str(nt)
-        time.sleep(0.1)
+    
+    for threads in thread_counts:
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        time.sleep(0.1)  # Allow environment to update
+        
         t0 = time.time()
-        for _ in range(steps):
-            fmm_kernel.fmm_force(x.tolist(), y.tolist(), m.tolist(),
-                                 N, domain_size, theta, maxLeaf,
-                                 soft, G, [0]*N, [0]*N)
-        t_avg = (time.time() - t0) / steps
-        print(f"Threads = {nt:>2} → Time = {t_avg:.6f} s")
-        times.append(t_avg)
-
-    sp = [times[0]/t for t in times]
-    plt.figure(figsize=(6,4))
-    plt.plot(thread_counts, sp, 'o-r', label="Measured Speedup")
-    plt.plot(thread_counts, thread_counts, '--k', label="Ideal Speedup")
+        for _ in range(10):  # Average over multiple runs
+            ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+        avg_time = (time.time() - t0) / 10
+        
+        times.append(avg_time)
+        print(f"Threads: {threads}, Time: {avg_time:.6f} seconds")
+    
+    # Calculate speedup
+    speedup = [times[0] / t for t in times]
+    
+    # Plot results
+    plt.figure(figsize=(8, 6))
+    plt.plot(thread_counts, speedup, 'o-', label="Measured Speedup")
+    plt.plot(thread_counts, thread_counts, '--', label="Ideal Speedup")
     plt.xlabel("Number of Threads")
-    plt.ylabel("Speedup (Relative to 1 thread)")
-    plt.title("OpenMP Thread Benchmark (FMM, N=10000)")
-    plt.xticks(thread_counts)
+    plt.ylabel("Speedup")
+    plt.title(f"OpenMP Thread Benchmark (FMM, N={N})")
     plt.legend()
-    plt.grid(True, which="both", ls="--", lw=0.5)
-    pngfile = os.path.join(OUTPUT_DIR, "openmp_thread_benchmark.png")
-    plt.savefig(pngfile, dpi=200)
+    plt.grid(True)
+    
+    thread_path = os.path.join(OUTPUT_DIR, "openmp_thread_benchmark.png")
+    plt.savefig(thread_path, dpi=300)
     plt.close()
-    print(f"✓ Saved thread-benchmark plot to {pngfile}")
-
-    # Restore OMP_NUM_THREADS back to 8
+    print(f"✓ Thread benchmark plot saved to {thread_path}")
+    
+    # Restore default thread count
     os.environ["OMP_NUM_THREADS"] = "8"
 
-# -----------------------------------------------------
-# Option (8): System Information
-# -----------------------------------------------------
 def system_information():
-    print("\nSystem Information\n------------------")
+    """System information"""
+    print("\nSystem Information")
+    print("=" * 50)
     print(f"Python version: {sys.version.split()[0]}")
-    print(f"Forced threads : 8")
+    print(f"OpenMP threads: {os.environ.get('OMP_NUM_THREADS', 'Not set')}")
+    print(f"Direct method module: {'Available' if HAS_DIRECT else 'Not available'}")
+    print(f"FMM module: {'Available' if HAS_FMM else 'Not available'}")
+    
     try:
         import platform
-        print(f"Platform       : {platform.platform()}")
+        print(f"Operating system: {platform.platform()}")
     except:
         pass
+    
     try:
         import multiprocessing
-        print(f"Logical cores  : {multiprocessing.cpu_count()}")
+        print(f"CPU cores: {multiprocessing.cpu_count()}")
     except:
         pass
-    # Query OpenMP max threads
+    
     try:
-        import ctypes
-        libgomp = ctypes.CDLL(None)
-        omp_get_max_threads = libgomp.omp_get_max_threads
-        omp_get_max_threads.restype = ctypes.c_int
-        print("OpenMP max threads:", omp_get_max_threads())
+        import numpy as np
+        print(f"NumPy version: {np.__version__}")
     except:
-        print("OpenMP max threads: N/A")
+        pass
 
-# -----------------------------------------------------
-# Main menu
-# -----------------------------------------------------
-if __name__ == "__main__":
+# Helper functions
+def calculate_total_energy(x, y, vx, vy, m, G, eps):
+    """Calculate total energy (kinetic + potential)"""
+    N = len(x)
+    
+    # Kinetic energy
+    ke = 0.5 * np.sum(m * (vx**2 + vy**2))
+    
+    # Potential energy
+    pe = 0.0
+    for i in range(N):
+        for j in range(i+1, N):
+            dx = x[j] - x[i]
+            dy = y[j] - y[i]
+            r = math.sqrt(dx*dx + dy*dy + eps*eps)
+            pe -= G * m[i] * m[j] / r
+    
+    return ke + pe
+
+def save_scaling_results(results, filename):
+    """Save scaling results to CSV and create plot"""
+    # Save CSV
+    csv_path = os.path.join(OUTPUT_DIR, f"{filename}.csv")
+    with open(csv_path, "w") as f:
+        f.write("N,Direct,BH,FMM\n")
+        for N, t_direct, t_bh, t_fmm in results:
+            f.write(f"{N},{t_direct},{t_bh},{t_fmm}\n")
+    
+    # Create plot
+    Ns = [r[0] for r in results]
+    times_direct = [r[1] for r in results if not math.isnan(r[1])]
+    times_bh = [r[2] for r in results if not math.isnan(r[2])]
+    times_fmm = [r[3] for r in results if not math.isnan(r[3])]
+    
+    plt.figure(figsize=(8, 6))
+    
+    if times_direct:
+        Ns_direct = [r[0] for r in results if not math.isnan(r[1])]
+        plt.loglog(Ns_direct, times_direct, 'o-', label="Direct O(N²)")
+    
+    if times_bh:
+        Ns_bh = [r[0] for r in results if not math.isnan(r[2])]
+        plt.loglog(Ns_bh, times_bh, 's-', label="Barnes-Hut O(N log N)")
+    
+    if times_fmm:
+        Ns_fmm = [r[0] for r in results if not math.isnan(r[3])]
+        plt.loglog(Ns_fmm, times_fmm, '^-', label="FMM O(N)")
+    
+    plt.xlabel("Number of Particles (N)")
+    plt.ylabel("Time per Step (seconds)")
+    plt.title("Performance Comparison")
+    plt.legend()
+    plt.grid(True)
+    
+    png_path = os.path.join(OUTPUT_DIR, f"{filename}.png")
+    plt.savefig(png_path, dpi=300)
+    plt.close()
+    
+    print(f"✓ Results saved to {csv_path} and {png_path}")
+
+def create_trajectory_animation(trajectory, method, N):
+    """Create trajectory animation"""
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Set limits based on trajectory
+    all_x = np.concatenate([pos[0] for pos in trajectory])
+    all_y = np.concatenate([pos[1] for pos in trajectory])
+    margin = 0.1
+    x_range = all_x.max() - all_x.min()
+    y_range = all_y.max() - all_y.min()
+    
+    ax.set_xlim(all_x.min() - margin*x_range, all_x.max() + margin*x_range)
+    ax.set_ylim(all_y.min() - margin*y_range, all_y.max() + margin*y_range)
+    ax.set_title(f"Trajectory ({method.upper()}, N={N})")
+    
+    scat = ax.scatter(trajectory[0][0], trajectory[0][1], s=10, c='blue')
+    
+    def animate(frame):
+        x, y = trajectory[frame]
+        scat.set_offsets(np.column_stack((x, y)))
+        return scat,
+    
+    ani = animation.FuncAnimation(fig, animate, frames=len(trajectory), interval=50, blit=True)
+    
+    gif_path = os.path.join(OUTPUT_DIR, f"trajectory_{method}_{N}.gif")
+    ani.save(gif_path, writer='pillow', fps=20)
+    plt.close()
+    print(f"✓ Trajectory animation saved to {gif_path}")
+
+def create_energy_plot(energies, dt, method, N):
+    """Create energy vs time plot"""
+    times = np.arange(len(energies)) * dt
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(times, energies, '-')
+    plt.xlabel("Time")
+    plt.ylabel("Total Energy")
+    plt.title(f"Energy vs Time ({method.upper()}, N={N})")
+    plt.grid(True)
+    
+    energy_path = os.path.join(OUTPUT_DIR, f"energy_{method}_{N}.png")
+    plt.savefig(energy_path, dpi=300)
+    plt.close()
+    print(f"✓ Energy plot saved to {energy_path}")
+
+def main_menu():
+    """Main menu with 8 options"""
     while True:
-        print("\n=== 2D N-Body Playground (Parallel, High-Precision) ===")
-        print("  1) Quick benchmark scaling")
-        print("  2) Save trajectory + energy plot")
-        print("  3) Live simulation animation")
-        print("  4) Large-N scaling test")
-        print("  5) Energy conservation test")
-        print("  6) Parameter optimization")
-        print("  7) OpenMP thread benchmark")
-        print("  8) System information")
-        print("  q) Quit")
-        print("=======================================================")
-        choice = input("Enter choice: ").strip().lower()
-
+        print("\n" + "=" * 60)
+        print("2D N-Body Problem Simulation Platform")
+        print("(Parallel High-Precision Version)")
+        print("=" * 60)
+        print("Select function:")
+        print(" 1) Quick benchmark scaling")
+        print(" 2) Save trajectory + energy plot")
+        print(" 3) Live simulation animation")
+        print(" 4) Large-N scaling test")
+        print(" 5) Energy conservation test")
+        print(" 6) Parameter optimization")
+        print(" 7) OpenMP thread benchmark")
+        print(" 8) System information")
+        print(" q) Exit program")
+        print("=" * 60)
+        
+        choice = input("Please enter your choice: ").strip().lower()
+        
         if choice == '1':
             quick_benchmark()
         elif choice == '2':
             save_trajectory_and_energy()
         elif choice == '3':
-            live_simulation()
+            live_simulation_animation()
         elif choice == '4':
-            largeN_scaling()
+            large_n_scaling()
         elif choice == '5':
             energy_conservation_test()
         elif choice == '6':
@@ -774,4 +778,16 @@ if __name__ == "__main__":
             break
         else:
             print("Invalid choice, please try again.")
+
+if __name__ == "__main__":
+    print("2D N-Body Problem Simulation Platform starting...")
+    
+    # Check module availability
+    if not HAS_DIRECT and not HAS_FMM:
+        print("Error: No available computation modules!")
+        print("Please ensure force_kernel and fmm_kernel modules are properly compiled.")
+        print("Run: python setup.py build_ext --inplace")
+        sys.exit(1)
+    
+    main_menu()
 

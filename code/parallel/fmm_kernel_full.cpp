@@ -1,242 +1,197 @@
 // fmm_kernel_full.cpp
-// --------------------------------------------------
-// PyBind11 + OpenMP implementation of a 2D Fast Multipole
-// Method (FMM) gravitational‐force kernel, accepting NumPy arrays.
-//
-// Exposes a single function:
-//
-//    fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G, ax, ay)
-//
-//   where x, y, m, ax, ay are NumPy arrays (dtype=float64).
-//
-// Build flags (setup.py passes):
-//   -std=c++17 -O3 -DNDEBUG -march=native -ffast-math -fopenmp
-// --------------------------------------------------
+// Fixed version with proper memory management and error handling
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <vector>
 #include <cmath>
+#include <memory>
+#include <stdexcept>
+
 #ifdef _OPENMP
-  #include <omp.h>
+#include <omp.h>
 #endif
 
 namespace py = pybind11;
 
-// -------------------------------------------------------------------
-// FMMCell: A node in the quadtree
-// -------------------------------------------------------------------
-struct FMMCell {
-    double cx, cy;               // center of cell
-    double size;                 // half‐width
-    std::vector<int> particles;  // indices inside this cell
-    double mass;                 // total mass
-    double mx, my;               // center‐of‐mass
-    bool isLeaf;                 // leaf? (no children)
-    FMMCell* children[4];        // pointers: 0=SW,1=SE,2=NW,3=NE
-
-    FMMCell(double _cx, double _cy, double _size)
-      : cx(_cx), cy(_cy), size(_size),
-        mass(0.0), mx(0.0), my(0.0), isLeaf(true)
-    {
-        for(int i=0; i<4; ++i) children[i] = nullptr;
-    }
-
-    ~FMMCell() {
-        for(int i=0; i<4; ++i) {
-            if(children[i]) {
-                delete children[i];
-                children[i] = nullptr;
-            }
+// Simple quadtree node
+struct FMMNode {
+    double cx, cy, size;
+    std::vector<int> particles;
+    double mass, mx, my;
+    bool is_leaf;
+    std::unique_ptr<FMMNode> children[4];
+    
+    FMMNode(double _cx, double _cy, double _size) 
+        : cx(_cx), cy(_cy), size(_size), mass(0.0), mx(0.0), my(0.0), is_leaf(true) {
+        for (int i = 0; i < 4; ++i) {
+            children[i] = nullptr;
         }
     }
 };
 
-// -------------------------------------------------------------------
-// build_tree: Insert N particles into root quadtree, splitting leaves
-// -------------------------------------------------------------------
-void build_tree(FMMCell* root,
-                const double* x,
-                const double* y,
-                int N,
-                int maxLeaf)
-{
-    for(int i = 0; i < N; ++i) {
-        double px = x[i], py = y[i];
-        FMMCell* cell = root;
-        while(true) {
-            if(cell->isLeaf) {
-                cell->particles.push_back(i);
-                if((int)cell->particles.size() > maxLeaf) {
-                    // Split leaf into 4 children
-                    cell->isLeaf = false;
-                    for(int q=0; q<4; ++q) {
-                        double offsetX = ((q & 1) ? +0.5 : -0.5) * cell->size;
-                        double offsetY = ((q & 2) ? +0.5 : -0.5) * cell->size;
-                        cell->children[q] = new FMMCell(
-                            cell->cx + offsetX,
-                            cell->cy + offsetY,
-                            cell->size * 0.5
-                        );
-                    }
-                    // Re‐insert existing particles into children
-                    for(int idx : cell->particles) {
-                        double rx = x[idx], ry = y[idx];
-                        int quadrant = ((rx > cell->cx) ? 1 : 0) + ((ry > cell->cy) ? 2 : 0);
-                        cell->children[quadrant]->particles.push_back(idx);
-                    }
-                    cell->particles.clear();
-                } else {
-                    break;
-                }
-            } else {
-                int quadrant = ((px > cell->cx) ? 1 : 0) + ((py > cell->cy) ? 2 : 0);
-                cell = cell->children[quadrant];
+class SimpleFMM {
+private:
+    std::unique_ptr<FMMNode> root;
+    const double* x_data;
+    const double* y_data;
+    const double* m_data;
+    int N;
+    double domain_size;
+    double theta;
+    int max_leaf;
+    double eps;
+    double G;
+    
+    void build_tree(FMMNode* node, int max_particles) {
+        if (node->particles.size() <= static_cast<size_t>(max_particles)) {
+            return; // Keep as leaf
+        }
+        
+        // Split into 4 children
+        node->is_leaf = false;
+        double half_size = node->size * 0.5;
+        
+        // Create children
+        node->children[0] = std::make_unique<FMMNode>(node->cx - half_size, node->cy - half_size, half_size); // SW
+        node->children[1] = std::make_unique<FMMNode>(node->cx + half_size, node->cy - half_size, half_size); // SE
+        node->children[2] = std::make_unique<FMMNode>(node->cx - half_size, node->cy + half_size, half_size); // NW
+        node->children[3] = std::make_unique<FMMNode>(node->cx + half_size, node->cy + half_size, half_size); // NE
+        
+        // Distribute particles to children
+        for (int pi : node->particles) {
+            double px = x_data[pi];
+            double py = y_data[pi];
+            
+            int quadrant = 0;
+            if (px > node->cx) quadrant += 1;
+            if (py > node->cy) quadrant += 2;
+            
+            node->children[quadrant]->particles.push_back(pi);
+        }
+        
+        node->particles.clear();
+        
+        // Recursively build children
+        for (int i = 0; i < 4; ++i) {
+            if (node->children[i] && !node->children[i]->particles.empty()) {
+                build_tree(node->children[i].get(), max_particles);
             }
         }
     }
-}
-
-// -------------------------------------------------------------------
-// gather: Collect pointers to all cells, grouped by depth
-// -------------------------------------------------------------------
-void gather_cells_by_level(FMMCell* root,
-                           std::vector<std::vector<FMMCell*>>& levels,
-                           int depth)
-{
-    if(depth >= (int)levels.size()) {
-        levels.resize(depth+1);
-    }
-    levels[depth].push_back(root);
-    if(!root->isLeaf) {
-        for(int q=0; q<4; ++q) {
-            gather_cells_by_level(root->children[q], levels, depth+1);
-        }
-    }
-}
-
-// -------------------------------------------------------------------
-// compute_upward_pass: Parallel bottom‐up pass to set mass & center‐of‐mass
-// -------------------------------------------------------------------
-void compute_upward_pass(FMMCell* root,
-                         const double* x,
-                         const double* y,
-                         const double* m,
-                         int N)
-{
-    // 1) Gather pointers by level (depth)
-    std::vector<std::vector<FMMCell*>> levels;
-    gather_cells_by_level(root, levels, 0);
-    int maxDepth = (int)levels.size() - 1;
-
-    // 2) For each level from bottom → top
-    for(int lev = maxDepth; lev >= 0; --lev) {
-        auto &cells = levels[lev];
-        int nCells = (int)cells.size();
-        #pragma omp parallel for schedule(static)
-        for(int idx = 0; idx < nCells; ++idx) {
-            FMMCell* cell = cells[idx];
-            if(cell->isLeaf) {
-                double mass_sum = 0.0;
-                double mx_sum = 0.0;
-                double my_sum = 0.0;
-                for(int pi : cell->particles) {
-                    double mi = m[pi];
-                    mass_sum += mi;
-                    mx_sum   += mi * x[pi];
-                    my_sum   += mi * y[pi];
-                }
-                cell->mass = mass_sum;
-                if(mass_sum > 0.0) {
-                    cell->mx = mx_sum / mass_sum;
-                    cell->my = my_sum / mass_sum;
-                } else {
-                    cell->mx = cell->cx;
-                    cell->my = cell->cy;
-                }
-            } else {
-                double mass_sum = 0.0;
-                double mx_sum = 0.0;
-                double my_sum = 0.0;
-                for(int q=0; q<4; ++q) {
-                    FMMCell* ch = cell->children[q];
-                    mass_sum += ch->mass;
-                    mx_sum   += ch->mass * ch->mx;
-                    my_sum   += ch->mass * ch->my;
-                }
-                cell->mass = mass_sum;
-                if(mass_sum > 0.0) {
-                    cell->mx = mx_sum / mass_sum;
-                    cell->my = my_sum / mass_sum;
-                } else {
-                    cell->mx = cell->cx;
-                    cell->my = cell->cy;
-                }
+    
+    void compute_mass_center(FMMNode* node) {
+        if (node->is_leaf) {
+            double total_mass = 0.0;
+            double mx_sum = 0.0;
+            double my_sum = 0.0;
+            
+            for (int pi : node->particles) {
+                double mi = m_data[pi];
+                total_mass += mi;
+                mx_sum += mi * x_data[pi];
+                my_sum += mi * y_data[pi];
             }
-        }
-    }
-}
-
-// -------------------------------------------------------------------
-// evaluate_target: Recursively traverse quadtree to accumulate force
-// -------------------------------------------------------------------
-void evaluate_target(const FMMCell* cell,
-                     double tx,
-                     double ty,
-                     double theta,
-                     double eps2,
-                     double G,
-                     const double* x,
-                     const double* y,
-                     const double* m,
-                     double& axi,
-                     double& ayi)
-{
-    double dx = cell->mx - tx;
-    double dy = cell->my - ty;
-    double dist2 = dx*dx + dy*dy + eps2;
-    double r = sqrt(dist2);
-
-    // If leaf OR (size / r) < theta, do monopole
-    if(cell->isLeaf || (cell->size / r) < theta) {
-        if(r > 0.0) {
-            double inv_r3 = 1.0 / (dist2 * r);
-            double mj = cell->mass * G * inv_r3;
-            axi += mj * dx;
-            ayi += mj * dy;
-        }
-    } else {
-        // Otherwise, open cell
-        if(cell->isLeaf) {
-            // Direct‐sum over particles in leaf
-            for(int pi : cell->particles) {
-                double ddx = x[pi] - tx;
-                double ddy = y[pi] - ty;
-                double d2 = ddx*ddx + ddy*ddy + eps2;
-                double rr = sqrt(d2);
-                if(rr > 0.0) {
-                    double inv_r3 = 1.0 / (d2 * rr);
-                    double mj = m[pi] * G * inv_r3;
-                    axi += mj * ddx;
-                    ayi += mj * ddy;
-                }
+            
+            node->mass = total_mass;
+            if (total_mass > 0.0) {
+                node->mx = mx_sum / total_mass;
+                node->my = my_sum / total_mass;
+            } else {
+                node->mx = node->cx;
+                node->my = node->cy;
             }
         } else {
-            // Recurse into children
-            for(int q=0; q<4; ++q) {
-                evaluate_target(cell->children[q],
-                                tx, ty,
-                                theta, eps2, G,
-                                x, y, m,
-                                axi, ayi);
+            double total_mass = 0.0;
+            double mx_sum = 0.0;
+            double my_sum = 0.0;
+            
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i] && !node->children[i]->particles.empty()) {
+                    compute_mass_center(node->children[i].get());
+                    
+                    double child_mass = node->children[i]->mass;
+                    total_mass += child_mass;
+                    mx_sum += child_mass * node->children[i]->mx;
+                    my_sum += child_mass * node->children[i]->my;
+                }
+            }
+            
+            node->mass = total_mass;
+            if (total_mass > 0.0) {
+                node->mx = mx_sum / total_mass;
+                node->my = my_sum / total_mass;
+            } else {
+                node->mx = node->cx;
+                node->my = node->cy;
             }
         }
     }
-}
+    
+    void evaluate_force(FMMNode* node, double tx, double ty, double& ax, double& ay) {
+        if (!node || node->mass == 0.0) return;
+        
+        double dx = node->mx - tx;
+        double dy = node->my - ty;
+        double r2 = dx*dx + dy*dy + eps*eps;
+        double r = std::sqrt(r2);
+        
+        // Use monopole approximation if far enough or leaf
+        if (node->is_leaf || (node->size / r) < theta) {
+            if (r > 0.0) {
+                double inv_r3 = G / (r2 * r);
+                ax += node->mass * dx * inv_r3;
+                ay += node->mass * dy * inv_r3;
+            }
+        } else {
+            // Recurse to children
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i]) {
+                    evaluate_force(node->children[i].get(), tx, ty, ax, ay);
+                }
+            }
+        }
+    }
+    
+public:
+    void compute_forces(const double* x, const double* y, const double* m, int n,
+                       double domain, double th, int max_leaf_particles,
+                       double epsilon, double gravity,
+                       double* ax, double* ay) {
+        
+        // Store parameters
+        x_data = x;
+        y_data = y;
+        m_data = m;
+        N = n;
+        domain_size = domain;
+        theta = th;
+        max_leaf = max_leaf_particles;
+        eps = epsilon;
+        G = gravity;
+        
+        // Create root node and add all particles
+        root = std::make_unique<FMMNode>(0.0, 0.0, domain_size);
+        for (int i = 0; i < N; ++i) {
+            root->particles.push_back(i);
+        }
+        
+        // Build tree
+        build_tree(root.get(), max_leaf);
+        
+        // Compute mass centers
+        compute_mass_center(root.get());
+        
+        // Compute forces for each particle
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i) {
+            ax[i] = 0.0;
+            ay[i] = 0.0;
+            evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
+        }
+    }
+};
 
-// -------------------------------------------------------------------
-// fmm_force: Build tree → upward pass → parallel downward pass
-// -------------------------------------------------------------------
 void fmm_force(const py::array_t<double>& x_arr,
                const py::array_t<double>& y_arr,
                const py::array_t<double>& m_arr,
@@ -249,65 +204,42 @@ void fmm_force(const py::array_t<double>& x_arr,
                py::array_t<double>& ax_arr,
                py::array_t<double>& ay_arr)
 {
-    // 1) Access raw pointers
-    auto x_view = x_arr.unchecked<1>();
-    auto y_view = y_arr.unchecked<1>();
-    auto m_view = m_arr.unchecked<1>();
-    auto ax_view = ax_arr.mutable_unchecked<1>();
-    auto ay_view = ay_arr.mutable_unchecked<1>();
-
-    // Copy data pointers into C arrays
-    // (NumPy guarantees contiguous double64)
-    const double* x = x_view.data(0);
-    const double* y = y_view.data(0);
-    const double* m = m_view.data(0);
-    double* ax = ax_view.mutable_data(0);
-    double* ay = ay_view.mutable_data(0);
-
-    // 2) Build quadtree
-    FMMCell* root = new FMMCell(0.0, 0.0, domain_size);
-    build_tree(root, x, y, N, maxLeaf);
-
-    // 3) Upward pass (compute mass & COM) in parallel
-    compute_upward_pass(root, x, y, m, N);
-
-    // 4) Zero out output arrays
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < N; ++i) {
-        ax[i] = 0.0;
-        ay[i] = 0.0;
+    // Get array access
+    auto x = x_arr.unchecked<1>();
+    auto y = y_arr.unchecked<1>();
+    auto m = m_arr.unchecked<1>();
+    auto ax = ax_arr.mutable_unchecked<1>();
+    auto ay = ay_arr.mutable_unchecked<1>();
+    
+    // Validate input
+    if (N != x.shape(0) || N != y.shape(0) || N != m.shape(0) || 
+        N != ax.shape(0) || N != ay.shape(0)) {
+        throw std::runtime_error("Array size mismatch in fmm_force");
     }
-
-    // 5) Downward pass: one OpenMP region, each thread handles a block of i
-    int nthreads = 1;
-    #ifdef _OPENMP
-    nthreads = omp_get_max_threads();
-    #endif
-    int chunk = (N + nthreads - 1) / nthreads;
-
-    #pragma omp parallel firstprivate(nthreads, chunk)
-    {
-        int tid = 0;
-        #ifdef _OPENMP
-        tid = omp_get_thread_num();
-        #endif
-        int istart = std::min(N, tid * chunk);
-        int iend   = std::min(N, (tid + 1) * chunk);
-
-        for(int i = istart; i < iend; ++i) {
-            double tx = x[i];
-            double ty = y[i];
-            double axi = 0.0;
-            double ayi = 0.0;
-            evaluate_target(root, tx, ty, theta, eps*eps, G,
-                            x, y, m, axi, ayi);
-            ax[i] = axi;
-            ay[i] = ayi;
-        }
+    
+    if (N <= 0) {
+        throw std::runtime_error("Invalid particle count");
     }
-
-    // 6) Clean up
-    delete root;
+    
+    try {
+        // Create FMM solver
+        SimpleFMM fmm;
+        
+        // Get raw data pointers
+        const double* x_ptr = x.data(0);
+        const double* y_ptr = y.data(0);
+        const double* m_ptr = m.data(0);
+        double* ax_ptr = ax.mutable_data(0);
+        double* ay_ptr = ay.mutable_data(0);
+        
+        // Compute forces
+        fmm.compute_forces(x_ptr, y_ptr, m_ptr, N,
+                          domain_size, theta, maxLeaf,
+                          eps, G, ax_ptr, ay_ptr);
+                          
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("FMM computation failed: ") + e.what());
+    }
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
@@ -319,10 +251,10 @@ PYBIND11_MODULE(fmm_kernel, m) {
           py::arg("m"),
           py::arg("N"),
           py::arg("domain_size") = 50.0,
-          py::arg("theta")       = 0.5,
-          py::arg("maxLeaf")     = 8,
-          py::arg("eps")         = 0.01,
-          py::arg("G")           = 1.0,
+          py::arg("theta") = 0.5,
+          py::arg("maxLeaf") = 8,
+          py::arg("eps") = 0.01,
+          py::arg("G") = 1.0,
           py::arg("ax"),
           py::arg("ay"));
 }
