@@ -1,5 +1,5 @@
 // force_kernel_full.cpp
-// Optimized version with better parallelization
+// Fixed version with proper includes and no warnings
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -32,34 +32,34 @@ void direct_force(const py::array_t<double>& x_arr,
         throw std::runtime_error("Array size mismatch in direct_force");
     }
     
-    // Initialize output arrays
+    // Initialize output arrays first
     #pragma omp parallel for schedule(static)
     for (ssize_t i = 0; i < N; ++i) {
         ax(i) = 0.0;
         ay(i) = 0.0;
     }
     
-    // Optimized O(N^2) loop with better cache usage and load balancing
-    #pragma omp parallel for schedule(dynamic, 16) collapse(1)
+    // Use static scheduling for better cache locality
+    // Only parallelize for larger problems to avoid overhead
+    #pragma omp parallel for schedule(static) if(N > 500)
     for (ssize_t i = 0; i < N; ++i) {
-        double xi = x(i);
-        double yi = y(i);
+        const double xi = x(i);
+        const double yi = y(i);
         double axi = 0.0;
         double ayi = 0.0;
         
-        // Vectorizable inner loop
-        #pragma omp simd reduction(+:axi,ayi)
+        // Inner loop with better vectorization hints
         for (ssize_t j = 0; j < N; ++j) {
             if (i == j) continue;
             
-            double dx = xi - x(j);
-            double dy = yi - y(j);
-            double r2 = dx*dx + dy*dy + eps2;
+            const double dx = xi - x(j);
+            const double dy = yi - y(j);
+            const double r2 = dx*dx + dy*dy + eps2;
             
-            if (r2 > 0.0) {
-                double inv_r = 1.0 / std::sqrt(r2);
-                double inv_r3 = inv_r * inv_r * inv_r;
-                double mj = m(j);
+            if (r2 > eps2) {  // Avoid division by very small numbers
+                const double inv_r = 1.0 / std::sqrt(r2);
+                const double inv_r3 = inv_r * inv_r * inv_r;
+                const double mj = m(j);
                 axi -= mj * dx * inv_r3;
                 ayi -= mj * dy * inv_r3;
             }
@@ -71,7 +71,7 @@ void direct_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(force_kernel, m) {
-    m.doc() = "2D direct O(N^2) gravitational kernel (Optimized OpenMP)";
+    m.doc() = "2D direct O(N^2) gravitational kernel (Fixed OpenMP)";
     m.def("direct_force",
           &direct_force,
           py::arg("x"),

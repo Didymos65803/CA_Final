@@ -1,5 +1,5 @@
 // fmm_kernel_full.cpp
-// Optimized version with better memory management and parallelization
+// Fixed version without unused variables
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -15,11 +15,13 @@
 
 namespace py = pybind11;
 
-// Cache-aligned structure to avoid false sharing
-struct alignas(64) ThreadLocalData {
+// Proper alignment to avoid false sharing
+struct alignas(128) ThreadLocalAccumulator {
     double ax;
     double ay;
-    char padding[64 - 2*sizeof(double)];
+    char padding[128 - 2*sizeof(double)];
+    
+    ThreadLocalAccumulator() : ax(0.0), ay(0.0) {}
 };
 
 struct FMMNode {
@@ -134,6 +136,23 @@ private:
         }
     }
     
+    void evaluate_force_direct(const std::vector<int>& particles, 
+                              double tx, double ty, double& ax, double& ay) {
+        // Direct calculation for leaf nodes
+        for (int pi : particles) {
+            double dx = x_data[pi] - tx;
+            double dy = y_data[pi] - ty;
+            double r2 = dx*dx + dy*dy + eps*eps;
+            
+            if (r2 > eps*eps) {
+                double inv_r3 = G / (r2 * std::sqrt(r2));
+                double mi = m_data[pi];
+                ax += mi * dx * inv_r3;
+                ay += mi * dy * inv_r3;
+            }
+        }
+    }
+    
     void evaluate_force(FMMNode* node, double tx, double ty, double& ax, double& ay) {
         if (!node || node->mass == 0.0) return;
         
@@ -142,13 +161,18 @@ private:
         double r2 = dx*dx + dy*dy + eps*eps;
         double r = std::sqrt(r2);
         
-        if (node->is_leaf || (node->size / r) < theta) {
-            if (r > 0.0) {
+        if (node->is_leaf) {
+            // For leaf nodes, always use direct calculation
+            evaluate_force_direct(node->particles, tx, ty, ax, ay);
+        } else if ((node->size / r) < theta) {
+            // Use monopole approximation
+            if (r > eps) {
                 double inv_r3 = G / (r2 * r);
                 ax += node->mass * dx * inv_r3;
                 ay += node->mass * dy * inv_r3;
             }
         } else {
+            // Recurse to children
             for (int i = 0; i < 4; ++i) {
                 if (node->children[i]) {
                     evaluate_force(node->children[i].get(), tx, ty, ax, ay);
@@ -179,18 +203,28 @@ public:
             root->particles.push_back(i);
         }
         
-        // Build tree
+        // Build tree (sequential - tree building is hard to parallelize efficiently)
         build_tree(root.get(), max_leaf);
         compute_mass_center(root.get());
         
-        // Compute forces with optimized parallelization
-        const int chunk_size = std::max(1, N / (omp_get_max_threads() * 4));
-        
-        #pragma omp parallel for schedule(dynamic, chunk_size)
-        for (int i = 0; i < N; ++i) {
-            ax[i] = 0.0;
-            ay[i] = 0.0;
-            evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
+        // Compute forces with improved parallelization
+        if (N >= 1000) {
+            // For large problems, use parallelization
+            const int chunk_size = std::max(16, N / (8 * omp_get_max_threads()));
+            
+            #pragma omp parallel for schedule(static, chunk_size)
+            for (int i = 0; i < N; ++i) {
+                ax[i] = 0.0;
+                ay[i] = 0.0;
+                evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
+            }
+        } else {
+            // For small problems, use sequential computation
+            for (int i = 0; i < N; ++i) {
+                ax[i] = 0.0;
+                ay[i] = 0.0;
+                evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
+            }
         }
     }
 };
@@ -241,7 +275,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "2D Fast Multipole Method (FMM) kernel (Optimized OpenMP)";
+    m.doc() = "2D Fast Multipole Method (FMM) kernel (Fixed OpenMP)";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),

@@ -1,6 +1,4 @@
-# setup.py
-# Optimized version with better compiler flags
-
+# setup.py - Fixed version
 from setuptools import setup, Extension
 import pybind11
 import sys
@@ -18,7 +16,7 @@ def has_openmp():
 
 include_dirs = [pybind11.get_include()]
 
-# Optimized compiler flags for better performance
+# Fixed compiler flags without problematic options
 base_compile_args = [
     "-std=c++17", 
     "-O3", 
@@ -26,35 +24,30 @@ base_compile_args = [
     "-ffast-math",
     "-funroll-loops",
     "-fno-signed-zeros",
-    "-fno-trapping-math"
+    "-fno-trapping-math",
+    "-ftree-vectorize"
 ]
 
 base_link_args = []
 
-# Add OpenMP with optimized settings
+# Add OpenMP
 if has_openmp():
-    base_compile_args.extend(["-fopenmp", "-DOMP_DYNAMIC=false"])
+    base_compile_args.extend(["-fopenmp"])
     base_link_args.append("-fopenmp")
-    print("OpenMP support detected with optimizations")
+    print("✓ OpenMP support detected")
 else:
-    print("Warning: OpenMP not available")
+    print("✗ OpenMP not available")
 
 # Platform-specific optimizations
 if sys.platform != "win32":
     base_compile_args.extend(["-march=native", "-mtune=native"])
-
-# Add vectorization flags
-base_compile_args.extend([
-    "-ftree-vectorize",
-    "-fopt-info-vec-optimized" if sys.platform != "win32" else ""
-])
 
 force_ext = Extension(
     name="force_kernel",
     sources=["force_kernel_full.cpp"],
     include_dirs=include_dirs,
     language="c++",
-    extra_compile_args=[arg for arg in base_compile_args if arg],
+    extra_compile_args=base_compile_args,
     extra_link_args=base_link_args
 )
 
@@ -63,15 +56,15 @@ fmm_ext = Extension(
     sources=["fmm_kernel_full.cpp"],
     include_dirs=include_dirs,
     language="c++",
-    extra_compile_args=[arg for arg in base_compile_args if arg],
+    extra_compile_args=base_compile_args,
     extra_link_args=base_link_args
 )
 
 setup(
     name="nbody_kernels",
-    version="2.1",
-    author="Optimized Version",
-    description="Optimized PyBind11 + OpenMP kernels for 2D N-Body",
+    version="3.0",
+    author="Fixed Version",
+    description="Fixed PyBind11 + OpenMP kernels for 2D N-Body",
     ext_modules=[force_ext, fmm_ext],
     zip_safe=False,
 )
