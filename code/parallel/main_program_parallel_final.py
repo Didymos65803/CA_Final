@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # main_program_parallel_final.py
-# Fixed version for new C++ kernel interface
+# Optimized version with better parallelization strategies
 
 import os
 import sys
@@ -10,8 +10,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-# Force OpenMP to use 8 threads
+# Optimized OpenMP environment settings
 os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["OMP_PROC_BIND"] = "close"
+os.environ["OMP_PLACES"] = "cores"
+os.environ["OMP_SCHEDULE"] = "dynamic,16"
+os.environ["OMP_DYNAMIC"] = "false"
 
 # Set path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -39,30 +43,40 @@ if not os.path.isdir(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 def initialize_particles(N, domain_size):
-    """Initialize N particles uniformly in a disk"""
+    """Initialize N particles uniformly in a disk with better memory layout"""
     angles = np.random.rand(N) * 2.0 * math.pi
     radii = domain_size * np.sqrt(np.random.rand(N))
-    x = radii * np.cos(angles)
-    y = radii * np.sin(angles)
+    
+    # Use memory-aligned arrays for better cache performance
+    x = np.empty(N, dtype=np.float64)
+    y = np.empty(N, dtype=np.float64)
     m = np.ones(N, dtype=np.float64)
+    
+    x[:] = radii * np.cos(angles)
+    y[:] = radii * np.sin(angles)
+    
+    # Ensure arrays are contiguous and aligned
+    x = np.ascontiguousarray(x)
+    y = np.ascontiguousarray(y)
+    m = np.ascontiguousarray(m)
+    
     return x, y, m
 
 def safe_direct_force(x, y, m, eps2):
-    """Safe wrapper for direct force calculation using new interface"""
+    """Optimized direct force calculation"""
     N = len(x)
     
-    # Ensure inputs are contiguous NumPy arrays
-    x_arr = np.ascontiguousarray(x, dtype=np.float64)
-    y_arr = np.ascontiguousarray(y, dtype=np.float64)
-    m_arr = np.ascontiguousarray(m, dtype=np.float64)
-    
-    # Pre-allocate output arrays
+    # Pre-allocate aligned output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
     if HAS_DIRECT:
         try:
-            # New interface: direct_force(x, y, m, eps2, ax, ay)
+            # Ensure memory alignment and contiguity
+            x_arr = np.ascontiguousarray(x, dtype=np.float64)
+            y_arr = np.ascontiguousarray(y, dtype=np.float64)
+            m_arr = np.ascontiguousarray(m, dtype=np.float64)
+            
             force_kernel.direct_force(x_arr, y_arr, m_arr, eps2, ax, ay)
             return ax, ay
         except Exception as e:
@@ -72,20 +86,19 @@ def safe_direct_force(x, y, m, eps2):
         return None, None
 
 def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
-    """Safe wrapper for FMM force calculation using new interface"""
+    """Optimized FMM force calculation"""
     
-    # Ensure inputs are contiguous NumPy arrays
-    x_arr = np.ascontiguousarray(x, dtype=np.float64)
-    y_arr = np.ascontiguousarray(y, dtype=np.float64)
-    m_arr = np.ascontiguousarray(m, dtype=np.float64)
-    
-    # Pre-allocate output arrays
+    # Pre-allocate aligned output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
     if HAS_FMM:
         try:
-            # New interface: fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G, ax, ay)
+            # Ensure memory alignment and contiguity
+            x_arr = np.ascontiguousarray(x, dtype=np.float64)
+            y_arr = np.ascontiguousarray(y, dtype=np.float64)
+            m_arr = np.ascontiguousarray(m, dtype=np.float64)
+            
             fmm_kernel.fmm_force(x_arr, y_arr, m_arr, N, domain_size, 
                                theta, maxLeaf, eps, G, ax, ay)
             return ax, ay
@@ -95,13 +108,111 @@ def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
     else:
         return None, None
 
+def optimized_benchmark():
+    """Optimized benchmark with better problem sizes for parallelization"""
+    print("\nOptimized Benchmark with Better Parallelization")
+    print("=" * 60)
+    
+    # Use larger problem sizes where parallelization shows benefits
+    Ns = [200, 500, 1000, 2000, 4000]
+    steps = 3
+    domain_size = 50.0
+    theta = 0.5
+    maxLeaf = 16  # Larger maxLeaf to reduce tree overhead
+    eps = 0.01
+    G = 1.0
+    
+    print(f"Using optimized OpenMP settings")
+    print(f"Testing particle counts: {Ns}")
+    print(f"Each test runs {steps} steps")
+    
+    results = []
+    
+    for N in Ns:
+        print(f"\nTesting N = {N}")
+        
+        # Initialize with better memory layout
+        x, y, m = initialize_particles(N, domain_size)
+        
+        # Test direct method (skip for large N)
+        t_direct = None
+        if HAS_DIRECT and N <= 1000:
+            try:
+                print("  Testing direct method...")
+                # Warm up
+                safe_direct_force(x, y, m, eps*eps)
+                
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_direct_force(x, y, m, eps*eps)
+                    if ax is None:
+                        raise Exception("Direct force failed")
+                t_direct = (time.time() - t0) / steps
+                print(f"  ✓ Direct method: {t_direct:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ Direct method: Failed ({e})")
+                t_direct = float('nan')
+        else:
+            print("  ✗ Direct method: Skipped for large N")
+            t_direct = float('nan')
+        
+        # Test Barnes-Hut
+        t_bh = None
+        if HAS_FMM:
+            try:
+                print("  Testing Barnes-Hut method...")
+                # Warm up
+                safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+                
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, 1, eps, G)
+                    if ax is None:
+                        raise Exception("BH force failed")
+                t_bh = (time.time() - t0) / steps
+                print(f"  ✓ Barnes-Hut: {t_bh:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ Barnes-Hut: Failed ({e})")
+                t_bh = float('nan')
+        else:
+            print("  ✗ Barnes-Hut: Not available")
+            t_bh = float('nan')
+        
+        # Test FMM
+        t_fmm = None
+        if HAS_FMM:
+            try:
+                print("  Testing FMM method...")
+                # Warm up
+                safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                
+                t0 = time.time()
+                for _ in range(steps):
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                    if ax is None:
+                        raise Exception("FMM force failed")
+                t_fmm = (time.time() - t0) / steps
+                print(f"  ✓ FMM: {t_fmm:.6f} seconds")
+            except Exception as e:
+                print(f"  ✗ FMM: Failed ({e})")
+                t_fmm = float('nan')
+        else:
+            print("  ✗ FMM: Not available")
+            t_fmm = float('nan')
+        
+        results.append((N, t_direct, t_bh, t_fmm))
+    
+    # Save results
+    save_scaling_results(results, "optimized_benchmark")
+    print("\n✓ Optimized benchmark completed!")
+
 def quick_benchmark():
     """Quick benchmark scaling"""
     print("\nQuick Benchmark Scaling")
     print("=" * 50)
     
-    Ns = [50, 100, 200, 500]  # 減少測試規模避免卡住
-    steps = 3  # 減少步數
+    Ns = [50, 100, 200, 500]
+    steps = 3
     domain_size = 50.0
     theta = 0.5
     maxLeaf = 8
@@ -116,7 +227,6 @@ def quick_benchmark():
     for N in Ns:
         print(f"\nTesting N = {N}")
         
-        # Initialize particles
         x, y, m = initialize_particles(N, domain_size)
         
         # Test direct method
@@ -138,7 +248,7 @@ def quick_benchmark():
             print("  ✗ Direct method: Not available")
             t_direct = float('nan')
         
-        # Test Barnes-Hut (using FMM with maxLeaf=1)
+        # Test Barnes-Hut
         t_bh = None
         if HAS_FMM:
             try:
@@ -178,7 +288,6 @@ def quick_benchmark():
         
         results.append((N, t_direct, t_bh, t_fmm))
     
-    # Save results
     save_scaling_results(results, "scaling_quick")
     print("\n✓ Quick benchmark completed!")
 
@@ -339,11 +448,11 @@ def large_n_scaling():
     print("\nLarge-N Scaling Test")
     print("=" * 50)
     
-    Ns = [500, 1000, 2000]  # 減少測試規模
+    Ns = [500, 1000, 2000, 4000]
     steps = 3
     domain_size = 50.0
     theta = 0.5
-    maxLeaf = 8
+    maxLeaf = 16  # Larger for better performance
     eps = 0.01
     G = 1.0
     
@@ -551,18 +660,19 @@ def parameter_optimization():
     print(f"✓ Parameter optimization plot saved to {param_path}")
 
 def openmp_thread_benchmark():
-    """OpenMP thread benchmark"""
-    print("\nOpenMP Thread Benchmark")
+    """Improved OpenMP thread benchmark with larger problem sizes"""
+    print("\nImproved OpenMP Thread Benchmark")
     print("=" * 50)
     
     if not HAS_FMM:
         print("FMM not available for thread benchmark")
         return
     
-    N = 500
+    # Use larger problem size for better parallelization
+    N = 2000
     domain_size = 50.0
     theta = 0.5
-    maxLeaf = 8
+    maxLeaf = 16
     eps = 0.01
     G = 1.0
     
@@ -571,35 +681,61 @@ def openmp_thread_benchmark():
     
     x, y, m = initialize_particles(N, domain_size)
     
+    print(f"Testing with N = {N} particles")
+    
     for threads in thread_counts:
         os.environ["OMP_NUM_THREADS"] = str(threads)
-        time.sleep(0.1)  # Allow environment to update
+        time.sleep(0.2)  # Allow environment to update
         
-        t0 = time.time()
-        for _ in range(10):  # Average over multiple runs
+        # Warm up
+        safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+        
+        # Measure performance
+        times_list = []
+        for _ in range(5):  # Multiple runs for better accuracy
+            t0 = time.time()
             ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
-        avg_time = (time.time() - t0) / 10
+            times_list.append(time.time() - t0)
         
+        avg_time = sum(times_list) / len(times_list)
         times.append(avg_time)
         print(f"Threads: {threads}, Time: {avg_time:.6f} seconds")
     
     # Calculate speedup
     speedup = [times[0] / t for t in times]
+    efficiency = [s / tc for s, tc in zip(speedup, thread_counts)]
     
     # Plot results
-    plt.figure(figsize=(8, 6))
-    plt.plot(thread_counts, speedup, 'o-', label="Measured Speedup")
-    plt.plot(thread_counts, thread_counts, '--', label="Ideal Speedup")
-    plt.xlabel("Number of Threads")
-    plt.ylabel("Speedup")
-    plt.title(f"OpenMP Thread Benchmark (FMM, N={N})")
-    plt.legend()
-    plt.grid(True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
-    thread_path = os.path.join(OUTPUT_DIR, "openmp_thread_benchmark.png")
+    # Speedup plot
+    ax1.plot(thread_counts, speedup, 'o-', label="Measured Speedup", linewidth=2)
+    ax1.plot(thread_counts, thread_counts, '--', label="Ideal Speedup", linewidth=2)
+    ax1.set_xlabel("Number of Threads")
+    ax1.set_ylabel("Speedup")
+    ax1.set_title(f"OpenMP Thread Benchmark (FMM, N={N})")
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Efficiency plot
+    ax2.plot(thread_counts, efficiency, 's-', color='red', label="Parallel Efficiency", linewidth=2)
+    ax2.axhline(y=1.0, color='gray', linestyle='--', label="Perfect Efficiency")
+    ax2.set_xlabel("Number of Threads")
+    ax2.set_ylabel("Efficiency")
+    ax2.set_title("Parallel Efficiency")
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    thread_path = os.path.join(OUTPUT_DIR, "improved_openmp_benchmark.png")
     plt.savefig(thread_path, dpi=300)
     plt.close()
-    print(f"✓ Thread benchmark plot saved to {thread_path}")
+    print(f"✓ Improved thread benchmark plot saved to {thread_path}")
+    
+    # Print summary
+    print(f"\nBenchmark Summary:")
+    print(f"Maximum speedup: {max(speedup):.2f}x")
+    print(f"Efficiency at 8 threads: {efficiency[-1]:.1%}")
     
     # Restore default thread count
     os.environ["OMP_NUM_THREADS"] = "8"
@@ -610,6 +746,8 @@ def system_information():
     print("=" * 50)
     print(f"Python version: {sys.version.split()[0]}")
     print(f"OpenMP threads: {os.environ.get('OMP_NUM_THREADS', 'Not set')}")
+    print(f"OpenMP proc bind: {os.environ.get('OMP_PROC_BIND', 'Not set')}")
+    print(f"OpenMP places: {os.environ.get('OMP_PLACES', 'Not set')}")
     print(f"Direct method module: {'Available' if HAS_DIRECT else 'Not available'}")
     print(f"FMM module: {'Available' if HAS_FMM else 'Not available'}")
     
@@ -669,15 +807,15 @@ def save_scaling_results(results, filename):
     
     if times_direct:
         Ns_direct = [r[0] for r in results if not math.isnan(r[1])]
-        plt.loglog(Ns_direct, times_direct, 'o-', label="Direct O(N²)")
+        plt.loglog(Ns_direct, times_direct, 'o-', label="Direct O(N²)", linewidth=2)
     
     if times_bh:
         Ns_bh = [r[0] for r in results if not math.isnan(r[2])]
-        plt.loglog(Ns_bh, times_bh, 's-', label="Barnes-Hut O(N log N)")
+        plt.loglog(Ns_bh, times_bh, 's-', label="Barnes-Hut O(N log N)", linewidth=2)
     
     if times_fmm:
         Ns_fmm = [r[0] for r in results if not math.isnan(r[3])]
-        plt.loglog(Ns_fmm, times_fmm, '^-', label="FMM O(N)")
+        plt.loglog(Ns_fmm, times_fmm, '^-', label="FMM O(N)", linewidth=2)
     
     plt.xlabel("Number of Particles (N)")
     plt.ylabel("Time per Step (seconds)")
@@ -737,11 +875,11 @@ def create_energy_plot(energies, dt, method, N):
     print(f"✓ Energy plot saved to {energy_path}")
 
 def main_menu():
-    """Main menu with 8 options"""
+    """Main menu with 9 options including optimized benchmark"""
     while True:
         print("\n" + "=" * 60)
         print("2D N-Body Problem Simulation Platform")
-        print("(Parallel High-Precision Version)")
+        print("(Optimized Parallel High-Precision Version)")
         print("=" * 60)
         print("Select function:")
         print(" 1) Quick benchmark scaling")
@@ -752,6 +890,7 @@ def main_menu():
         print(" 6) Parameter optimization")
         print(" 7) OpenMP thread benchmark")
         print(" 8) System information")
+        print(" 9) Optimized benchmark (large N)")
         print(" q) Exit program")
         print("=" * 60)
         
@@ -773,6 +912,8 @@ def main_menu():
             openmp_thread_benchmark()
         elif choice == '8':
             system_information()
+        elif choice == '9':
+            optimized_benchmark()
         elif choice == 'q':
             print("Goodbye!")
             break
@@ -781,6 +922,7 @@ def main_menu():
 
 if __name__ == "__main__":
     print("2D N-Body Problem Simulation Platform starting...")
+    print("Optimized for better parallel performance")
     
     # Check module availability
     if not HAS_DIRECT and not HAS_FMM:

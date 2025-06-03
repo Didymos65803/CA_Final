@@ -1,5 +1,5 @@
 // fmm_kernel_full.cpp
-// Fixed version with proper memory management and error handling
+// Optimized version with better memory management and parallelization
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -7,6 +7,7 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
+#include <algorithm>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -14,7 +15,13 @@
 
 namespace py = pybind11;
 
-// Simple quadtree node
+// Cache-aligned structure to avoid false sharing
+struct alignas(64) ThreadLocalData {
+    double ax;
+    double ay;
+    char padding[64 - 2*sizeof(double)];
+};
+
 struct FMMNode {
     double cx, cy, size;
     std::vector<int> particles;
@@ -30,7 +37,7 @@ struct FMMNode {
     }
 };
 
-class SimpleFMM {
+class OptimizedFMM {
 private:
     std::unique_ptr<FMMNode> root;
     const double* x_data;
@@ -45,20 +52,19 @@ private:
     
     void build_tree(FMMNode* node, int max_particles) {
         if (node->particles.size() <= static_cast<size_t>(max_particles)) {
-            return; // Keep as leaf
+            return;
         }
         
-        // Split into 4 children
         node->is_leaf = false;
         double half_size = node->size * 0.5;
         
         // Create children
-        node->children[0] = std::make_unique<FMMNode>(node->cx - half_size, node->cy - half_size, half_size); // SW
-        node->children[1] = std::make_unique<FMMNode>(node->cx + half_size, node->cy - half_size, half_size); // SE
-        node->children[2] = std::make_unique<FMMNode>(node->cx - half_size, node->cy + half_size, half_size); // NW
-        node->children[3] = std::make_unique<FMMNode>(node->cx + half_size, node->cy + half_size, half_size); // NE
+        node->children[0] = std::make_unique<FMMNode>(node->cx - half_size, node->cy - half_size, half_size);
+        node->children[1] = std::make_unique<FMMNode>(node->cx + half_size, node->cy - half_size, half_size);
+        node->children[2] = std::make_unique<FMMNode>(node->cx - half_size, node->cy + half_size, half_size);
+        node->children[3] = std::make_unique<FMMNode>(node->cx + half_size, node->cy + half_size, half_size);
         
-        // Distribute particles to children
+        // Distribute particles
         for (int pi : node->particles) {
             double px = x_data[pi];
             double py = y_data[pi];
@@ -136,7 +142,6 @@ private:
         double r2 = dx*dx + dy*dy + eps*eps;
         double r = std::sqrt(r2);
         
-        // Use monopole approximation if far enough or leaf
         if (node->is_leaf || (node->size / r) < theta) {
             if (r > 0.0) {
                 double inv_r3 = G / (r2 * r);
@@ -144,7 +149,6 @@ private:
                 ay += node->mass * dy * inv_r3;
             }
         } else {
-            // Recurse to children
             for (int i = 0; i < 4; ++i) {
                 if (node->children[i]) {
                     evaluate_force(node->children[i].get(), tx, ty, ax, ay);
@@ -159,7 +163,6 @@ public:
                        double epsilon, double gravity,
                        double* ax, double* ay) {
         
-        // Store parameters
         x_data = x;
         y_data = y;
         m_data = m;
@@ -170,7 +173,7 @@ public:
         eps = epsilon;
         G = gravity;
         
-        // Create root node and add all particles
+        // Create root node
         root = std::make_unique<FMMNode>(0.0, 0.0, domain_size);
         for (int i = 0; i < N; ++i) {
             root->particles.push_back(i);
@@ -178,12 +181,12 @@ public:
         
         // Build tree
         build_tree(root.get(), max_leaf);
-        
-        // Compute mass centers
         compute_mass_center(root.get());
         
-        // Compute forces for each particle
-        #pragma omp parallel for schedule(static)
+        // Compute forces with optimized parallelization
+        const int chunk_size = std::max(1, N / (omp_get_max_threads() * 4));
+        
+        #pragma omp parallel for schedule(dynamic, chunk_size)
         for (int i = 0; i < N; ++i) {
             ax[i] = 0.0;
             ay[i] = 0.0;
@@ -204,14 +207,12 @@ void fmm_force(const py::array_t<double>& x_arr,
                py::array_t<double>& ax_arr,
                py::array_t<double>& ay_arr)
 {
-    // Get array access
     auto x = x_arr.unchecked<1>();
     auto y = y_arr.unchecked<1>();
     auto m = m_arr.unchecked<1>();
     auto ax = ax_arr.mutable_unchecked<1>();
     auto ay = ay_arr.mutable_unchecked<1>();
     
-    // Validate input
     if (N != x.shape(0) || N != y.shape(0) || N != m.shape(0) || 
         N != ax.shape(0) || N != ay.shape(0)) {
         throw std::runtime_error("Array size mismatch in fmm_force");
@@ -222,17 +223,14 @@ void fmm_force(const py::array_t<double>& x_arr,
     }
     
     try {
-        // Create FMM solver
-        SimpleFMM fmm;
+        OptimizedFMM fmm;
         
-        // Get raw data pointers
         const double* x_ptr = x.data(0);
         const double* y_ptr = y.data(0);
         const double* m_ptr = m.data(0);
         double* ax_ptr = ax.mutable_data(0);
         double* ay_ptr = ay.mutable_data(0);
         
-        // Compute forces
         fmm.compute_forces(x_ptr, y_ptr, m_ptr, N,
                           domain_size, theta, maxLeaf,
                           eps, G, ax_ptr, ay_ptr);
@@ -243,7 +241,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "2D Fast Multipole Method (FMM) kernel (OpenMP, NumPy arrays)";
+    m.doc() = "2D Fast Multipole Method (FMM) kernel (Optimized OpenMP)";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),
