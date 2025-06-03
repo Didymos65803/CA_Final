@@ -1,23 +1,29 @@
 # comprehensive_test.py
-# ======================
-# 包含多种对比测试与基准测试函数，供 main_program_parallel_final.py 调用。
+# =====================
+# This file contains all of the test / benchmark / plotting routines for the
+# 2D N-body playground. It is called by main_program_parallel_final.py.
 #
-# 注意：在使用这些函数前，请确保已经完成以下模块编译：
-#   - fmm_kernel（来自 fmm_kernel_full.cpp）
-#   - force_kernel（如果有 direct_omp, bh_omp 实现的话）
-#
-# 如果缺少 force_kernel，你可以先只用 FMM 进行测试。
+# Fixes included:
+#   • test_scaling() now runs the Direct kernel 5× and averages to remove “first-call noise.”
+#   • thread_benchmark() now computes Speedup = time@1-thread / time@N-threads (instead of 1/time).
+#   • All output files go into an "output" folder (adjust OUTPUT_DIR to change or remove this behavior).
 
 import os
 import sys
 import time
 import math
 import random
+import csv
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-# 试着导入 C++ 接口模块
+# If you want to save everything under a subfolder called "output",
+# uncomment these lines and use OUTPUT_PATH everywhere:
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Try to import the C++ modules. If they are not compiled, HAS_FMM or HAS_DIRECT_BH will be False.
 try:
     import fmm_kernel
     HAS_FMM = True
@@ -34,26 +40,28 @@ except ImportError:
     direct_omp = None
     bh_omp = None
 
-# 全局参数 (与 main_program_parallel_final.py 保持一致)
+# Global physics constants and default parameters (used in both files):
 G = 1.0
-SOFT = 0.005
-DOMAIN = 100.0
-DT = 0.0005
-STAR_M = 100.0
+SOFT = 0.005               # softening length for near‐field
+DOMAIN = 100.0             # Domain size (half‐width 50)
+DT = 0.0005                # Time step (Leapfrog)
+STAR_M = 100.0             # Mass of central fixed star (if used)
 
+# Optimized Barnes-Hut / FMM parameters (used in accuracy & scaling tests)
 OPTIMIZED_PARAMS = {
-    'bh_theta': 0.3,
-    'fmm_theta': 0.2,
-    'bh_domain': DOMAIN,
-    'fmm_domain': DOMAIN,
-    'distribution_size': 50.0,
+    "bh_theta": 0.3,
+    "fmm_theta": 0.2,
+    "bh_domain": DOMAIN,
+    "fmm_domain": DOMAIN,
+    "distribution_size": 50.0,
 }
 
 
-def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_central=False):
+def generate_disk(n, radius=OPTIMIZED_PARAMS["distribution_size"], include_central=False):
     """
-    随机生成 n 颗粒子，分布在半径 radius 的圆盘内。如果 include_central=True，
-    第 0 号为质量 STAR_M 的固定恒星。返回 bodies: ndarray (N_total, 5) → [x,y,vx,vy,m]
+    Generate `n` particles uniformly in a disk of given `radius` in the XY-plane.
+    If include_central=True, the 0-th particle is a fixed star of mass STAR_M at the origin.
+    Returns a numpy array of shape (N_total, 5): columns = [x, y, vx, vy, m].
     """
     if include_central:
         N_total = n + 1
@@ -61,27 +69,27 @@ def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_centr
         N_total = n
 
     bodies = np.zeros((N_total, 5), dtype=np.float64)
-
     if include_central:
-        bodies[0] = [0.0, 0.0, 0.0, 0.0, STAR_M]
+        # Place a fixed star at index 0
+        bodies[0, :] = [0.0, 0.0, 0.0, 0.0, STAR_M]
 
     for i in range(1 if include_central else 0, N_total):
-        r = random.random()**0.5 * radius
+        r = math.sqrt(random.random()) * radius
         theta = random.random() * 2.0 * math.pi
         x = r * math.cos(theta)
         y = r * math.sin(theta)
         bodies[i, 0] = x
         bodies[i, 1] = y
-        bodies[i, 4] = 1.0
-        bodies[i, 2] = 0.0
-        bodies[i, 3] = 0.0
-
+        bodies[i, 2] = 0.0  # initial vx
+        bodies[i, 3] = 0.0  # initial vy
+        bodies[i, 4] = 1.0  # mass = 1
     return bodies
 
 
 def total_energy(bodies, include_central=False):
     """
-    计算系统的总能量 (动能 + 位能)。如果 include_central=True，第 0 号当作固定恒星。
+    Compute total energy (kinetic + potential) of the system.
+    If include_central=True, skip i=0 when summing KE and include i=0 in PE.
     """
     N = bodies.shape[0]
     KE = 0.0
@@ -94,93 +102,87 @@ def total_energy(bodies, include_central=False):
     for i in range(N):
         for j in range(i + 1, N):
             if include_central and (i == 0 or j == 0):
-                # 恒星与其他粒子
-                if i == 0:
-                    dx = bodies[j, 0] - bodies[i, 0]
-                    dy = bodies[j, 1] - bodies[i, 1]
-                    dist = math.hypot(dx, dy) + SOFT
-                    PE -= G * bodies[i, 4] * bodies[j, 4] / dist
-                else:
-                    dx = bodies[i, 0] - bodies[j, 0]
-                    dy = bodies[i, 1] - bodies[j, 1]
-                    dist = math.hypot(dx, dy) + SOFT
-                    PE -= G * bodies[i, 4] * bodies[j, 4] / dist
-                continue
-            dx = bodies[i, 0] - bodies[j, 0]
-            dy = bodies[i, 1] - bodies[j, 1]
-            dist = math.hypot(dx, dy) + SOFT
-            PE -= G * bodies[i, 4] * bodies[j, 4] / dist
-
+                # central star interactions
+                dx = bodies[i, 0] - bodies[j, 0]
+                dy = bodies[i, 1] - bodies[j, 1]
+                dist = math.hypot(dx, dy) + SOFT
+                PE -= G * bodies[i, 4] * bodies[j, 4] / dist
+            else:
+                dx = bodies[i, 0] - bodies[j, 0]
+                dy = bodies[i, 1] - bodies[j, 1]
+                dist = math.hypot(dx, dy) + SOFT
+                PE -= G * bodies[i, 4] * bodies[j, 4] / dist
     return KE + PE
 
 
 def test_accuracy():
     """
     Accuracy Comparison:
-    - 对 N = [50, 100, 200, 500] 做 Direct / BH / FMM 3 款算法的力计算，并比较相对误差。
-    - 结果绘制成 'accuracy_test_results_fixed.png'。
+    - For N in [50, 100, 200, 500], compute forces with Direct, BH, FMM.
+    - Compare the SUM of force magnitudes against Direct to find relative error.
+    - Plot performance (time) vs error in a 1×2 subplot, save as accuracy_test_results_fixed.png.
     """
     print("Testing accuracy with optimized parameters...\n")
 
     Ns = [50, 100, 200, 500]
-    bh_theta = OPTIMIZED_PARAMS['bh_theta']
-    fmm_theta = OPTIMIZED_PARAMS['fmm_theta']
-    distribution_size = OPTIMIZED_PARAMS['distribution_size']
+    bh_theta = OPTIMIZED_PARAMS["bh_theta"]
+    fmm_theta = OPTIMIZED_PARAMS["fmm_theta"]
+    distribution_size = OPTIMIZED_PARAMS["distribution_size"]
 
     results = []
     for N in Ns:
-        # 生成随机圆盘分布（无固定恒星）
         bodies = generate_disk(N, distribution_size, include_central=False)
         x = bodies[:, 0].tolist()
         y = bodies[:, 1].tolist()
         m = bodies[:, 4].tolist()
 
-        # --- Direct (基准) ---
+        # --- Direct (Baseline) ---
         if not HAS_DIRECT_BH:
-            print("Warning: Direct 模块未加载，将跳过 Accuracy 测试。")
+            print("Warning: force_kernel (Direct/BH) not available; skipping accuracy test.")
             return
         t0 = time.time()
         fx_direct, fy_direct = direct_omp(x, y, m, G=G, soft=SOFT)
         t_direct = time.time() - t0
-        Fd = np.sqrt(np.array(fx_direct)**2 + np.array(fy_direct)**2).sum()
+        Fd = np.linalg.norm(np.vstack((fx_direct, fy_direct)), axis=0).sum()
 
         # --- Barnes-Hut ---
         t0 = time.time()
         fx_bh, fy_bh = bh_omp(x, y, m, DOMAIN, bh_theta, G, SOFT)
         t_bh = time.time() - t0
-        Fb = np.sqrt(np.array(fx_bh)**2 + np.array(fy_bh)**2).sum()
+        Fb = np.linalg.norm(np.vstack((fx_bh, fy_bh)), axis=0).sum()
         err_bh = abs(Fb - Fd) / (Fd + 1e-16)
 
         # --- FMM ---
         if not HAS_FMM:
             err_fmm = np.nan
             t_fmm = np.nan
+            Ff = 0.0
         else:
             t0 = time.time()
             fx_fmm, fy_fmm = fmm_kernel.fmm_omp(x, y, m, DOMAIN, fmm_theta, G, SOFT)
             t_fmm = time.time() - t0
-            Ff = np.sqrt(np.array(fx_fmm)**2 + np.array(fy_fmm)**2).sum()
+            Ff = np.linalg.norm(np.vstack((fx_fmm, fy_fmm)), axis=0).sum()
             err_fmm = abs(Ff - Fd) / (Fd + 1e-16)
 
-        results.append((N, t_direct, t_bh, err_bh, t_fmm, err_fmm, Fd, Fb if HAS_DIRECT_BH else 0.0, Ff if HAS_FMM else 0.0))
+        results.append((N, t_direct, t_bh, err_bh, t_fmm, err_fmm, Fd, Fb, Ff))
 
         print(f"Testing N = {N}")
-        print(f"  Direct:     {t_direct:.4f} s")
-        print(f"  Barnes-Hut: {t_bh:.4f} s (error: {err_bh:.2e}) [θ={bh_theta}]")
+        print(f"  Direct:     {t_direct:.6f} s")
+        print(f"  Barnes-Hut: {t_bh:.6f} s (error = {err_bh:.2e}, θ={bh_theta})")
         if HAS_FMM:
-            print(f"  FMM:        {t_fmm:.4f} s (error: {err_fmm:.2e}) [θ={fmm_theta}]")
+            print(f"  FMM:        {t_fmm:.6f} s (error = {err_fmm:.2e}, θ={fmm_theta})")
         else:
-            print("  FMM:        Not Available")
-        print(f"  Force magnitudes - Direct: {Fd:.3e}, BH: {Fb:.3e}, FMM: {Ff:.3e}\n")
+            print("  FMM not available.")
+        print(f"  Force magnitudes → Direct: {Fd:.3e}, BH: {Fb:.3e}, FMM: {Ff:.3e}\n")
 
-    # 汇总输出
-    max_err_bh = max([r[3] for r in results])
-    max_err_fmm = max([r[5] for r in results if not math.isnan(r[5])])
+    # Summary
+    max_err_bh = max(r[3] for r in results)
+    max_err_fmm = max(r[5] for r in results if not math.isnan(r[5]))
     print("Overall Results:")
-    print(f"Max Barnes-Hut error: {max_err_bh:.2e}")
-    print(f"Max FMM error: {max_err_fmm:.2e}\n")
+    print(f"  Max Barnes-Hut relative error: {max_err_bh:.2e}")
+    print(f"  Max FMM relative error: {max_err_fmm:.2e}\n")
 
-    # 绘图
+    # Prepare plot
     Ns_plot = [r[0] for r in results]
     times_direct = [r[1] for r in results]
     times_bh = [r[2] for r in results]
@@ -191,7 +193,7 @@ def test_accuracy():
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # 性能对比 (左)
+    # Left: Performance (time)
     ax1.plot(Ns_plot, times_direct, 'o-', color='red', label='Direct (O(N²))')
     ax1.plot(Ns_plot, times_bh, 's-', color='blue', label='Barnes-Hut (O(N log N))')
     if HAS_FMM:
@@ -204,7 +206,7 @@ def test_accuracy():
     ax1.grid(True, which='both', ls='--', alpha=0.4)
     ax1.legend()
 
-    # 精度对比 (右)
+    # Right: Accuracy (relative error)
     ax2.plot(Ns_plot, errs_bh, 's-', color='blue', label='Barnes-Hut Error')
     if HAS_FMM:
         ax2.plot(Ns_plot, errs_fmm, '^-', color='green', label='FMM Error')
@@ -219,23 +221,25 @@ def test_accuracy():
     ax2.legend()
 
     plt.tight_layout()
-    plt.savefig('accuracy_test_results_fixed.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'accuracy_test_results_fixed.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved accuracy_test_results_fixed.png\n")
+    print(f"✓ Saved accuracy plot to {outpath}\n")
 
 
 def test_scaling():
     """
-    Quick benchmark scaling:
-    - 先在小 N (50,100,200,500,1000) 下测试 Direct/BH/FMM 的时间，绘图。
-    - 存储结果到 'performance_comparison.png' 和 'scaling_smallN.csv'。
+    Quick benchmark scaling (small N):
+    - Test for N = [50, 100, 200, 500, 1000, 2000].
+    - Measure Direct (averaged over 5 runs), BH (1 run), FMM (1 run).
+    - Output CSV = scaling_smallN.csv and plot performance_comparison.png.
     """
-    print("Testing scaling behavior...\n")
+    print("Testing small-N scaling behavior...\n")
 
     smallNs = [50, 100, 200, 500, 1000, 2000]
-    bh_theta = OPTIMIZED_PARAMS['bh_theta']
-    fmm_theta = OPTIMIZED_PARAMS['fmm_theta']
-    distribution_size = OPTIMIZED_PARAMS['distribution_size']
+    bh_theta = OPTIMIZED_PARAMS["bh_theta"]
+    fmm_theta = OPTIMIZED_PARAMS["fmm_theta"]
+    distribution_size = OPTIMIZED_PARAMS["distribution_size"]
 
     results = []
     for N in smallNs:
@@ -244,15 +248,18 @@ def test_scaling():
         y = bodies[:, 1].tolist()
         m = bodies[:, 4].tolist()
 
-        # Direct
+        # --- Direct (averaged over 5 runs) ---
         if not HAS_DIRECT_BH:
             t_direct = np.nan
         else:
-            t0 = time.time()
-            direct_omp(x, y, m, G=G, soft=SOFT)
-            t_direct = time.time() - t0
+            direct_times = []
+            for _ in range(5):
+                t0 = time.time()
+                direct_omp(x, y, m, G=G, soft=SOFT)
+                direct_times.append(time.time() - t0)
+            t_direct = sum(direct_times) / len(direct_times)
 
-        # Barnes-Hut
+        # --- Barnes-Hut (1 run) ---
         if not HAS_DIRECT_BH:
             t_bh = np.nan
         else:
@@ -260,7 +267,7 @@ def test_scaling():
             bh_omp(x, y, m, DOMAIN, bh_theta, G, SOFT)
             t_bh = time.time() - t0
 
-        # FMM
+        # --- FMM (1 run) ---
         if not HAS_FMM:
             t_fmm = np.nan
         else:
@@ -269,24 +276,18 @@ def test_scaling():
             t_fmm = time.time() - t0
 
         results.append((N, t_direct, t_bh, t_fmm))
-        print(f"Testing N = {N}")
-        print(f"  Direct:  {t_direct:.4f} s")
-        print(f"  Barnes-Hut: {t_bh:.4f} s (θ={bh_theta})")
-        if HAS_FMM:
-            print(f"  FMM:     {t_fmm:.4f} s (θ={fmm_theta})")
-        else:
-            print("  FMM:     Not Available")
-        print("")
+        print(f"N={N:<5}  Direct={t_direct:.6f}s  BH={t_bh:.6f}s  FMM={t_fmm:.6f}s")
 
-    # 输出 CSV
-    import csv
-    with open('scaling_smallN.csv', 'w', newline='') as csvfile:
+    # Save CSV
+    csv_path = os.path.join(OUTPUT_DIR, 'scaling_smallN.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['N', 'Direct', 'Barnes-Hut', 'FMM'])
         for row in results:
             writer.writerow(row)
+    print(f"✓ Saved CSV to {csv_path}")
 
-    # 绘图
+    # Plot
     Ns_plot = [r[0] for r in results]
     times_direct = [r[1] for r in results]
     times_bh = [r[2] for r in results]
@@ -301,29 +302,29 @@ def test_scaling():
     ax.set_yscale('log')
     ax.set_xlabel('Number of Particles')
     ax.set_ylabel('Computation Time (s)')
-    ax.set_title('Scaling Comparison (small N)')
+    ax.set_title('Scaling Comparison (Small N)')
     ax.grid(True, which='both', ls='--', alpha=0.4)
     ax.legend()
-
     plt.tight_layout()
-    plt.savefig('performance_comparison.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'performance_comparison.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved performance_comparison.png")
-    print("✓ Saved scaling_smallN.csv\n")
+    print(f"✓ Saved performance plot to {outpath}\n")
 
 
 def test_largeN_scaling():
     """
     Large-N Scaling Test:
-    - 对 N = [500, 1000, 2000, 4000] 做 Direct/BH/FMM benchmarking（也可只做 BH 和 FMM），
-      输出到 'scaling_largeN.png' + 'scaling_largeN.csv'。
+    - Test for N = [500, 1000, 2000, 4000].
+    - Direct is skipped for N > 2000 (NaN).
+    - Output CSV = scaling_largeN.csv and plot scaling_largeN.png.
     """
     print("Testing large-N scaling behavior...\n")
 
     largeNs = [500, 1000, 2000, 4000]
-    bh_theta = OPTIMIZED_PARAMS['bh_theta']
-    fmm_theta = OPTIMIZED_PARAMS['fmm_theta']
-    distribution_size = OPTIMIZED_PARAMS['distribution_size']
+    bh_theta = OPTIMIZED_PARAMS["bh_theta"]
+    fmm_theta = OPTIMIZED_PARAMS["fmm_theta"]
+    distribution_size = OPTIMIZED_PARAMS["distribution_size"]
 
     results = []
     for N in largeNs:
@@ -332,7 +333,7 @@ def test_largeN_scaling():
         y = bodies[:, 1].tolist()
         m = bodies[:, 4].tolist()
 
-        # Direct (如果 N 太大可能耗时很久，可以选择 skip)
+        # --- Direct (skip if N > 2000) ---
         if not HAS_DIRECT_BH or N > 2000:
             t_direct = np.nan
         else:
@@ -340,7 +341,7 @@ def test_largeN_scaling():
             direct_omp(x, y, m, G=G, soft=SOFT)
             t_direct = time.time() - t0
 
-        # Barnes-Hut
+        # --- Barnes-Hut ---
         if not HAS_DIRECT_BH:
             t_bh = np.nan
         else:
@@ -348,7 +349,7 @@ def test_largeN_scaling():
             bh_omp(x, y, m, DOMAIN, bh_theta, G, SOFT)
             t_bh = time.time() - t0
 
-        # FMM
+        # --- FMM ---
         if not HAS_FMM:
             t_fmm = np.nan
         else:
@@ -357,33 +358,25 @@ def test_largeN_scaling():
             t_fmm = time.time() - t0
 
         results.append((N, t_direct, t_bh, t_fmm))
-        print(f"Testing N = {N}")
-        if not math.isnan(t_direct):
-            print(f"  Direct:  {t_direct:.4f} s")
-        else:
-            print("  Direct:  skip (N too large)")
-        print(f"  Barnes-Hut: {t_bh:.4f} s (θ={bh_theta})")
-        if HAS_FMM:
-            print(f"  FMM:     {t_fmm:.4f} s (θ={fmm_theta})")
-        else:
-            print("  FMM:     Not Available")
-        print("")
+        print(f"N={N:<5}  Direct={t_direct}  BH={t_bh:.6f}s  FMM={t_fmm:.6f}s")
 
-    # 输出 CSV
-    import csv
-    with open('scaling_largeN.csv', 'w', newline='') as csvfile:
+    # Save CSV
+    csv_path = os.path.join(OUTPUT_DIR, 'scaling_largeN.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['N', 'Direct', 'Barnes-Hut', 'FMM'])
         for row in results:
             writer.writerow(row)
+    print(f"✓ Saved CSV to {csv_path}")
 
-    # 绘图
+    # Plot
     Ns_plot = [r[0] for r in results]
     times_direct = [r[1] for r in results]
     times_bh = [r[2] for r in results]
     times_fmm = [r[3] for r in results]
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    # Only plot Direct if it is not all NaN
     if not all(math.isnan(t) for t in times_direct):
         ax.plot(Ns_plot, times_direct, 'o-', color='red', label='Direct O(N²)')
     ax.plot(Ns_plot, times_bh, 's-', color='blue', label='Barnes-Hut O(N log N)')
@@ -396,19 +389,18 @@ def test_largeN_scaling():
     ax.set_title('Large-N Scaling Comparison')
     ax.grid(True, which='both', ls='--', alpha=0.4)
     ax.legend()
-
     plt.tight_layout()
-    plt.savefig('scaling_largeN.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'scaling_largeN.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved scaling_largeN.png")
-    print("✓ Saved scaling_largeN.csv\n")
+    print(f"✓ Saved plot to {outpath}\n")
 
 
 def test_energy_conservation():
     """
     Energy Conservation Test:
-    - 生成一批随机粒子（N=200）、使用 Direct/BH/FMM 分别演化一段时间，
-      记录并绘制能量随时间的相对误差，保存为 'energy_conservation.png'。
+    - For N=200, run Direct/BH/FMM for STEPS=500, record relative energy error every 5 steps.
+    - Plot relative energy error (log‐scale) vs time, save as energy_conservation.png.
     """
     print("Testing energy conservation for Direct/BH/FMM...\n")
 
@@ -416,91 +408,84 @@ def test_energy_conservation():
     STEPS = 500
     RECORD_EVERY = 5
     THREADS = 4
-    fixed_star = False
+    include_central = False
 
-    # 设置线程数
+    # Set OpenMP threads
     os.environ["OMP_NUM_THREADS"] = str(THREADS)
 
-    # 生成初始状态
-    bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
+    # Generate initial state
+    bodies = generate_disk(N, OPTIMIZED_PARAMS["distribution_size"], include_central=include_central)
     total_N = bodies.shape[0]
-    E0 = total_energy(bodies, include_central=fixed_star)
+    E0 = total_energy(bodies, include_central=include_central)
 
-    # 初始加速度
-    x0 = bodies[:, 0].tolist()
-    y0 = bodies[:, 1].tolist()
-    m0 = bodies[:, 4].tolist()
-
-    # 分别对 Direct/BH/FMM 做能量守恒测试
+    # Prepare solver list
     solvers = []
-    labels = []
-
     if HAS_DIRECT_BH:
-        solvers.append(('Direct', direct_omp, None))
-        labels.append('Direct')
-    if HAS_DIRECT_BH:
-        solvers.append(('BH', bh_omp, OPTIMIZED_PARAMS['bh_theta']))
-        labels.append('Barnes-Hut')
+        solvers.append(("Direct", direct_omp, None))
+        solvers.append(("Barnes-Hut", bh_omp, OPTIMIZED_PARAMS["bh_theta"]))
     if HAS_FMM:
-        solvers.append(('FMM', fmm_kernel.fmm_omp, OPTIMIZED_PARAMS['fmm_theta']))
-        labels.append('FMM')
+        solvers.append(("FMM", fmm_kernel.fmm_omp, OPTIMIZED_PARAMS["fmm_theta"]))
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for (name, solver_fn, theta) in solvers:
-        # 重新生成起始点，以保证三者用同一初始分布
-        bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
-        E0_local = total_energy(bodies, include_central=fixed_star)
-        x_list = bodies[:, 0].tolist()
-        y_list = bodies[:, 1].tolist()
-        m_list = bodies[:, 4].tolist()
+    for (label, solver_fn, theta) in solvers:
+        bodies_copy = generate_disk(N, OPTIMIZED_PARAMS["distribution_size"], include_central=include_central)
+        E0_local = total_energy(bodies_copy, include_central=include_central)
+        x = bodies_copy[:, 0].tolist()
+        y = bodies_copy[:, 1].tolist()
+        m = bodies_copy[:, 4].tolist()
 
-        if name == 'Direct':
-            ax_old, ay_old = solver_fn(x_list, y_list, m_list, G=G, soft=SOFT)
-        elif name == 'BH':
-            ax_old, ay_old = solver_fn(x_list, y_list, m_list, DOMAIN, theta, G, SOFT)
+        # Initial acceleration
+        if label == "Direct":
+            ax_old, ay_old = solver_fn(x, y, m, G=G, soft=SOFT)
+        elif label == "Barnes-Hut":
+            ax_old, ay_old = solver_fn(x, y, m, DOMAIN, theta, G, SOFT)
         else:  # FMM
-            ax_old, ay_old = solver_fn(x_list, y_list, m_list, DOMAIN, theta, G, SOFT)
+            ax_old, ay_old = solver_fn(x, y, m, DOMAIN, theta, G, SOFT)
 
         times = []
         rel_errors = []
 
         for step in range(STEPS):
-            # Leapfrog half-kick/drift/half-kick
-            # （复用前面 main 程序的 leapfrog_step 实现即可，
-            #  但为了简洁，这里在测试函数里再写一次）
+            # Leapfrog half‐kick, drift, compute new accel, half‐kick
             # 1) half-kick
             for i in range(total_N):
-                bodies[i, 2] += 0.5 * DT * ax_old[i]
-                bodies[i, 3] += 0.5 * DT * ay_old[i]
+                if include_central and i == 0:
+                    continue
+                bodies_copy[i, 2] += 0.5 * DT * ax_old[i]
+                bodies_copy[i, 3] += 0.5 * DT * ay_old[i]
             # 2) drift
             for i in range(total_N):
-                bodies[i, 0] += DT * bodies[i, 2]
-                bodies[i, 1] += DT * bodies[i, 3]
-            # 3) compute new accel
-            x_list = bodies[:, 0].tolist()
-            y_list = bodies[:, 1].tolist()
-            m_list = bodies[:, 4].tolist()
-            if name == 'Direct':
-                ax_new, ay_new = solver_fn(x_list, y_list, m_list, G=G, soft=SOFT)
-            elif name == 'BH':
-                ax_new, ay_new = solver_fn(x_list, y_list, m_list, DOMAIN, theta, G, SOFT)
-            else:
-                ax_new, ay_new = solver_fn(x_list, y_list, m_list, DOMAIN, theta, G, SOFT)
+                if include_central and i == 0:
+                    continue
+                bodies_copy[i, 0] += DT * bodies_copy[i, 2]
+                bodies_copy[i, 1] += DT * bodies_copy[i, 3]
+            # 3) new accel
+            x = bodies_copy[:, 0].tolist()
+            y = bodies_copy[:, 1].tolist()
+            m = bodies_copy[:, 4].tolist()
+            if label == "Direct":
+                ax_new, ay_new = solver_fn(x, y, m, G=G, soft=SOFT)
+            elif label == "Barnes-Hut":
+                ax_new, ay_new = solver_fn(x, y, m, DOMAIN, theta, G, SOFT)
+            else:  # FMM
+                ax_new, ay_new = solver_fn(x, y, m, DOMAIN, theta, G, SOFT)
             # 4) half-kick
             for i in range(total_N):
-                bodies[i, 2] += 0.5 * DT * ax_new[i]
-                bodies[i, 3] += 0.5 * DT * ay_new[i]
+                if include_central and i == 0:
+                    continue
+                bodies_copy[i, 2] += 0.5 * DT * ax_new[i]
+                bodies_copy[i, 3] += 0.5 * DT * ay_new[i]
 
             ax_old, ay_old = ax_new, ay_new
 
             if step % RECORD_EVERY == 0:
-                E = total_energy(bodies, include_central=fixed_star)
-                rel_err = abs(E - E0_local) / abs(E0_local + 1e-16)
+                E = total_energy(bodies_copy, include_central=include_central)
+                rel_err = abs(E - E0_local) / (abs(E0_local) + 1e-16)
                 times.append(step * DT)
                 rel_errors.append(rel_err)
 
-        ax.plot(times, rel_errors, label=name)
+        ax.plot(times, rel_errors, label=label)
 
     ax.set_yscale('log')
     ax.set_xlabel('Time')
@@ -508,95 +493,99 @@ def test_energy_conservation():
     ax.set_title(f'Energy Conservation Test (N={N}, threads={THREADS})')
     ax.grid(True, which='both', ls='--', alpha=0.4)
     ax.legend()
+
     plt.tight_layout()
-    plt.savefig('energy_conservation.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'energy_conservation.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved energy_conservation.png\n")
+    print(f"✓ Saved energy conservation plot to {outpath}\n")
 
 
 def optimize_parameters():
     """
     Parameter Optimization:
-    - 对 BH 的 θ ∈ [0.1,0.3,0.5,0.7,1.0]，domain ∈ [50,100,200] 做网格搜索，找出最优组合：
-      误差 < 10% 且 时间最小。
-    - 输出到 'parameter_optimization.png' 并打印最佳 θ, domain。
+    - For N=100, test BH with theta ∈ [0.1, 0.3, 0.5, 0.7, 1.0] and domain ∈ [50, 100, 200].
+    - Find the combination that yields relative error < 10% with minimal time.
+    - Plot relative error vs theta (for each domain) and save as parameter_optimization.png.
     """
-    print("Optimizing Barnes-Hut parameters...\n")
+    print("Optimizing Barnes-Hut parameters (N=100)...\n")
 
-    # 固定 N=100 用来测试误差与时间
     N = 100
-    distribution_size = OPTIMIZED_PARAMS['distribution_size']
+    distribution_size = OPTIMIZED_PARAMS["distribution_size"]
     bodies = generate_disk(N, distribution_size, include_central=False)
     x = bodies[:, 0].tolist()
     y = bodies[:, 1].tolist()
     m = bodies[:, 4].tolist()
 
-    # 直接当作基准
     if not HAS_DIRECT_BH:
-        print("Error: Direct/BH 模块未加载，Parameter Optimization 无法进行。")
+        print("Error: Direct/BH module not available. Cannot optimize parameters.\n")
         return
+
+    # Baseline direct force
     fx_direct, fy_direct = direct_omp(x, y, m, G=G, soft=SOFT)
-    Fd = np.sqrt(np.array(fx_direct)**2 + np.array(fy_direct)**2).sum()
+    Fd = np.linalg.norm(np.vstack((fx_direct, fy_direct)), axis=0).sum()
 
     thetas = [0.1, 0.3, 0.5, 0.7, 1.0]
     domains = [50.0, 100.0, 200.0]
 
     records = []
-    best = (None, None, float('inf'), float('inf'))  # (θ, domain, error, time)
+    best_combo = (None, None, float('inf'), float('inf'))  # (theta, domain, error, time)
 
-    print("Testing parameter combinations:")
-    print("Theta  Domain  Error      Time")
-    print("-----------------------------------")
+    print(" Theta  Domain    Error    Time(s)")
+    print("------------------------------------")
     for theta in thetas:
         for domain in domains:
             t0 = time.time()
             fx_bh, fy_bh = bh_omp(x, y, m, domain, theta, G, SOFT)
             t_bh = time.time() - t0
-            Fb = np.sqrt(np.array(fx_bh)**2 + np.array(fy_bh)**2).sum()
+            Fb = np.linalg.norm(np.vstack((fx_bh, fy_bh)), axis=0).sum()
             err = abs(Fb - Fd) / (Fd + 1e-16)
             records.append((theta, domain, err, t_bh))
-            print(f"  {theta:<5} {domain:<6} {err:.2e}  {t_bh:.4f}s")
-            # 以 error < 0.1 (10%) 且 时间最小 为准
-            if err < 0.1 and t_bh < best[3]:
-                best = (theta, domain, err, t_bh)
+            print(f" {theta:<5}  {domain:<6}  {err:.2e}  {t_bh:.4f}")
+            # Choose best: error < 0.1 and minimal time
+            if err < 0.1 and t_bh < best_combo[3]:
+                best_combo = (theta, domain, err, t_bh)
     print("")
-    if best[0] is not None:
-        print(f"Best parameters: θ={best[0]}, domain={best[1]}")
-        print(f"Best error: {best[2]:.2e}, Best time: {best[3]:.4f}s\n")
-    else:
-        print("没有找到在误差 < 10% 的组合，请考虑降低误差阈值或扩大搜索范围。\n")
 
-    # 绘图：误差 vs θ (color 为 domain)
+    if best_combo[0] is not None:
+        print(f"Best combination → θ={best_combo[0]}, domain={best_combo[1]} (err={best_combo[2]:.2e}, time={best_combo[3]:.4f}s)\n")
+    else:
+        print("No combination found with error < 10%. Consider expanding search.\n")
+
+    # Plot: error vs theta (one curve per domain)
     fig, ax = plt.subplots(figsize=(6, 5))
     for domain in domains:
-        errs = [r[2] for r in records if r[1] == domain]
-        times = [r[3] for r in records if r[1] == domain]
-        ax.semilogy(thetas, errs, 'o-', label=f'domain={domain}')
+        errs_for_domain = [r[2] for r in records if r[1] == domain]
+        ax.plot(thetas, errs_for_domain, 'o-', label=f"domain={domain}")
+    ax.set_xscale('linear')
+    ax.set_yscale('log')
     ax.set_xlabel('Theta')
     ax.set_ylabel('Relative Error')
     ax.set_title('Parameter Optimization (N=100)')
     ax.grid(True, which='both', ls='--', alpha=0.4)
     ax.legend()
+
     plt.tight_layout()
-    plt.savefig('parameter_optimization.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'parameter_optimization.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved parameter_optimization.png\n")
+    print(f"✓ Saved parameter optimization plot to {outpath}\n")
 
 
 def thread_benchmark():
     """
     OpenMP Thread Benchmark:
-    - 对 FMM （N=500 固定）在线程数 [1,2,4,8] 下做时间对比。
-    - 绘制成 'openmp_thread_benchmark.png'，CSV 存到 'openmp_thread_benchmark.csv'。
+    - For FMM (N=500), measure time under threads = [1, 2, 4, 8].
+    - Compute Speedup = t(1-thread) / t(N-threads). Plot and save as openmp_thread_benchmark.png.
     """
     print("Running OpenMP thread benchmark for FMM (N=500)...\n")
 
     if not HAS_FMM:
-        print("Error: FMM 模块未加载，无法进行线程基准测试。")
+        print("Error: FMM module not available. Cannot run thread benchmark.\n")
         return
 
     N = 500
-    distribution_size = OPTIMIZED_PARAMS['distribution_size']
+    distribution_size = OPTIMIZED_PARAMS["distribution_size"]
     bodies = generate_disk(N, distribution_size, include_central=False)
     x = bodies[:, 0].tolist()
     y = bodies[:, 1].tolist()
@@ -608,89 +597,86 @@ def thread_benchmark():
     for tcount in thread_counts:
         os.environ["OMP_NUM_THREADS"] = str(tcount)
         t0 = time.time()
-        fmm_kernel.fmm_omp(x, y, m, DOMAIN, OPTIMIZED_PARAMS['fmm_theta'], G, SOFT)
-        t_fmm = time.time() - t0
-        results.append((tcount, t_fmm))
-        print(f"Threads = {tcount}, Time = {t_fmm:.5f} s")
+        fmm_kernel.fmm_omp(x, y, m, DOMAIN, OPTIMIZED_PARAMS["fmm_theta"], G, SOFT)
+        t_run = time.time() - t0
+        results.append((tcount, t_run))
+        print(f"Threads={tcount:<2}  Time={t_run:.6f}s")
 
-    # 保存 CSV
-    import csv
-    with open('openmp_thread_benchmark.csv', 'w', newline='') as csvfile:
+    # Save CSV
+    csv_path = os.path.join(OUTPUT_DIR, 'openmp_thread_benchmark.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Threads', 'Time'])
         for row in results:
             writer.writerow(row)
+    print(f"✓ Saved CSV to {csv_path}")
 
-    # 绘图
+    # Plot Speedup
     threads_plot = [r[0] for r in results]
     times_plot = [r[1] for r in results]
+    baseline_time = times_plot[0]
+    speedups = baseline_time / np.array(times_plot)
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(threads_plot, threads_plot[0]/np.array(times_plot), 'o-', color='red', label='Speedup')
+    ax.plot(threads_plot, speedups, 'o-', color='red', label='Speedup')
     ax.plot(threads_plot, threads_plot, '--', color='gray', label='Ideal Speedup')
     ax.set_xlabel('Number of Threads')
     ax.set_ylabel('Speedup')
     ax.set_title('OpenMP Thread Benchmark (FMM, N=500)')
     ax.set_xticks(thread_counts)
-    ax.grid(True, ls='--', alpha=0.4)
+    ax.grid(True, which='both', ls='--', alpha=0.4)
     ax.legend()
+
     plt.tight_layout()
-    plt.savefig('openmp_thread_benchmark.png', dpi=150)
+    outpath = os.path.join(OUTPUT_DIR, 'openmp_thread_benchmark.png')
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
-    print("✓ Saved openmp_thread_benchmark.png")
-    print("✓ Saved openmp_thread_benchmark.csv\n")
+    print(f"✓ Saved thread benchmark plot to {outpath}\n")
 
 
 def show_system_info():
     """
     System Information:
-    - 输出当前环境下的 CPU 核心数、OpenMP 线程信息、操作系统等。
+    - Print OS, CPU cores, OMP_NUM_THREADS, whether FMM has OpenMP, and Python version.
     """
     print("Gathering system information...\n")
     try:
         import platform
         info = platform.uname()
         print(f"System: {info.system} {info.release} ({info.machine})")
-    except ImportError:
+    except:
         pass
 
-    # CPU count
     try:
         cpu_count = os.cpu_count()
         print(f"CPU cores (os.cpu_count): {cpu_count}")
     except:
         pass
 
-    # OpenMP 线程
-    try:
-        # 通过环境变量或 omp_get_max_threads
-        env_t = os.environ.get("OMP_NUM_THREADS", "Not set")
-        print(f"OMP_NUM_THREADS (env): {env_t}")
-        if HAS_FMM:
-            # 如果编译时包含 OpenMP，那么 m.attr("has_openmp") 在 Python 端为 True
-            has_omp = fmm_kernel.has_openmp
-        else:
-            has_omp = False
-        print(f"FMM has OpenMP support: {has_omp}")
-        if has_omp:
-            from ctypes import cdll, c_int
-            # 尝试加载 libgomp 获取 omp_get_max_threads
-            try:
-                libg = cdll.LoadLibrary("libgomp.so")
-                libg.omp_get_max_threads.restype = c_int
-                max_th = libg.omp_get_max_threads()
-                print(f"omp_get_max_threads(): {max_th}")
-            except:
-                pass
-    except:
-        pass
+    env_t = os.environ.get("OMP_NUM_THREADS", "Not set")
+    print(f"OMP_NUM_THREADS (env): {env_t}")
 
-    # Python 版本
+    if HAS_FMM:
+        has_omp = getattr(fmm_kernel, "has_openmp", False)
+    else:
+        has_omp = False
+    print(f"FMM has OpenMP support: {has_omp}")
+
+    if has_omp:
+        try:
+            from ctypes import cdll, c_int
+            libg = cdll.LoadLibrary("libgomp.so")
+            libg.omp_get_max_threads.restype = c_int
+            max_th = libg.omp_get_max_threads()
+            print(f"omp_get_max_threads(): {max_th}")
+        except:
+            pass
+
     print(f"Python version: {sys.version.split()[0]}")
     print("Done.\n")
 
 
 if __name__ == "__main__":
-    # stand-alone 测试时可启用
-    print("Run `python main_program_parallel_final.py` using interactive menu\n")
+    # If you run this file standalone, nothing special happens.
+    print("This file provides testing functions. Run \"python main_program_parallel_final.py\" to use the menu.\n")
 
