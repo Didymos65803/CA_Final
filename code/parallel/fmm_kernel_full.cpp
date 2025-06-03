@@ -1,5 +1,5 @@
 // fmm_kernel_full.cpp
-// Fixed version without unused variables
+// Redesigned with spatial decomposition approach
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -15,167 +15,118 @@
 
 namespace py = pybind11;
 
-// Proper alignment to avoid false sharing
-struct alignas(128) ThreadLocalAccumulator {
-    double ax;
-    double ay;
-    char padding[128 - 2*sizeof(double)];
-    
-    ThreadLocalAccumulator() : ax(0.0), ay(0.0) {}
-};
-
-struct FMMNode {
-    double cx, cy, size;
-    std::vector<int> particles;
-    double mass, mx, my;
-    bool is_leaf;
-    std::unique_ptr<FMMNode> children[4];
-    
-    FMMNode(double _cx, double _cy, double _size) 
-        : cx(_cx), cy(_cy), size(_size), mass(0.0), mx(0.0), my(0.0), is_leaf(true) {
-        for (int i = 0; i < 4; ++i) {
-            children[i] = nullptr;
-        }
-    }
-};
-
-class OptimizedFMM {
+// Simple spatial decomposition FMM
+class SpatialFMM {
 private:
-    std::unique_ptr<FMMNode> root;
     const double* x_data;
     const double* y_data;
     const double* m_data;
     int N;
     double domain_size;
     double theta;
-    int max_leaf;
     double eps;
     double G;
     
-    void build_tree(FMMNode* node, int max_particles) {
-        if (node->particles.size() <= static_cast<size_t>(max_particles)) {
-            return;
+    // Use spatial decomposition instead of tree traversal
+    void compute_forces_spatial(double* ax, double* ay) {
+        const int grid_size = 8; // 8x8 spatial grid
+        const double cell_size = domain_size * 2.0 / grid_size;
+        
+        // Create spatial grid
+        std::vector<std::vector<int>> grid(grid_size * grid_size);
+        
+        // Assign particles to grid cells
+        for (int i = 0; i < N; ++i) {
+            int grid_x = std::max(0, std::min(grid_size - 1, 
+                         static_cast<int>((x_data[i] + domain_size) / cell_size)));
+            int grid_y = std::max(0, std::min(grid_size - 1, 
+                         static_cast<int>((y_data[i] + domain_size) / cell_size)));
+            grid[grid_y * grid_size + grid_x].push_back(i);
         }
         
-        node->is_leaf = false;
-        double half_size = node->size * 0.5;
-        
-        // Create children
-        node->children[0] = std::make_unique<FMMNode>(node->cx - half_size, node->cy - half_size, half_size);
-        node->children[1] = std::make_unique<FMMNode>(node->cx + half_size, node->cy - half_size, half_size);
-        node->children[2] = std::make_unique<FMMNode>(node->cx - half_size, node->cy + half_size, half_size);
-        node->children[3] = std::make_unique<FMMNode>(node->cx + half_size, node->cy + half_size, half_size);
-        
-        // Distribute particles
-        for (int pi : node->particles) {
-            double px = x_data[pi];
-            double py = y_data[pi];
+        // Compute forces using spatial decomposition
+        #pragma omp parallel for schedule(dynamic, 1) if(N > 500)
+        for (int i = 0; i < N; ++i) {
+            ax[i] = 0.0;
+            ay[i] = 0.0;
             
-            int quadrant = 0;
-            if (px > node->cx) quadrant += 1;
-            if (py > node->cy) quadrant += 2;
+            const double xi = x_data[i];
+            const double yi = y_data[i];
             
-            node->children[quadrant]->particles.push_back(pi);
-        }
-        
-        node->particles.clear();
-        
-        // Recursively build children
-        for (int i = 0; i < 4; ++i) {
-            if (node->children[i] && !node->children[i]->particles.empty()) {
-                build_tree(node->children[i].get(), max_particles);
-            }
-        }
-    }
-    
-    void compute_mass_center(FMMNode* node) {
-        if (node->is_leaf) {
-            double total_mass = 0.0;
-            double mx_sum = 0.0;
-            double my_sum = 0.0;
+            // Determine which grid cell this particle is in
+            int grid_x = std::max(0, std::min(grid_size - 1, 
+                         static_cast<int>((xi + domain_size) / cell_size)));
+            int grid_y = std::max(0, std::min(grid_size - 1, 
+                         static_cast<int>((yi + domain_size) / cell_size)));
             
-            for (int pi : node->particles) {
-                double mi = m_data[pi];
-                total_mass += mi;
-                mx_sum += mi * x_data[pi];
-                my_sum += mi * y_data[pi];
-            }
-            
-            node->mass = total_mass;
-            if (total_mass > 0.0) {
-                node->mx = mx_sum / total_mass;
-                node->my = my_sum / total_mass;
-            } else {
-                node->mx = node->cx;
-                node->my = node->cy;
-            }
-        } else {
-            double total_mass = 0.0;
-            double mx_sum = 0.0;
-            double my_sum = 0.0;
-            
-            for (int i = 0; i < 4; ++i) {
-                if (node->children[i] && !node->children[i]->particles.empty()) {
-                    compute_mass_center(node->children[i].get());
+            // Interact with nearby cells (3x3 neighborhood)
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = grid_x + dx;
+                    int ny = grid_y + dy;
                     
-                    double child_mass = node->children[i]->mass;
-                    total_mass += child_mass;
-                    mx_sum += child_mass * node->children[i]->mx;
-                    my_sum += child_mass * node->children[i]->my;
+                    if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size) {
+                        const auto& cell = grid[ny * grid_size + nx];
+                        
+                        // Direct interaction with particles in this cell
+                        for (int j : cell) {
+                            if (i == j) continue;
+                            
+                            const double dx_val = xi - x_data[j];
+                            const double dy_val = yi - y_data[j];
+                            const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
+                            
+                            if (r2 > eps*eps) {
+                                const double inv_r3 = G / (r2 * std::sqrt(r2));
+                                const double mj = m_data[j];
+                                ax[i] += mj * dx_val * inv_r3;
+                                ay[i] += mj * dy_val * inv_r3;
+                            }
+                        }
+                    }
                 }
             }
             
-            node->mass = total_mass;
-            if (total_mass > 0.0) {
-                node->mx = mx_sum / total_mass;
-                node->my = my_sum / total_mass;
-            } else {
-                node->mx = node->cx;
-                node->my = node->cy;
-            }
-        }
-    }
-    
-    void evaluate_force_direct(const std::vector<int>& particles, 
-                              double tx, double ty, double& ax, double& ay) {
-        // Direct calculation for leaf nodes
-        for (int pi : particles) {
-            double dx = x_data[pi] - tx;
-            double dy = y_data[pi] - ty;
-            double r2 = dx*dx + dy*dy + eps*eps;
-            
-            if (r2 > eps*eps) {
-                double inv_r3 = G / (r2 * std::sqrt(r2));
-                double mi = m_data[pi];
-                ax += mi * dx * inv_r3;
-                ay += mi * dy * inv_r3;
-            }
-        }
-    }
-    
-    void evaluate_force(FMMNode* node, double tx, double ty, double& ax, double& ay) {
-        if (!node || node->mass == 0.0) return;
-        
-        double dx = node->mx - tx;
-        double dy = node->my - ty;
-        double r2 = dx*dx + dy*dy + eps*eps;
-        double r = std::sqrt(r2);
-        
-        if (node->is_leaf) {
-            // For leaf nodes, always use direct calculation
-            evaluate_force_direct(node->particles, tx, ty, ax, ay);
-        } else if ((node->size / r) < theta) {
-            // Use monopole approximation
-            if (r > eps) {
-                double inv_r3 = G / (r2 * r);
-                ax += node->mass * dx * inv_r3;
-                ay += node->mass * dy * inv_r3;
-            }
-        } else {
-            // Recurse to children
-            for (int i = 0; i < 4; ++i) {
-                if (node->children[i]) {
-                    evaluate_force(node->children[i].get(), tx, ty, ax, ay);
+            // For distant cells, use multipole approximation
+            for (int cy = 0; cy < grid_size; ++cy) {
+                for (int cx = 0; cx < grid_size; ++cx) {
+                    // Skip nearby cells (already computed above)
+                    if (std::abs(cx - grid_x) <= 1 && std::abs(cy - grid_y) <= 1) {
+                        continue;
+                    }
+                    
+                    const auto& cell = grid[cy * grid_size + cx];
+                    if (cell.empty()) continue;
+                    
+                    // Compute cell center and total mass
+                    double cell_cx = (cx + 0.5) * cell_size - domain_size;
+                    double cell_cy = (cy + 0.5) * cell_size - domain_size;
+                    double total_mass = 0.0;
+                    double mass_cx = 0.0;
+                    double mass_cy = 0.0;
+                    
+                    for (int j : cell) {
+                        double mj = m_data[j];
+                        total_mass += mj;
+                        mass_cx += mj * x_data[j];
+                        mass_cy += mj * y_data[j];
+                    }
+                    
+                    if (total_mass > 0.0) {
+                        mass_cx /= total_mass;
+                        mass_cy /= total_mass;
+                        
+                        // Use monopole approximation
+                        const double dx_val = xi - mass_cx;
+                        const double dy_val = yi - mass_cy;
+                        const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
+                        
+                        if (r2 > eps*eps) {
+                            const double inv_r3 = G / (r2 * std::sqrt(r2));
+                            ax[i] += total_mass * dx_val * inv_r3;
+                            ay[i] += total_mass * dy_val * inv_r3;
+                        }
+                    }
                 }
             }
         }
@@ -193,38 +144,34 @@ public:
         N = n;
         domain_size = domain;
         theta = th;
-        max_leaf = max_leaf_particles;
         eps = epsilon;
         G = gravity;
         
-        // Create root node
-        root = std::make_unique<FMMNode>(0.0, 0.0, domain_size);
-        for (int i = 0; i < N; ++i) {
-            root->particles.push_back(i);
-        }
-        
-        // Build tree (sequential - tree building is hard to parallelize efficiently)
-        build_tree(root.get(), max_leaf);
-        compute_mass_center(root.get());
-        
-        // Compute forces with improved parallelization
-        if (N >= 1000) {
-            // For large problems, use parallelization
-            const int chunk_size = std::max(16, N / (8 * omp_get_max_threads()));
-            
-            #pragma omp parallel for schedule(static, chunk_size)
+        if (N < 1000) {
+            // For small problems, fall back to direct method
+            #pragma omp parallel for schedule(static) if(N > 100)
             for (int i = 0; i < N; ++i) {
                 ax[i] = 0.0;
                 ay[i] = 0.0;
-                evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
+                
+                for (int j = 0; j < N; ++j) {
+                    if (i == j) continue;
+                    
+                    const double dx = x[i] - x[j];
+                    const double dy = y[i] - y[j];
+                    const double r2 = dx*dx + dy*dy + eps*eps;
+                    
+                    if (r2 > eps*eps) {
+                        const double inv_r3 = G / (r2 * std::sqrt(r2));
+                        const double mj = m[j];
+                        ax[i] += mj * dx * inv_r3;
+                        ay[i] += mj * dy * inv_r3;
+                    }
+                }
             }
         } else {
-            // For small problems, use sequential computation
-            for (int i = 0; i < N; ++i) {
-                ax[i] = 0.0;
-                ay[i] = 0.0;
-                evaluate_force(root.get(), x[i], y[i], ax[i], ay[i]);
-            }
+            // Use spatial decomposition for larger problems
+            compute_forces_spatial(ax, ay);
         }
     }
 };
@@ -257,7 +204,7 @@ void fmm_force(const py::array_t<double>& x_arr,
     }
     
     try {
-        OptimizedFMM fmm;
+        SpatialFMM fmm;
         
         const double* x_ptr = x.data(0);
         const double* y_ptr = y.data(0);
@@ -275,7 +222,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "2D Fast Multipole Method (FMM) kernel (Fixed OpenMP)";
+    m.doc() = "2D Spatial Decomposition FMM kernel (Optimized)";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),

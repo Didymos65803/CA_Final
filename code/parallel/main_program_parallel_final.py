@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # main_program_parallel_final.py
-# Completely revised version with fixed parallelization
+# Completely redesigned with effective parallelization strategies
 
 import os
 import sys
@@ -12,9 +12,9 @@ import matplotlib.animation as animation
 
 # Optimized OpenMP environment settings
 os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["OMP_PROC_BIND"] = "spread"  # Changed from "close"
-os.environ["OMP_PLACES"] = "threads"     # Changed from "cores"
-os.environ["OMP_SCHEDULE"] = "static"    # Changed from "dynamic"
+os.environ["OMP_PROC_BIND"] = "spread"
+os.environ["OMP_PLACES"] = "threads"
+os.environ["OMP_SCHEDULE"] = "guided,16"  # Better for load balancing
 os.environ["OMP_DYNAMIC"] = "false"
 
 # Set path
@@ -43,32 +43,35 @@ if not os.path.isdir(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 def initialize_particles(N, domain_size):
-    """Initialize N particles uniformly in a disk with optimized memory layout"""
-    # Use vectorized operations for better performance
-    angles = np.random.rand(N) * 2.0 * math.pi
-    radii = domain_size * np.sqrt(np.random.rand(N))
+    """Initialize N particles with optimized memory layout"""
+    # Use numpy's random number generator for better performance
+    rng = np.random.default_rng()
     
-    # Create arrays with specific alignment for SIMD
+    # Generate random positions in a circle
+    angles = rng.uniform(0, 2*math.pi, N)
+    radii = domain_size * np.sqrt(rng.uniform(0, 1, N))
+    
+    # Create memory-aligned arrays
     x = np.empty(N, dtype=np.float64)
     y = np.empty(N, dtype=np.float64)
     m = np.ones(N, dtype=np.float64)
     
-    # Vectorized initialization
+    # Vectorized computation
     np.multiply(radii, np.cos(angles), out=x)
     np.multiply(radii, np.sin(angles), out=y)
     
-    # Ensure memory alignment
-    x = np.ascontiguousarray(x, dtype=np.float64)
-    y = np.ascontiguousarray(y, dtype=np.float64)
-    m = np.ascontiguousarray(m, dtype=np.float64)
+    # Ensure contiguous memory layout
+    x = np.ascontiguousarray(x)
+    y = np.ascontiguousarray(y)
+    m = np.ascontiguousarray(m)
     
     return x, y, m
 
 def safe_direct_force(x, y, m, eps2):
-    """Optimized direct force calculation with better error handling"""
+    """Optimized direct force calculation"""
     N = len(x)
     
-    # Pre-allocate aligned output arrays
+    # Pre-allocate output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
@@ -88,9 +91,9 @@ def safe_direct_force(x, y, m, eps2):
         return None, None
 
 def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
-    """Optimized FMM force calculation with better error handling"""
+    """Optimized FMM force calculation"""
     
-    # Pre-allocate aligned output arrays
+    # Pre-allocate output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
@@ -110,207 +113,384 @@ def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
     else:
         return None, None
 
-def comprehensive_thread_benchmark():
-    """Comprehensive thread benchmark with multiple problem sizes"""
-    print("\nComprehensive Thread Benchmark")
+def enhanced_thread_benchmark():
+    """Enhanced thread benchmark with focus on direct method"""
+    print("\nEnhanced Thread Benchmark")
     print("=" * 60)
     
-    if not HAS_FMM:
-        print("FMM not available for thread benchmark")
+    if not HAS_DIRECT and not HAS_FMM:
+        print("No computation modules available")
         return
     
-    # Test multiple problem sizes
-    test_sizes = [1000, 2000, 5000, 10000, 20000]
-    thread_counts = [1, 2, 4, 8]
+    # Focus on sizes where parallelization can be effective
+    test_sizes = [500, 1000, 2000, 4000, 8000]
+    thread_counts = [1, 2, 4, 6, 8]
     
     results = {}
     
     for N in test_sizes:
         print(f"\nTesting with N = {N} particles")
         
-        domain_size = 100.0  # Larger domain for bigger problems
+        domain_size = 100.0
         theta = 0.5
-        maxLeaf = 64 if N > 10000 else 32  # Adaptive maxLeaf
+        maxLeaf = 64
         eps = 0.01
         G = 1.0
         
         x, y, m = initialize_particles(N, domain_size)
-        times = []
+        
+        times_direct = []
+        times_fmm = []
         
         for threads in thread_counts:
-            # Set environment variables
+            # Configure OpenMP for each thread count
             os.environ["OMP_NUM_THREADS"] = str(threads)
+            
             if threads == 1:
                 os.environ["OMP_PROC_BIND"] = "false"
+                os.environ["OMP_SCHEDULE"] = "static"
             else:
                 os.environ["OMP_PROC_BIND"] = "spread"
+                os.environ["OMP_SCHEDULE"] = "guided,16"
             
-            time.sleep(0.5)  # Longer wait for environment changes
+            time.sleep(0.3)  # Allow environment changes to take effect
             
-            # Warm up run
-            safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+            # Test direct method (most parallelizable)
+            if HAS_DIRECT:
+                # Warm up
+                safe_direct_force(x, y, m, eps*eps)
+                
+                # Multiple runs for accuracy
+                run_times = []
+                for _ in range(5):
+                    t0 = time.perf_counter()
+                    ax, ay = safe_direct_force(x, y, m, eps*eps)
+                    if ax is not None:
+                        run_times.append(time.perf_counter() - t0)
+                
+                if run_times:
+                    median_time = sorted(run_times)[len(run_times)//2]
+                    times_direct.append(median_time)
+                    print(f"  Direct ({threads} threads): {median_time:.6f} seconds")
+                else:
+                    times_direct.append(float('nan'))
+            else:
+                times_direct.append(float('nan'))
             
-            # Multiple measurement runs
-            run_times = []
-            for run in range(5):  # More runs for better statistics
-                t0 = time.perf_counter()  # More precise timing
-                ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
-                run_times.append(time.perf_counter() - t0)
-            
-            # Remove outliers and take median
-            run_times.sort()
-            median_time = run_times[len(run_times)//2]
-            times.append(median_time)
-            
-            print(f"  Threads: {threads:2d}, Time: {median_time:.6f} seconds")
+            # Test FMM method
+            if HAS_FMM:
+                # Warm up
+                safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                
+                # Multiple runs for accuracy
+                run_times = []
+                for _ in range(5):
+                    t0 = time.perf_counter()
+                    ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                    if ax is not None:
+                        run_times.append(time.perf_counter() - t0)
+                
+                if run_times:
+                    median_time = sorted(run_times)[len(run_times)//2]
+                    times_fmm.append(median_time)
+                    print(f"  FMM ({threads} threads): {median_time:.6f} seconds")
+                else:
+                    times_fmm.append(float('nan'))
+            else:
+                times_fmm.append(float('nan'))
         
-        # Calculate speedup and efficiency
-        speedup = [times[0] / t for t in times]
-        efficiency = [s / tc for s, tc in zip(speedup, thread_counts)]
+        # Calculate speedups and efficiency
+        speedup_direct = []
+        speedup_fmm = []
+        efficiency_direct = []
+        efficiency_fmm = []
+        
+        if times_direct and not math.isnan(times_direct[0]):
+            speedup_direct = [times_direct[0] / t for t in times_direct if not math.isnan(t)]
+            efficiency_direct = [s / tc for s, tc in zip(speedup_direct, thread_counts[:len(speedup_direct)])]
+        
+        if times_fmm and not math.isnan(times_fmm[0]):
+            speedup_fmm = [times_fmm[0] / t for t in times_fmm if not math.isnan(t)]
+            efficiency_fmm = [s / tc for s, tc in zip(speedup_fmm, thread_counts[:len(speedup_fmm)])]
         
         results[N] = {
             'threads': thread_counts,
-            'times': times,
-            'speedup': speedup,
-            'efficiency': efficiency
+            'times_direct': times_direct,
+            'times_fmm': times_fmm,
+            'speedup_direct': speedup_direct,
+            'speedup_fmm': speedup_fmm,
+            'efficiency_direct': efficiency_direct,
+            'efficiency_fmm': efficiency_fmm
         }
         
-        print(f"  Best speedup: {max(speedup):.2f}x at {thread_counts[speedup.index(max(speedup))]} threads")
-        print(f"  Efficiency at 8 threads: {efficiency[-1]:.1%}")
+        if speedup_direct:
+            max_speedup = max(speedup_direct)
+            best_threads = thread_counts[speedup_direct.index(max_speedup)]
+            print(f"  Direct best speedup: {max_speedup:.2f}x at {best_threads} threads")
+        
+        if speedup_fmm:
+            max_speedup = max(speedup_fmm)
+            best_threads = thread_counts[speedup_fmm.index(max_speedup)]
+            print(f"  FMM best speedup: {max_speedup:.2f}x at {best_threads} threads")
     
-    # Create comprehensive visualization
-    create_comprehensive_plots(results, test_sizes, thread_counts)
+    # Create enhanced visualization
+    create_enhanced_plots(results, test_sizes, thread_counts)
     
-    # Restore default settings
+    # Restore defaults
     os.environ["OMP_NUM_THREADS"] = "8"
     os.environ["OMP_PROC_BIND"] = "spread"
     
     return results
 
-def create_comprehensive_plots(results, test_sizes, thread_counts):
-    """Create comprehensive performance analysis plots"""
+def create_enhanced_plots(results, test_sizes, thread_counts):
+    """Create enhanced performance analysis plots"""
     
-    fig = plt.figure(figsize=(16, 12))
-    
-    # Color scheme
+    fig = plt.figure(figsize=(18, 12))
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
     
-    # 1. Speedup vs Thread Count (for different problem sizes)
-    ax1 = plt.subplot(2, 3, 1)
+    # 1. Direct Method Speedup
+    ax1 = plt.subplot(2, 4, 1)
+    ax1.set_title("Direct Method Speedup", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
-        if N in results:
-            ax1.plot(results[N]['threads'], results[N]['speedup'], 
+        if N in results and results[N]['speedup_direct']:
+            threads_used = thread_counts[:len(results[N]['speedup_direct'])]
+            ax1.plot(threads_used, results[N]['speedup_direct'], 
                     'o-', color=colors[i % len(colors)], label=f"N={N}", linewidth=2, markersize=6)
     
-    ax1.plot(thread_counts, thread_counts, '--', color='gray', 
-            label="Ideal Speedup", linewidth=2, alpha=0.7)
+    ax1.plot(thread_counts, thread_counts, '--', color='gray', label="Ideal", linewidth=2, alpha=0.7)
     ax1.set_xlabel("Number of Threads")
     ax1.set_ylabel("Speedup")
-    ax1.set_title("Speedup vs Thread Count")
-    ax1.legend()
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim(0.5, 8.5)
     
-    # 2. Parallel Efficiency
-    ax2 = plt.subplot(2, 3, 2)
+    # 2. Direct Method Efficiency
+    ax2 = plt.subplot(2, 4, 2)
+    ax2.set_title("Direct Method Efficiency", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
-        if N in results:
-            ax2.plot(results[N]['threads'], results[N]['efficiency'], 
+        if N in results and results[N]['efficiency_direct']:
+            threads_used = thread_counts[:len(results[N]['efficiency_direct'])]
+            ax2.plot(threads_used, results[N]['efficiency_direct'], 
                     's-', color=colors[i % len(colors)], label=f"N={N}", linewidth=2, markersize=6)
     
-    ax2.axhline(y=1.0, color='gray', linestyle='--', label="Perfect Efficiency", alpha=0.7)
-    ax2.axhline(y=0.5, color='red', linestyle=':', label="50% Efficiency", alpha=0.7)
+    ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7)
+    ax2.axhline(y=0.8, color='green', linestyle=':', alpha=0.7, label="Good (80%)")
+    ax2.axhline(y=0.5, color='orange', linestyle=':', alpha=0.7, label="Fair (50%)")
     ax2.set_xlabel("Number of Threads")
     ax2.set_ylabel("Parallel Efficiency")
-    ax2.set_title("Parallel Efficiency")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     ax2.set_xlim(0.5, 8.5)
     ax2.set_ylim(0, 1.1)
     
-    # 3. Execution Time (log scale)
-    ax3 = plt.subplot(2, 3, 3)
+    # 3. FMM Method Speedup
+    ax3 = plt.subplot(2, 4, 3)
+    ax3.set_title("FMM Method Speedup", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
-        if N in results:
-            ax3.semilogy(results[N]['threads'], results[N]['times'], 
-                        '^-', color=colors[i % len(colors)], label=f"N={N}", linewidth=2, markersize=6)
+        if N in results and results[N]['speedup_fmm']:
+            threads_used = thread_counts[:len(results[N]['speedup_fmm'])]
+            ax3.plot(threads_used, results[N]['speedup_fmm'], 
+                    '^-', color=colors[i % len(colors)], label=f"N={N}", linewidth=2, markersize=6)
     
+    ax3.plot(thread_counts, thread_counts, '--', color='gray', label="Ideal", linewidth=2, alpha=0.7)
     ax3.set_xlabel("Number of Threads")
-    ax3.set_ylabel("Execution Time (seconds)")
-    ax3.set_title("Execution Time vs Thread Count")
+    ax3.set_ylabel("Speedup")
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     ax3.set_xlim(0.5, 8.5)
     
-    # 4. Strong Scaling Efficiency
-    ax4 = plt.subplot(2, 3, 4)
-    for threads in [2, 4, 8]:
-        thread_idx = thread_counts.index(threads)
-        effs = [results[N]['efficiency'][thread_idx] for N in test_sizes if N in results]
-        sizes = [N for N in test_sizes if N in results]
-        ax4.semilogx(sizes, effs, 'o-', label=f"{threads} threads", linewidth=2, markersize=6)
+    # 4. Method Comparison (8 threads)
+    ax4 = plt.subplot(2, 4, 4)
+    ax4.set_title("Method Comparison (8 Threads)", fontsize=14, fontweight='bold')
     
-    ax4.axhline(y=0.8, color='green', linestyle='--', label="Good Efficiency (80%)", alpha=0.7)
-    ax4.axhline(y=0.5, color='orange', linestyle='--', label="Fair Efficiency (50%)", alpha=0.7)
+    direct_times_8 = []
+    fmm_times_8 = []
+    sizes_direct = []
+    sizes_fmm = []
+    
+    for N in test_sizes:
+        if N in results:
+            if (len(results[N]['times_direct']) >= 5 and 
+                not math.isnan(results[N]['times_direct'][4])):
+                direct_times_8.append(results[N]['times_direct'][4])
+                sizes_direct.append(N)
+            
+            if (len(results[N]['times_fmm']) >= 5 and 
+                not math.isnan(results[N]['times_fmm'][4])):
+                fmm_times_8.append(results[N]['times_fmm'][4])
+                sizes_fmm.append(N)
+    
+    if direct_times_8:
+        ax4.loglog(sizes_direct, direct_times_8, 'o-', label="Direct O(N²)", linewidth=2)
+    if fmm_times_8:
+        ax4.loglog(sizes_fmm, fmm_times_8, 's-', label="FMM", linewidth=2)
+    
     ax4.set_xlabel("Problem Size (N)")
-    ax4.set_ylabel("Parallel Efficiency")
-    ax4.set_title("Strong Scaling Analysis")
+    ax4.set_ylabel("Time (seconds)")
     ax4.legend()
     ax4.grid(True, alpha=0.3)
-    ax4.set_ylim(0, 1.1)
     
-    # 5. Performance per Thread
-    ax5 = plt.subplot(2, 3, 5)
-    for i, N in enumerate(test_sizes):
+    # 5. Scalability Analysis
+    ax5 = plt.subplot(2, 4, 5)
+    ax5.set_title("Scalability Analysis", fontsize=14, fontweight='bold')
+    
+    best_speedups_direct = []
+    best_speedups_fmm = []
+    
+    for N in test_sizes:
         if N in results:
-            throughput = [N / (t * tc) for t, tc in zip(results[N]['times'], results[N]['threads'])]
-            ax5.plot(results[N]['threads'], throughput, 
-                    'D-', color=colors[i % len(colors)], label=f"N={N}", linewidth=2, markersize=6)
+            if results[N]['speedup_direct']:
+                best_speedups_direct.append(max(results[N]['speedup_direct']))
+            else:
+                best_speedups_direct.append(0)
+            
+            if results[N]['speedup_fmm']:
+                best_speedups_fmm.append(max(results[N]['speedup_fmm']))
+            else:
+                best_speedups_fmm.append(0)
     
-    ax5.set_xlabel("Number of Threads")
-    ax5.set_ylabel("Particles per Second per Thread")
-    ax5.set_title("Per-Thread Performance")
+    x = np.arange(len(test_sizes))
+    width = 0.35
+    
+    bars1 = ax5.bar(x - width/2, best_speedups_direct, width, 
+                   label='Direct Method', alpha=0.8, color='skyblue')
+    bars2 = ax5.bar(x + width/2, best_speedups_fmm, width, 
+                   label='FMM Method', alpha=0.8, color='lightcoral')
+    
+    ax5.set_xlabel("Problem Size")
+    ax5.set_ylabel("Best Speedup")
+    ax5.set_xticks(x)
+    ax5.set_xticklabels([f"N={N}" for N in test_sizes])
     ax5.legend()
     ax5.grid(True, alpha=0.3)
-    ax5.set_xlim(0.5, 8.5)
-    
-    # 6. Scalability Summary
-    ax6 = plt.subplot(2, 3, 6)
-    max_speedups = [max(results[N]['speedup']) for N in test_sizes if N in results]
-    eff_8_threads = [results[N]['efficiency'][-1] for N in test_sizes if N in results]
-    
-    ax6_twin = ax6.twinx()
-    
-    bars1 = ax6.bar([str(N) for N in test_sizes if N in results], max_speedups, 
-                   alpha=0.7, color='skyblue', label='Max Speedup')
-    bars2 = ax6_twin.bar([str(N) for N in test_sizes if N in results], 
-                        [e*100 for e in eff_8_threads], 
-                        alpha=0.7, color='lightcoral', width=0.6, label='8-Thread Efficiency (%)')
-    
-    ax6.set_xlabel("Problem Size (N)")
-    ax6.set_ylabel("Maximum Speedup", color='blue')
-    ax6_twin.set_ylabel("8-Thread Efficiency (%)", color='red')
-    ax6.set_title("Scalability Summary")
     
     # Add value labels on bars
-    for bar, val in zip(bars1, max_speedups):
-        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05, 
-                f'{val:.1f}x', ha='center', va='bottom', fontsize=10)
+    for bar in bars1:
+        height = bar.get_height()
+        if height > 0:
+            ax5.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{height:.1f}x', ha='center', va='bottom', fontsize=9)
     
-    for bar, val in zip(bars2, eff_8_threads):
-        ax6_twin.text(bar.get_x() + bar.get_width()/2, val*100 + 1, 
-                     f'{val:.1%}', ha='center', va='bottom', fontsize=10)
+    for bar in bars2:
+        height = bar.get_height()
+        if height > 0:
+            ax5.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{height:.1f}x', ha='center', va='bottom', fontsize=9)
+    
+    # 6. Efficiency Heatmap
+    ax6 = plt.subplot(2, 4, 6)
+    ax6.set_title("Efficiency Heatmap (Direct)", fontsize=14, fontweight='bold')
+    
+    # Create efficiency matrix for direct method
+    eff_matrix = np.zeros((len(test_sizes), len(thread_counts)))
+    for i, N in enumerate(test_sizes):
+        if N in results and results[N]['efficiency_direct']:
+            for j, eff in enumerate(results[N]['efficiency_direct']):
+                eff_matrix[i, j] = eff
+    
+    im = ax6.imshow(eff_matrix, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+    ax6.set_xticks(range(len(thread_counts)))
+    ax6.set_xticklabels(thread_counts)
+    ax6.set_yticks(range(len(test_sizes)))
+    ax6.set_yticklabels([f"N={N}" for N in test_sizes])
+    ax6.set_xlabel("Number of Threads")
+    ax6.set_ylabel("Problem Size")
+    
+    # Add text annotations
+    for i in range(len(test_sizes)):
+        for j in range(len(thread_counts)):
+            if eff_matrix[i, j] > 0:
+                text = ax6.text(j, i, f'{eff_matrix[i, j]:.2f}',
+                               ha="center", va="center", color="black", fontsize=8)
+    
+    plt.colorbar(im, ax=ax6, label='Efficiency')
+    
+    # 7. Performance Summary
+    ax7 = plt.subplot(2, 4, 7)
+    ax7.set_title("Performance Summary", fontsize=14, fontweight='bold')
+    
+    # Calculate overall metrics
+    overall_metrics = {}
+    for N in test_sizes:
+        if N in results:
+            # Best efficiency for each method
+            best_eff_direct = max(results[N]['efficiency_direct']) if results[N]['efficiency_direct'] else 0
+            best_eff_fmm = max(results[N]['efficiency_fmm']) if results[N]['efficiency_fmm'] else 0
+            
+            overall_metrics[N] = {
+                'direct_efficiency': best_eff_direct,
+                'fmm_efficiency': best_eff_fmm
+            }
+    
+    # Plot efficiency trends
+    sizes = list(overall_metrics.keys())
+    direct_effs = [overall_metrics[N]['direct_efficiency'] for N in sizes]
+    fmm_effs = [overall_metrics[N]['fmm_efficiency'] for N in sizes]
+    
+    ax7.semilogx(sizes, direct_effs, 'o-', label='Direct Method', linewidth=2)
+    ax7.semilogx(sizes, fmm_effs, 's-', label='FMM Method', linewidth=2)
+    ax7.axhline(y=0.8, color='green', linestyle='--', alpha=0.5)
+    ax7.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5)
+    ax7.set_xlabel("Problem Size (N)")
+    ax7.set_ylabel("Best Efficiency Achieved")
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+    ax7.set_ylim(0, 1.1)
+    
+    # 8. Recommendations
+    ax8 = plt.subplot(2, 4, 8)
+    ax8.set_title("Parallelization Recommendations", fontsize=14, fontweight='bold')
+    ax8.axis('off')
+    
+    # Generate recommendations based on results
+    recommendations = []
+    
+    # Analyze direct method performance
+    if overall_metrics:
+        avg_direct_eff = np.mean([m['direct_efficiency'] for m in overall_metrics.values()])
+        avg_fmm_eff = np.mean([m['fmm_efficiency'] for m in overall_metrics.values()])
+        
+        if avg_direct_eff > 0.5:
+            recommendations.append("✓ Direct method shows good parallelization")
+        else:
+            recommendations.append("✗ Direct method needs optimization")
+        
+        if avg_fmm_eff > 0.3:
+            recommendations.append("✓ FMM shows reasonable parallelization")
+        else:
+            recommendations.append("✗ FMM parallelization is poor")
+        
+        # Problem size recommendations
+        good_sizes = [N for N, m in overall_metrics.items() if m['direct_efficiency'] > 0.7]
+        if good_sizes:
+            recommendations.append(f"✓ Best performance at N ≥ {min(good_sizes)}")
+        
+        # Thread count recommendations
+        optimal_threads = 4  # Default
+        for N in test_sizes:
+            if N in results and results[N]['efficiency_direct']:
+                for i, eff in enumerate(results[N]['efficiency_direct']):
+                    if eff > 0.7:
+                        optimal_threads = thread_counts[i]
+                        break
+        
+        recommendations.append(f"⚡ Optimal thread count: {optimal_threads}")
+    
+    # Display recommendations
+    for i, rec in enumerate(recommendations):
+        ax8.text(0.05, 0.9 - i*0.15, rec, fontsize=11, 
+                transform=ax8.transAxes, verticalalignment='top')
     
     plt.tight_layout()
     
-    # Save plots
-    comprehensive_path = os.path.join(OUTPUT_DIR, "comprehensive_thread_analysis.png")
-    plt.savefig(comprehensive_path, dpi=300, bbox_inches='tight')
+    # Save enhanced plots
+    enhanced_path = os.path.join(OUTPUT_DIR, "enhanced_thread_analysis.png")
+    plt.savefig(enhanced_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✓ Comprehensive analysis saved to {comprehensive_path}")
+    print(f"\n✓ Enhanced analysis saved to {enhanced_path}")
 
 def quick_benchmark():
-    """Quick benchmark scaling - simplified version"""
+    """Quick benchmark scaling"""
     print("\nQuick Benchmark Scaling")
     print("=" * 50)
     
@@ -551,11 +731,11 @@ def large_n_scaling():
     print("\nLarge-N Scaling Test")
     print("=" * 50)
     
-    Ns = [500, 1000, 2000, 4000]
+    Ns = [500, 1000, 2000, 4000, 8000]
     steps = 3
     domain_size = 50.0
     theta = 0.5
-    maxLeaf = 32  # Larger for better performance with large N
+    maxLeaf = 32
     eps = 0.01
     G = 1.0
     
@@ -568,8 +748,8 @@ def large_n_scaling():
         
         x, y, m = initialize_particles(N, domain_size)
         
-        # Skip direct method for large N
-        t_direct = float('nan') if N > 1000 else None
+        # Test direct method (skip for very large N)
+        t_direct = float('nan') if N > 2000 else None
         if t_direct is None and HAS_DIRECT:
             try:
                 t0 = time.perf_counter()
@@ -770,6 +950,7 @@ def system_information():
     print(f"OpenMP threads: {os.environ.get('OMP_NUM_THREADS', 'Not set')}")
     print(f"OpenMP proc bind: {os.environ.get('OMP_PROC_BIND', 'Not set')}")
     print(f"OpenMP places: {os.environ.get('OMP_PLACES', 'Not set')}")
+    print(f"OpenMP schedule: {os.environ.get('OMP_SCHEDULE', 'Not set')}")
     print(f"Direct method module: {'Available' if HAS_DIRECT else 'Not available'}")
     print(f"FMM module: {'Available' if HAS_FMM else 'Not available'}")
     
@@ -897,11 +1078,11 @@ def create_energy_plot(energies, dt, method, N):
     print(f"✓ Energy plot saved to {energy_path}")
 
 def main_menu():
-    """Main menu with comprehensive thread benchmark"""
+    """Main menu with enhanced thread benchmark"""
     while True:
         print("\n" + "=" * 60)
         print("2D N-Body Problem Simulation Platform")
-        print("(Comprehensive Parallel Analysis Version)")
+        print("(Enhanced Parallel Analysis Version)")
         print("=" * 60)
         print("Select function:")
         print(" 1) Quick benchmark scaling")
@@ -910,7 +1091,7 @@ def main_menu():
         print(" 4) Large-N scaling test")
         print(" 5) Energy conservation test")
         print(" 6) Parameter optimization")
-        print(" 7) Comprehensive thread benchmark")
+        print(" 7) Enhanced thread benchmark")
         print(" 8) System information")
         print(" q) Exit program")
         print("=" * 60)
@@ -930,7 +1111,7 @@ def main_menu():
         elif choice == '6':
             parameter_optimization()
         elif choice == '7':
-            comprehensive_thread_benchmark()
+            enhanced_thread_benchmark()
         elif choice == '8':
             system_information()
         elif choice == 'q':
@@ -941,7 +1122,12 @@ def main_menu():
 
 if __name__ == "__main__":
     print("2D N-Body Problem Simulation Platform starting...")
-    print("Comprehensive parallel performance analysis version")
+    print("Enhanced parallel performance analysis version")
+    print(f"Detected OpenMP configuration:")
+    print(f"  - Threads: {os.environ.get('OMP_NUM_THREADS')}")
+    print(f"  - Proc bind: {os.environ.get('OMP_PROC_BIND')}")
+    print(f"  - Places: {os.environ.get('OMP_PLACES')}")
+    print(f"  - Schedule: {os.environ.get('OMP_SCHEDULE')}")
     
     # Check module availability
     if not HAS_DIRECT and not HAS_FMM:

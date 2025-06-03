@@ -1,5 +1,5 @@
 // force_kernel_full.cpp
-// Fixed version with proper includes and no warnings
+// Optimized version focusing on better parallelization
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -32,46 +32,78 @@ void direct_force(const py::array_t<double>& x_arr,
         throw std::runtime_error("Array size mismatch in direct_force");
     }
     
-    // Initialize output arrays first
-    #pragma omp parallel for schedule(static)
+    // Initialize output arrays
+    #pragma omp parallel for schedule(static) if(N > 100)
     for (ssize_t i = 0; i < N; ++i) {
         ax(i) = 0.0;
         ay(i) = 0.0;
     }
     
-    // Use static scheduling for better cache locality
-    // Only parallelize for larger problems to avoid overhead
-    #pragma omp parallel for schedule(static) if(N > 500)
-    for (ssize_t i = 0; i < N; ++i) {
-        const double xi = x(i);
-        const double yi = y(i);
-        double axi = 0.0;
-        double ayi = 0.0;
-        
-        // Inner loop with better vectorization hints
-        for (ssize_t j = 0; j < N; ++j) {
-            if (i == j) continue;
+    // Optimized O(N^2) computation with better parallelization
+    if (N <= 200) {
+        // For small N, use sequential computation to avoid overhead
+        for (ssize_t i = 0; i < N; ++i) {
+            const double xi = x(i);
+            const double yi = y(i);
+            double axi = 0.0;
+            double ayi = 0.0;
             
-            const double dx = xi - x(j);
-            const double dy = yi - y(j);
-            const double r2 = dx*dx + dy*dy + eps2;
-            
-            if (r2 > eps2) {  // Avoid division by very small numbers
-                const double inv_r = 1.0 / std::sqrt(r2);
-                const double inv_r3 = inv_r * inv_r * inv_r;
-                const double mj = m(j);
-                axi -= mj * dx * inv_r3;
-                ayi -= mj * dy * inv_r3;
+            for (ssize_t j = 0; j < N; ++j) {
+                if (i == j) continue;
+                
+                const double dx = xi - x(j);
+                const double dy = yi - y(j);
+                const double r2 = dx*dx + dy*dy + eps2;
+                
+                if (r2 > eps2) {
+                    const double inv_r = 1.0 / std::sqrt(r2);
+                    const double inv_r3 = inv_r * inv_r * inv_r;
+                    const double mj = m(j);
+                    axi -= mj * dx * inv_r3;
+                    ayi -= mj * dy * inv_r3;
+                }
             }
+            
+            ax(i) = axi;
+            ay(i) = ayi;
         }
+    } else {
+        // For larger N, use parallelization with optimized scheduling
+        const int num_threads = omp_get_max_threads();
+        const int chunk_size = std::max(1, static_cast<int>(N / (num_threads * 4)));
         
-        ax(i) = axi;
-        ay(i) = ayi;
+        #pragma omp parallel for schedule(dynamic, chunk_size)
+        for (ssize_t i = 0; i < N; ++i) {
+            const double xi = x(i);
+            const double yi = y(i);
+            double axi = 0.0;
+            double ayi = 0.0;
+            
+            // Vectorizable inner loop
+            for (ssize_t j = 0; j < N; ++j) {
+                if (i == j) continue;
+                
+                const double dx = xi - x(j);
+                const double dy = yi - y(j);
+                const double r2 = dx*dx + dy*dy + eps2;
+                
+                if (r2 > eps2) {
+                    const double inv_r = 1.0 / std::sqrt(r2);
+                    const double inv_r3 = inv_r * inv_r * inv_r;
+                    const double mj = m(j);
+                    axi -= mj * dx * inv_r3;
+                    ayi -= mj * dy * inv_r3;
+                }
+            }
+            
+            ax(i) = axi;
+            ay(i) = ayi;
+        }
     }
 }
 
 PYBIND11_MODULE(force_kernel, m) {
-    m.doc() = "2D direct O(N^2) gravitational kernel (Fixed OpenMP)";
+    m.doc() = "2D direct O(N^2) gravitational kernel (Optimized)";
     m.def("direct_force",
           &direct_force,
           py::arg("x"),
