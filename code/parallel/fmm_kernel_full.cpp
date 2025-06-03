@@ -2,23 +2,17 @@
 // ===================
 //
 // High-precision Fast Multipole Method (FMM) with OpenMP acceleration.
+// This file implements a P=8 complex‐expansion FMM in 2D. The final “evaluate_forces”
+// step is parallelized leaf‐by‐leaf using OpenMP.
 //
-// Compared to the original version, this file:
-//   1) Introduces `collect_leaves` to build a flat list of leaf cells.
-//   2) Modifies `fmm_evaluate_forces` so that each leaf’s near-field
-//      and local-expansion computation runs in an OpenMP parallel loop.
-//   3) Retains all original single‐threaded FMM helper functions (subdivide,
-//      upward, interaction, downward). You only need to paste your original
-//      implementations of those helpers in the marked sections below.
+// Build command (in the same folder as setup.py):
+//     python setup.py build_ext --inplace
 //
-// Build command (from the same folder as setup.py):
-//   python setup.py build_ext --inplace
+// If compiled correctly, you’ll get a shared library `fmm_kernel*.so` which
+// can be imported in Python as `import fmm_kernel`.  The symbol `fmm_kernel.has_openmp`
+// will tell you whether OpenMP was enabled.
 //
-// If compiled correctly, you’ll get fmm_kernel*.so in this directory.  
-// Then Python can do `import fmm_kernel` and see `fmm_kernel.has_openmp == True`.
-//
-//  Author: (Your Name), Date: 2025-06-XX
-// ------------------------------------------------------------------------------------------------
+// Author: Your Name (2025-06-XX)
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -39,48 +33,84 @@
 namespace py = pybind11;
 using cplx = std::complex<double>;
 
+// ----- PARAMETERS FOR MULTIPOLE EXPANSION -----
+
+// We choose P = 8 total expansion terms (0..8) for a high‐precision 2D FMM.
+// If you want to change accuracy, adjust P here (and recompile).
+constexpr int P = 8;
+
+// Precompute factorials 0!, 1!, 2!, …, P! for quick lookup.
+static std::array<double, P + 1> factorial_table = []() {
+    std::array<double, P + 1> table;
+    table[0] = 1.0;
+    for (int i = 1; i <= P; ++i) {
+        table[i] = table[i-1] * i;
+    }
+    return table;
+}();
+
+// Compute “n choose k” via a small loop (exact for n,k ≤ P).
+static double binomial(int n, int k) {
+    if (k < 0 || k > n) return 0.0;
+    if (k == 0 || k == n) return 1.0;
+    if (k > n - k) k = n - k;
+    double result = 1.0;
+    for (int i = 0; i < k; ++i) {
+        result = result * (n - i) / (i + 1);
+    }
+    return result;
+}
+
+// ----- FMM TREE NODE DEFINITION -----
+
 /**
  * FMMCell:
- *   - Represents one node (box) in the 2D quadtree.
- *   - Holds multipole expansion (size = P), local expansion (size = P),
- *     list of particle indices, child pointers, etc.
+ *   Represents one node in the 2D quadtree. Each node holds:
+ *     - center (cx,cy), half‐size “size” (so full box is 2*size × 2*size)
+ *     - list of particle indices if leaf
+ *     - multipole expansion coefficients multipole[0..P]
+ *     - local expansion coefficients local[0..P]
+ *     - up to four children (NW, NE, SW, SE)
+ *     - parent pointer (nullptr at root)
+ *     - is_leaf flag (true if no children)
  */
 struct FMMCell {
-    double cx, cy;                       // Center coordinates of this cell
-    double size;                         // Half-size (half the edge length)
-    std::array<std::unique_ptr<FMMCell>, 4> children;  // Four quadrants: 0=NW,1=NE,2=SW,3=SE
-    std::vector<size_t> particles;       // Particle indices in this cell (only if leaf)
-    std::vector<cplx> multipole;         // Multipole expansion coefficients (length = P)
-    std::vector<cplx> local;             // Local expansion coefficients (length = P)
-    bool is_leaf;                        // True if no children (i.e. a leaf)
-    FMMCell* parent;                     // Parent pointer (nullptr for root)
+    double cx, cy;                          // Box center
+    double size;                            // Half‐length of box
+    int    level;                           // Depth in tree (root = 0)
+    bool   is_leaf;                         // True if this is a leaf node
 
-    // Constructor: initialize center (cx,cy), half-size, level, parent
-    //   Default P = 15 terms for high precision (you may adjust P as needed)
-    FMMCell(double _cx, double _cy, double _size, int level = 0, FMMCell* _parent = nullptr)
-        : cx(_cx), cy(_cy), size(_size), is_leaf(true), parent(_parent) {
-        const int P = 15;
-        multipole.assign(P, cplx(0.0, 0.0));
-        local.assign(P, cplx(0.0, 0.0));
+    std::vector<size_t> particles;          // List of particle indices inside this leaf
+    std::array<cplx, P + 1> multipole;      // Multipole coefficients a_0..a_P
+    std::array<cplx, P + 1> local;          // Local expansion b_0..b_P
+
+    std::array<std::unique_ptr<FMMCell>, 4> children;  // 0=NW,1=NE,2=SW,3=SE
+    FMMCell* parent;                        // Parent pointer (nullptr if root)
+
+    // Constructor: initialize center (cx,cy), half‐size “size”, depth level, parent pointer
+    FMMCell(double _cx, double _cy, double _size, int _level = 0, FMMCell* _parent = nullptr)
+        : cx(_cx), cy(_cy), size(_size), level(_level), parent(_parent) {
+        is_leaf = true;
+        // Zero‐out expansions
+        for (int i = 0; i <= P; ++i) {
+            multipole[i] = cplx(0.0, 0.0);
+            local[i]     = cplx(0.0, 0.0);
+        }
     }
 };
 
+// ----- HELPER: COLLECT ALL LEAVES INTO A VECTOR -----
+
 /**
  * collect_leaves(root, leaf_list)
- *   Recursively traverse the quadtree. Whenever a node has is_leaf == true,
- *   push its pointer into leaf_list. In this way, we flatten the leaves into a
- *   contiguous vector, so that later we can do a single `#pragma omp parallel for`
- *   over all leaves.
- *
- * @param root      Pointer to current FMMCell (node in the tree).
- * @param leaf_list Vector<FMMCell*>& to accumulate pointers of leaf nodes.
+ *   Recursively traverse the quadtree. Whenever a node is a leaf, push its pointer
+ *   into leaf_list. This “flattens” all leaves so that we can parallelize leaf‐by‐leaf.
  */
 static void collect_leaves(FMMCell* root, std::vector<FMMCell*>& leaf_list) {
     if (!root) return;
     if (root->is_leaf) {
         leaf_list.push_back(root);
     } else {
-        // Recurse into all non-null children
         for (int qi = 0; qi < 4; ++qi) {
             if (root->children[qi]) {
                 collect_leaves(root->children[qi].get(), leaf_list);
@@ -89,77 +119,94 @@ static void collect_leaves(FMMCell* root, std::vector<FMMCell*>& leaf_list) {
     }
 }
 
-// Forward declarations of the original single-threaded FMM helper functions.
-// You must copy‐paste your original implementations of these *entirely* here,
-// without modifying them (so that the algorithm stays exactly as before):
-// 
-//   - fmm_subdivide: splits a cell into 4 children until ≤ max_particles per leaf
-//   - fmm_upward_pass: does P2M on leaves, then M2M combine multipole up the tree
-//   - fmm_interaction_pass: for each target cell, do M2L from well-separated sources
-//   - fmm_downward_pass: propagate local expansions (L2L) down to children
-//   - fmm_evaluate_forces: *ORIGINAL* single-threaded evaluate of near‐field + L2P
+// ----- FORWARD DECLARATIONS: ORIGINAL SINGLE‐THREADED FMM STEPS -----
 //
-// In this file, we replace `fmm_evaluate_forces` with a parallel‐enabled version
-// further down. But first, declare the signatures so the compiler knows about them.
+//   These routines must be copied exactly from your working serial FMM
+//   implementation. They remain unmodified so that the FMM algorithm itself
+//   is identical. We only change the final "evaluate_forces" to be parallel.
+//
+//   1) fmm_subdivide: build/quadtree‐refinement until ≤ max_particles or max_level.
+//
+   void fmm_subdivide(
+       FMMCell*                      cell,
+       const std::vector<double>&    x,
+       const std::vector<double>&    y,
+       int                           max_particles,
+       int                           max_level
+   );
+//
+//   2) fmm_upward_pass: P2M in leaves, then M2M up the tree to build multipoles.
+//
+   void fmm_upward_pass(
+       FMMCell*                      cell,
+       const std::vector<double>&    x,
+       const std::vector<double>&    y,
+       const std::vector<double>&    m
+   );
+//
+//   3) fmm_m2l_translation: core M2L translation from one source node to one target node.
+//
+   void fmm_m2l_translation(
+       FMMCell*                      target,
+       FMMCell*                      source
+   );
+//
+//   4) fmm_interaction_pass: traverse tree to do M2L for each node.
+//
+   void fmm_interaction_pass(
+       FMMCell*                      cell,
+       FMMCell*                      root,
+       double                        theta
+   );
+//
+//   5) fmm_downward_pass: L2L to propagate local expansions from parent to children.
+//
+   void fmm_downward_pass(
+       FMMCell*                      cell
+   );
+//
+//   6) fmm_evaluate_forces: single‐threaded final force evaluation (direct + local).
+//      (We will _replace_ calls to fmm_evaluate_forces with a parallel version.)
+//
+   void fmm_evaluate_forces(
+       FMMCell*                        cell,
+       const std::vector<double>&      x,
+       const std::vector<double>&      y,
+       const std::vector<double>&      m,
+       std::vector<double>&            fx,
+       std::vector<double>&            fy,
+       double                          G,
+       double                          soft2
+   );
 
-void fmm_subdivide(FMMCell* cell,
-                   const std::vector<double>& x,
-                   const std::vector<double>& y,
-                   int max_particles,
-                   int max_level);
-
-void fmm_upward_pass(FMMCell* cell,
-                     const std::vector<double>& x,
-                     const std::vector<double>& y,
-                     const std::vector<double>& m);
-
-void fmm_interaction_pass(FMMCell* cell,
-                          FMMCell* root,
-                          double theta);
-
-void fmm_downward_pass(FMMCell* cell);
-
-// ------------------------------------------------------------------------------------------------
-//  Revised, parallelized version of evaluate_forces. We collect all leaf pointers into `leaf_list`
-//  and distribute “leaf‐by‐leaf” to multiple OpenMP threads. Inside each leaf, we do two steps:
-//    1) Near‐field direct: Compute pairwise O(n_leaf²) among that leaf’s particles.
-//    2) Far‐field local expansion: Evaluate the “local expansion” at each particle in that leaf.
-//  We protect every fx[i] += …, fy[i] += … with `#pragma omp atomic` to avoid data races.
-//  
-//  Note: the *original* single‐threaded implementation of fmm_evaluate_forces can be copied into
-//  some separate function if you wish. Here, for clarity, we assume the code below is the ONLY
-//  evaluate_forces that will be used (i.e. we no longer call the old serial version).
-// ------------------------------------------------------------------------------------------------
+// ============================================================================
+// PARALLEL VERSION OF EVALUATE_FORCES (LEAF‐BY‐LEAF using OpenMP)
+// ============================================================================
 
 /**
  * parallel_fmm_evaluate_forces(root, x, y, m, fx, fy, G, soft2)
  *
- * Given a fully‐built and fully‐translated FMM tree (all multipole/local expansions done),
- * this function:
- *   1) Traverses the tree to collect all leaf cells into `leaf_list`.
- *   2) Splits `leaf_list` among OpenMP threads so that each thread simultaneously
- *      processes several leaves. Inside each leaf:
- *        a) Compute near‐field direct among that leaf’s particles.
- *        b) Add local expansion (L2P) contribution at each particle.
+ * Given a fully built FMM tree (with all multipole/local expansions done),
+ * this function collects all leaf pointers, then in parallel (OpenMP) loops
+ * over leaves.  Each leaf does two things:
+ *   1) Near‐field: direct pairwise interactions among particles in that leaf.
+ *   2) Far‐field: evaluate the local expansion (L2P) at each particle in that leaf.
  *
- * @param root   Root pointer of FMM tree.
- * @param x, y, m Vectors of size N (particle positions & masses).
- * @param fx, fy Vectors to accumulate forces (initialized outside to zeros).
- * @param G      Gravitational constant.
- * @param soft2  Softening length squared.
+ * We use #pragma omp atomic when updating fx[i], fy[i] to avoid race conditions.
  */
-static void parallel_fmm_evaluate_forces(FMMCell* root,
-                                         const std::vector<double>& x,
-                                         const std::vector<double>& y,
-                                         const std::vector<double>& m,
-                                         std::vector<double>& fx,
-                                         std::vector<double>& fy,
-                                         double G,
-                                         double soft2)
-{
+static void parallel_fmm_evaluate_forces(
+    FMMCell*                         root,
+    const std::vector<double>&       x,
+    const std::vector<double>&       y,
+    const std::vector<double>&       m,
+    std::vector<double>&             fx,
+    std::vector<double>&             fy,
+    double                           G,
+    double                           soft2
+) {
     // (a) Build a flat list of all leaf cells
     std::vector<FMMCell*> leaf_list;
-    leaf_list.reserve(x.size() / 4 + 1);  // heuristic: expect ~N/4 leaves
+    leaf_list.reserve(x.size()/4 + 1);  // heuristic
     collect_leaves(root, leaf_list);
     size_t num_leaves = leaf_list.size();
 
@@ -169,12 +216,10 @@ static void parallel_fmm_evaluate_forces(FMMCell* root,
     #endif
     for (size_t idx = 0; idx < num_leaves; ++idx) {
         FMMCell* leaf = leaf_list[idx];
-
-        // Each leaf has a small vector of particle indices
         const std::vector<size_t>& plist = leaf->particles;
         size_t leaf_n = plist.size();
 
-        // ----- (1) NEAR-FIELD DIRECT within this leaf -----
+        // ---- (1) NEAR‐FIELD DIRECT within this leaf ----
         for (size_t a = 0; a < leaf_n; ++a) {
             size_t i = plist[a];
             for (size_t b = a + 1; b < leaf_n; ++b) {
@@ -187,7 +232,7 @@ static void parallel_fmm_evaluate_forces(FMMCell* root,
                 double fijx = G * m[j] * dx * inv_r3;
                 double fijy = G * m[j] * dy * inv_r3;
 
-                // Update forces on i and j (atomic to avoid races)
+                // update forces atomically
                 #ifdef USE_OPENMP
                 #pragma omp atomic
                 #endif
@@ -208,34 +253,31 @@ static void parallel_fmm_evaluate_forces(FMMCell* root,
             }
         }
 
-        // ----- (2) FAR-FIELD LOCAL EXPANSION (L2P) from leaf->local -----
-        // We assume that `leaf->local[k]` is the k-th coefficient of the local expansion
-        // around leaf->(cx,cy). We now evaluate its gradient at each particle in this leaf.
+        // ---- (2) FAR‐FIELD: evaluate L2P (local expansion) at each particle ----
         double cx = leaf->cx;
         double cy = leaf->cy;
-        const std::vector<cplx>& L = leaf->local;  // local expansion coefficients
-        int P = static_cast<int>(L.size());         // number of expansion terms
+        const std::vector<cplx>& L = leaf->local;
+        int Psize = static_cast<int>(L.size());  // should equal (P+1)
 
         for (size_t a = 0; a < leaf_n; ++a) {
             size_t i = plist[a];
-            // Relative coordinate from leaf center
             double rx = x[i] - cx;
             double ry = y[i] - cy;
-            cplx z(rx, ry);    // represent as complex z = rx + i ry
+            cplx z(rx, ry);
 
-            // Evaluate gradient of local expansion: ∑_{n=1..P−1} [ n * L[n] * z^(n-1) ]
-            cplx dz(0.0, 0.0); // will accumulate dφ/dx + i·dφ/dy
-            cplx power(1.0, 0.0);  // will be z^(n-1) at step n
+            // Evaluate ∇φ from local expansion: sum_{n=1..P} n * L[n] * z^(n-1)
+            cplx dz(0.0, 0.0);
+            cplx power(1.0, 0.0);   // z^(n-1)
 
-            for (int n = 1; n < P; ++n) {
-                // derivative term for z^n is n * L[n] * z^(n−1)
+            for (int n = 1; n < Psize; ++n) {
                 dz += static_cast<double>(n) * L[n] * power;
-                power *= z;  // update power = z^(n)
+                power *= z;   // next power = z^n
             }
 
-            // Convert complex derivative to real force components
-            double lok_x =  dz.real();    // ∂φ/∂x
-            double lok_y = -dz.imag();    // ∂φ/∂y (sign depends on polynomial convention)
+            // Convert complex gradient to real force
+            //  ∂φ/∂x =  Re(dz),   ∂φ/∂y = −Im(dz)  (convention for 2D FMM)
+            double lok_x =  dz.real();
+            double lok_y = -dz.imag();
 
             #ifdef USE_OPENMP
             #pragma omp atomic
@@ -249,46 +291,43 @@ static void parallel_fmm_evaluate_forces(FMMCell* root,
     }
 }
 
+// ============================================================================
+// PYBIND11 WRAPPER: fmm_omp()
+// ============================================================================
+
 /**
  * fmm_omp(x, y, m, domain, theta, G, soft)
  *
- * Pybind11 binding entry point. This is the function that Python calls:
- *   ax, ay = fmm_kernel.fmm_omp(x_array, y_array, m_array, domain, theta, G, soft)
+ * Python‐callable entry point.  Steps:
+ *   1) Copy input NumPy arrays (x,y,m) into C++ vectors vx, vy, vm.
+ *   2) Build root FMMCell with center=(0,0), half-size=(domain/2).
+ *   3) Assign all N particles to root->particles, then call fmm_subdivide(…,16,10).
+ *   4) fmm_upward_pass(root, vx, vy, vm)  // P2M + M2M
+ *   5) fmm_interaction_pass(root, root, theta)  // M2L
+ *   6) fmm_downward_pass(root)  // L2L
+ *   7) parallel_fmm_evaluate_forces(root, vx, vy, vm, fx, fy, G, soft2)
+ *   8) Copy fx,fy into two NumPy arrays and return (ax,ay).
+ *   9) Delete the entire tree (avoid memory leak).
  *
- * Steps:
- *   1) Copy input NumPy arrays to std::vector<double>
- *   2) Build root cell (center=0,0; half-size=domain/2) and put all N particles in it
- *   3) Call fmm_subdivide(...) to create the quadtree (leaf_size ≤ 16 or max_level=10)
- *   4) fmm_upward_pass(...)   – compute multipole expansions
- *   5) fmm_interaction_pass(...) – do M2L between well-separated cells
- *   6) fmm_downward_pass(...)   – propagate local expansions downward (L2L)
- *   7) parallel_fmm_evaluate_forces(...)   – in parallel, each leaf does near-field + L2P
- *   8) Copy fx/fy into NumPy arrays and return as (ax, ay)
- *   9) Delete the tree (avoid memory leak)
- *
- * @param x      (NumPy array[N]) x‐coordinates
- * @param y      (NumPy array[N]) y‐coordinates
- * @param m      (NumPy array[N]) masses
- * @param domain Half‐length of bounding box
- * @param theta  Multipole acceptance criterion
- * @param G      Gravitational constant
- * @param soft   Softening length (we square it inside)
- * @return       Tuple of two NumPy arrays (ax, ay), each length N
+ * Returns a tuple (ax_array, ay_array) of length N each.
  */
-py::tuple fmm_omp(py::array_t<double> x,
-                  py::array_t<double> y,
-                  py::array_t<double> m,
-                  double domain,
-                  double theta,
-                  double G = 1.0,
-                  double soft = 0.05) {
+py::tuple fmm_omp(
+    py::array_t<double> x,
+    py::array_t<double> y,
+    py::array_t<double> m,
+    double              domain,
+    double              theta = 0.5,
+    double              G     = 1.0,
+    double              soft  = 0.05
+) {
     size_t N = x.size();
     if (N == 0) {
+        // Return two empty arrays if there are no particles
         return py::make_tuple(py::array_t<double>(0),
                               py::array_t<double>(0));
     }
 
-    // Copy NumPy arrays into C++ vectors
+    // Copy NumPy arrays -> std::vector<double>
     std::vector<double> vx(N), vy(N), vm(N);
     for (size_t i = 0; i < N; ++i) {
         vx[i] = x.at(i);
@@ -296,9 +335,8 @@ py::tuple fmm_omp(py::array_t<double> x,
         vm[i] = m.at(i);
     }
 
-    // Prepare force accumulators
+    // Prepare force vectors
     std::vector<double> fx(N, 0.0), fy(N, 0.0);
-
     double soft2 = soft * soft;
 
     // (1) Build root cell and insert all particles
@@ -306,24 +344,23 @@ py::tuple fmm_omp(py::array_t<double> x,
     {
         root->particles.resize(N);
         std::iota(root->particles.begin(), root->particles.end(), 0u);
-
-        // Subdivide until each leaf ≤ 16 particles or depth ≤ 10
+        // Subdivide until each leaf has ≤ 16 particles or depth ≤ 10
         fmm_subdivide(root, vx, vy, /*max_particles=*/16, /*max_level=*/10);
     }
 
-    // (2) Upward Pass: P2M & M2M build multipole expansions
+    // (2) Upward Pass: P2M + M2M
     fmm_upward_pass(root, vx, vy, vm);
 
-    // (3) Interaction Pass: M2L between well-separated cells
+    // (3) Interaction Pass: M2L
     fmm_interaction_pass(root, root, theta);
 
-    // (4) Downward Pass: L2L propagate local expansions
+    // (4) Downward Pass: L2L
     fmm_downward_pass(root);
 
-    // (5) Evaluate forces in parallel over leaf nodes
+    // (5) Parallel Evaluate: leaf‐by‐leaf near‐field + local expansion
     parallel_fmm_evaluate_forces(root, vx, vy, vm, fx, fy, G, soft2);
 
-    // (6) Copy back to NumPy arrays
+    // (6) Copy C++ force arrays back to NumPy arrays
     auto ax_out = py::array_t<double>(N);
     auto ay_out = py::array_t<double>(N);
     auto pax = ax_out.mutable_unchecked<1>();
@@ -333,68 +370,36 @@ py::tuple fmm_omp(py::array_t<double> x,
         pay(i) = fy[i];
     }
 
-    // (7) Free the quadtree to avoid memory leak
-    std::function<void(FMMCell*)> delete_tree = [&](FMMCell* cell) {
-        if (!cell) return;
+    // (7) Delete entire quadtree to free memory
+    std::function<void(FMMCell*)> delete_tree = [&](FMMCell* c) {
+        if (!c) return;
         for (int qi = 0; qi < 4; ++qi) {
-            if (cell->children[qi]) {
-                delete_tree(cell->children[qi].release());
+            if (c->children[qi]) {
+                delete_tree(c->children[qi].release());
             }
         }
-        delete cell;
+        delete c;
     };
     delete_tree(root);
 
     return py::make_tuple(ax_out, ay_out);
 }
 
-// ================================================================================
-//  INSERT HERE YOUR ORIGINAL SINGLE-THREADED IMPLEMENTATIONS OF THESE FUNCTIONS:
-//    void fmm_subdivide(...);
-//    void fmm_upward_pass(...);
-//    void fmm_interaction_pass(...);
-//    void fmm_downward_pass(...);
-//  They must remain exactly as you wrote them before (unmodified), so that the
-//  FMM algorithm itself is unchanged—only the final “evaluate_forces” step is parallel.
-// ================================================================================
+// ============================================================================
+// MODULE DEFINITION
+// ============================================================================
 
-void fmm_subdivide(FMMCell* cell,
-                   const std::vector<double>& x,
-                   const std::vector<double>& y,
-                   int max_particles,
-                   int max_level)
-{
-    // … Copy‐paste your original subdivide code here …
-}
-
-void fmm_upward_pass(FMMCell* cell,
-                     const std::vector<double>& x,
-                     const std::vector<double>& y,
-                     const std::vector<double>& m)
-{
-    // … Copy‐paste your original upward pass code here …
-}
-
-void fmm_interaction_pass(FMMCell* cell,
-                          FMMCell* root,
-                          double theta)
-{
-    // … Copy‐paste your original interaction pass code here …
-}
-
-void fmm_downward_pass(FMMCell* cell)
-{
-    // … Copy‐paste your original downward pass code here …
-}
-
-// =================================================================================
-//  Finally, the PyBind11 module definition. Remains largely unchanged.
-// =================================================================================
 PYBIND11_MODULE(fmm_kernel, m) {
     m.doc() = "High-precision Fast Multipole Method (FMM) with OpenMP acceleration";
+
     m.def("fmm_omp", &fmm_omp,
-          "FMM (OMP‐enabled). Args: x,y,m (arrays), domain, theta, G, soft. "
-          "Returns: (ax, ay) arrays.",
+          "FMM (OMP-enabled). Args:\n"
+          "  x, y, m      : 1D arrays of length N (positions & masses)\n"
+          "  domain       : half‐width of bounding box\n"
+          "  theta        : opening angle (M2L criterion)\n"
+          "  G            : gravitational constant (default=1.0)\n"
+          "  soft         : softening length (default=0.05)\n"
+          "Returns (ax, ay): two 1D arrays of length N with force components.",
           py::arg("x"), py::arg("y"), py::arg("m"),
           py::arg("domain"), py::arg("theta") = 0.5,
           py::arg("G") = 1.0, py::arg("soft") = 0.05);
