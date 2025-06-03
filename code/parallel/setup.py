@@ -1,4 +1,4 @@
-# setup.py - Fixed version
+# setup.py - Optimized version for better parallelization
 from setuptools import setup, Extension
 import pybind11
 import sys
@@ -16,7 +16,7 @@ def has_openmp():
 
 include_dirs = [pybind11.get_include()]
 
-# Fixed compiler flags without problematic options
+# Optimized compiler flags for better parallel performance
 base_compile_args = [
     "-std=c++17", 
     "-O3", 
@@ -25,16 +25,19 @@ base_compile_args = [
     "-funroll-loops",
     "-fno-signed-zeros",
     "-fno-trapping-math",
-    "-ftree-vectorize"
+    "-ftree-vectorize",
+    "-fopt-info-vec-optimized",  # 修正13: 加入向量化資訊
+    "-mavx2",                    # 修正14: 啟用 AVX2 指令集
+    "-mfma"                      # 修正15: 啟用 FMA 指令
 ]
 
 base_link_args = []
 
-# Add OpenMP
+# Add OpenMP with optimized settings
 if has_openmp():
-    base_compile_args.extend(["-fopenmp"])
+    base_compile_args.extend(["-fopenmp", "-DOMP_DYNAMIC=false"])
     base_link_args.append("-fopenmp")
-    print("✓ OpenMP support detected")
+    print("✓ OpenMP support detected with optimizations")
 else:
     print("✗ OpenMP not available")
 
@@ -62,9 +65,9 @@ fmm_ext = Extension(
 
 setup(
     name="nbody_kernels",
-    version="3.0",
-    author="Fixed Version",
-    description="Fixed PyBind11 + OpenMP kernels for 2D N-Body",
+    version="4.0",
+    author="Fixed Parallel Version",
+    description="Fixed PyBind11 + OpenMP kernels for 2D N-Body with effective parallelization",
     ext_modules=[force_ext, fmm_ext],
     zip_safe=False,
 )

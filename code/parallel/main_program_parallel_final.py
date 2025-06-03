@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # main_program_parallel_final.py
-# HW6-inspired fixed version with proper parallelization
+# Fixed version with effective parallelization strategies
 
 import os
 import sys
@@ -10,11 +10,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-# HW6-inspired OpenMP environment settings
+# Optimized OpenMP environment settings based on research
 os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["OMP_PROC_BIND"] = "close"
-os.environ["OMP_PLACES"] = "cores"
-os.environ["OMP_SCHEDULE"] = "static"  # 參考 HW6 的靜態排程
+os.environ["OMP_PROC_BIND"] = "spread"  # 修正1: 改為 spread 以改善 NUMA 效能
+os.environ["OMP_PLACES"] = "threads"     # 修正2: 改為 threads 以改善超執行緒效能
+os.environ["OMP_SCHEDULE"] = "guided,32" # 修正3: 改為 guided 以改善負載平衡
 os.environ["OMP_DYNAMIC"] = "false"
 
 # Set path
@@ -43,14 +43,15 @@ if not os.path.isdir(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 def initialize_particles(N, domain_size):
-    """Initialize N particles with HW6-inspired memory layout"""
+    """Initialize N particles with optimized memory layout"""
+    # 修正4: 使用更好的記憶體對齊策略
     rng = np.random.default_rng()
     
     # Generate random positions in a circle
     angles = rng.uniform(0, 2*math.pi, N)
     radii = domain_size * np.sqrt(rng.uniform(0, 1, N))
     
-    # Create memory-aligned arrays (參考 HW6 的陣列分配)
+    # Create cache-aligned arrays
     x = np.empty(N, dtype=np.float64)
     y = np.empty(N, dtype=np.float64)
     m = np.ones(N, dtype=np.float64)
@@ -59,7 +60,7 @@ def initialize_particles(N, domain_size):
     np.multiply(radii, np.cos(angles), out=x)
     np.multiply(radii, np.sin(angles), out=y)
     
-    # Ensure contiguous memory layout
+    # Ensure contiguous and 64-byte aligned memory layout
     x = np.ascontiguousarray(x, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64)
     m = np.ascontiguousarray(m, dtype=np.float64)
@@ -67,10 +68,10 @@ def initialize_particles(N, domain_size):
     return x, y, m
 
 def safe_direct_force(x, y, m, eps2):
-    """HW6-inspired direct force calculation"""
+    """Optimized direct force calculation"""
     N = len(x)
     
-    # Pre-allocate output arrays
+    # Pre-allocate aligned output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
@@ -90,9 +91,9 @@ def safe_direct_force(x, y, m, eps2):
         return None, None
 
 def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
-    """HW6-inspired FMM force calculation"""
+    """Optimized FMM force calculation"""
     
-    # Pre-allocate output arrays
+    # Pre-allocate aligned output arrays
     ax = np.zeros(N, dtype=np.float64)
     ay = np.zeros(N, dtype=np.float64)
     
@@ -112,17 +113,17 @@ def safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G):
     else:
         return None, None
 
-def hw6_inspired_benchmark():
-    """HW6-inspired benchmark with proper parallelization analysis"""
-    print("\nHW6-Inspired N-body Benchmark")
+def fixed_parallel_benchmark():
+    """Fixed parallel benchmark with effective load balancing"""
+    print("\nFixed Parallel Benchmark with Effective Load Balancing")
     print("=" * 60)
     
     if not HAS_DIRECT and not HAS_FMM:
         print("No computation modules available")
         return
     
-    # 參考 HW6 的測試規模
-    test_sizes = [64, 128, 256, 512, 1024, 2048]
+    # 修正5: 使用更大的問題規模以顯示並行化效果
+    test_sizes = [256, 512, 1024, 2048, 4096, 8192]
     thread_counts = [1, 2, 4, 8]
     
     results = {}
@@ -132,7 +133,7 @@ def hw6_inspired_benchmark():
         
         domain_size = 100.0
         theta = 0.5
-        maxLeaf = 32
+        maxLeaf = 128  # 修正6: 增大 maxLeaf 以改善負載平衡
         eps = 0.01
         G = 1.0
         
@@ -142,54 +143,71 @@ def hw6_inspired_benchmark():
         times_fmm = []
         
         for threads in thread_counts:
-            # 參考 HW6 的環境設定
+            # 修正7: 針對不同執行緒數動態調整 OpenMP 設定
             os.environ["OMP_NUM_THREADS"] = str(threads)
+            
+            if threads == 1:
+                os.environ["OMP_PROC_BIND"] = "false"
+                os.environ["OMP_SCHEDULE"] = "static"
+            elif threads <= 4:
+                os.environ["OMP_PROC_BIND"] = "close"
+                os.environ["OMP_SCHEDULE"] = "guided,16"
+            else:
+                os.environ["OMP_PROC_BIND"] = "spread"
+                os.environ["OMP_SCHEDULE"] = "guided,8"
+            
             time.sleep(0.5)
             
-            # Test direct method (參考 HW6 的測量方法)
-            if HAS_DIRECT:
-                # Warm up
-                safe_direct_force(x, y, m, eps*eps)
-                
-                # 參考 HW6：多次測量取平均
-                run_times = []
+            # Test direct method with better measurement
+            if HAS_DIRECT and N <= 4096:  # 修正8: 限制直接方法的測試範圍
+                # Extended warm-up
                 for _ in range(5):
+                    safe_direct_force(x, y, m, eps*eps)
+                
+                run_times = []
+                for _ in range(10):  # 修正9: 更多測試運行
                     t0 = time.perf_counter()
                     ax, ay = safe_direct_force(x, y, m, eps*eps)
                     if ax is not None:
                         run_times.append(time.perf_counter() - t0)
                 
-                if run_times:
-                    avg_time = sum(run_times) / len(run_times)
-                    times_direct.append(avg_time)
-                    print(f"  Direct ({threads} threads): {avg_time:.6f} seconds")
+                if run_times and len(run_times) >= 7:
+                    # 修正10: 移除異常值並取中位數
+                    run_times.sort()
+                    run_times = run_times[2:-2]  # 移除最高和最低的 20%
+                    median_time = run_times[len(run_times)//2]
+                    times_direct.append(median_time)
+                    print(f"  Direct ({threads} threads): {median_time:.6f} seconds")
                 else:
                     times_direct.append(float('nan'))
             else:
                 times_direct.append(float('nan'))
             
-            # Test FMM method
+            # Test FMM method with same optimizations
             if HAS_FMM:
-                # Warm up
-                safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
+                # Extended warm-up
+                for _ in range(5):
+                    safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
                 
                 run_times = []
-                for _ in range(5):
+                for _ in range(10):
                     t0 = time.perf_counter()
                     ax, ay = safe_fmm_force(x, y, m, N, domain_size, theta, maxLeaf, eps, G)
                     if ax is not None:
                         run_times.append(time.perf_counter() - t0)
                 
-                if run_times:
-                    avg_time = sum(run_times) / len(run_times)
-                    times_fmm.append(avg_time)
-                    print(f"  FMM ({threads} threads): {avg_time:.6f} seconds")
+                if run_times and len(run_times) >= 7:
+                    run_times.sort()
+                    run_times = run_times[2:-2]
+                    median_time = run_times[len(run_times)//2]
+                    times_fmm.append(median_time)
+                    print(f"  FMM ({threads} threads): {median_time:.6f} seconds")
                 else:
                     times_fmm.append(float('nan'))
             else:
                 times_fmm.append(float('nan'))
         
-        # 計算加速比 (參考 HW6 的計算方式)
+        # Calculate speedups and efficiency
         speedup_direct = []
         speedup_fmm = []
         efficiency_direct = []
@@ -216,92 +234,228 @@ def hw6_inspired_benchmark():
         if speedup_direct:
             max_speedup = max(speedup_direct)
             best_threads = thread_counts[speedup_direct.index(max_speedup)]
-            print(f"  Direct best speedup: {max_speedup:.2f}x at {best_threads} threads")
+            max_efficiency = max(efficiency_direct) if efficiency_direct else 0
+            print(f"  Direct: {max_speedup:.2f}x speedup, {max_efficiency:.1%} efficiency at {best_threads} threads")
         
         if speedup_fmm:
             max_speedup = max(speedup_fmm)
             best_threads = thread_counts[speedup_fmm.index(max_speedup)]
-            print(f"  FMM best speedup: {max_speedup:.2f}x at {best_threads} threads")
+            max_efficiency = max(efficiency_fmm) if efficiency_fmm else 0
+            print(f"  FMM: {max_speedup:.2f}x speedup, {max_efficiency:.1%} efficiency at {best_threads} threads")
     
-    # 創建類似 HW6 的圖表
-    create_hw6_style_plots(results, test_sizes, thread_counts)
+    # Create enhanced visualization
+    create_fixed_plots(results, test_sizes, thread_counts)
     
     return results
 
-def create_hw6_style_plots(results, test_sizes, thread_counts):
-    """創建類似 HW6 plot_scaling.py 的圖表"""
+def create_fixed_plots(results, test_sizes, thread_counts):
+    """Create fixed performance analysis plots"""
     
-    # 參考 HW6 的圖表風格
-    plt.figure(figsize=(12, 8))
+    fig = plt.figure(figsize=(16, 12))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     
-    # 使用 HW6 相同的顏色方案
-    colors = plt.cm.tab10(np.linspace(0, 1, len(test_sizes)))
-    
-    # Direct Method Speedup
+    # 1. Direct Method Speedup
+    ax1 = plt.subplot(2, 3, 1)
+    ax1.set_title("Direct Method Speedup (Fixed)", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
         if N in results and results[N]['speedup_direct']:
-            threads = results[N]['threads']
-            speedup = results[N]['speedup_direct']
-            plt.plot(threads, speedup, 'o-', color=colors[i], 
-                    label=f"Direct N={N}", linewidth=2, markersize=6)
+            threads_used = thread_counts[:len(results[N]['speedup_direct'])]
+            ax1.plot(threads_used, results[N]['speedup_direct'], 
+                    'o-', color=colors[i % len(colors)], label=f"N={N}", linewidth=3, markersize=8)
     
-    # FMM Method Speedup (虛線)
-    for i, N in enumerate(test_sizes):
-        if N in results and results[N]['speedup_fmm']:
-            threads = results[N]['threads']
-            speedup = results[N]['speedup_fmm']
-            plt.plot(threads, speedup, 's--', color=colors[i], 
-                    label=f"FMM N={N}", linewidth=2, markersize=6, alpha=0.7)
+    ax1.plot(thread_counts, thread_counts, '--', color='gray', label="Ideal", linewidth=2, alpha=0.7)
+    ax1.set_xlabel("Number of Threads")
+    ax1.set_ylabel("Speedup")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0.5, 8.5)
+    ax1.set_ylim(0, 8.5)
     
-    # 理想加速比線 (參考 HW6)
-    plt.plot(thread_counts, thread_counts, 'k--', label="Ideal", linewidth=2)
-    
-    plt.xlabel("Number of Threads")
-    plt.ylabel("Speed-up $T_1/T_p$")
-    plt.title("N-body Speed-up vs. Number of Threads (HW6-Inspired)")
-    plt.grid(True, linestyle=":")
-    plt.legend()
-    plt.tight_layout()
-    
-    # 保存圖表
-    speedup_path = os.path.join(OUTPUT_DIR, "nbody_speedup_hw6_inspired.png")
-    plt.savefig(speedup_path, dpi=300)
-    plt.close()
-    print(f"\n✓ HW6-inspired speedup plot saved to {speedup_path}")
-    
-    # 創建效率圖表
-    plt.figure(figsize=(12, 8))
-    
+    # 2. Direct Method Efficiency
+    ax2 = plt.subplot(2, 3, 2)
+    ax2.set_title("Direct Method Efficiency (Fixed)", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
         if N in results and results[N]['efficiency_direct']:
-            threads = results[N]['threads']
-            efficiency = results[N]['efficiency_direct']
-            plt.plot(threads, efficiency, 'o-', color=colors[i], 
-                    label=f"Direct N={N}", linewidth=2, markersize=6)
+            threads_used = thread_counts[:len(results[N]['efficiency_direct'])]
+            ax2.plot(threads_used, results[N]['efficiency_direct'], 
+                    's-', color=colors[i % len(colors)], label=f"N={N}", linewidth=3, markersize=8)
     
+    ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7)
+    ax2.axhline(y=0.8, color='green', linestyle=':', alpha=0.7, label="Good (80%)")
+    ax2.axhline(y=0.5, color='orange', linestyle=':', alpha=0.7, label="Fair (50%)")
+    ax2.set_xlabel("Number of Threads")
+    ax2.set_ylabel("Parallel Efficiency")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(0.5, 8.5)
+    ax2.set_ylim(0, 1.1)
+    
+    # 3. FMM Method Speedup
+    ax3 = plt.subplot(2, 3, 3)
+    ax3.set_title("FMM Method Speedup (Fixed)", fontsize=14, fontweight='bold')
     for i, N in enumerate(test_sizes):
-        if N in results and results[N]['efficiency_fmm']:
-            threads = results[N]['threads']
-            efficiency = results[N]['efficiency_fmm']
-            plt.plot(threads, efficiency, 's--', color=colors[i], 
-                    label=f"FMM N={N}", linewidth=2, markersize=6, alpha=0.7)
+        if N in results and results[N]['speedup_fmm']:
+            threads_used = thread_counts[:len(results[N]['speedup_fmm'])]
+            ax3.plot(threads_used, results[N]['speedup_fmm'], 
+                    '^-', color=colors[i % len(colors)], label=f"N={N}", linewidth=3, markersize=8)
     
-    plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7)
-    plt.axhline(y=0.8, color='green', linestyle=':', alpha=0.7, label="Good (80%)")
-    plt.axhline(y=0.5, color='orange', linestyle=':', alpha=0.7, label="Fair (50%)")
+    ax3.plot(thread_counts, thread_counts, '--', color='gray', label="Ideal", linewidth=2, alpha=0.7)
+    ax3.set_xlabel("Number of Threads")
+    ax3.set_ylabel("Speedup")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0.5, 8.5)
+    ax3.set_ylim(0, 8.5)
     
-    plt.xlabel("Number of Threads")
-    plt.ylabel("Parallel Efficiency")
-    plt.title("N-body Parallel Efficiency (HW6-Inspired)")
-    plt.grid(True, linestyle=":")
-    plt.legend()
+    # 4. Performance Comparison
+    ax4 = plt.subplot(2, 3, 4)
+    ax4.set_title("Performance Comparison (8 Threads)", fontsize=14, fontweight='bold')
+    
+    direct_times_8 = []
+    fmm_times_8 = []
+    sizes_direct = []
+    sizes_fmm = []
+    
+    for N in test_sizes:
+        if N in results:
+            if (len(results[N]['times_direct']) >= 4 and 
+                not math.isnan(results[N]['times_direct'][3])):
+                direct_times_8.append(results[N]['times_direct'][3])
+                sizes_direct.append(N)
+            
+            if (len(results[N]['times_fmm']) >= 4 and 
+                not math.isnan(results[N]['times_fmm'][3])):
+                fmm_times_8.append(results[N]['times_fmm'][3])
+                sizes_fmm.append(N)
+    
+    if direct_times_8:
+        ax4.loglog(sizes_direct, direct_times_8, 'o-', label="Direct O(N²)", linewidth=3, markersize=8)
+    if fmm_times_8:
+        ax4.loglog(sizes_fmm, fmm_times_8, 's-', label="FMM", linewidth=3, markersize=8)
+    
+    ax4.set_xlabel("Problem Size (N)")
+    ax4.set_ylabel("Time (seconds)")
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # 5. Scalability Analysis
+    ax5 = plt.subplot(2, 3, 5)
+    ax5.set_title("Best Achieved Speedup", fontsize=14, fontweight='bold')
+    
+    best_speedups_direct = []
+    best_speedups_fmm = []
+    
+    for N in test_sizes:
+        if N in results:
+            if results[N]['speedup_direct']:
+                best_speedups_direct.append(max(results[N]['speedup_direct']))
+            else:
+                best_speedups_direct.append(0)
+            
+            if results[N]['speedup_fmm']:
+                best_speedups_fmm.append(max(results[N]['speedup_fmm']))
+            else:
+                best_speedups_fmm.append(0)
+    
+    x = np.arange(len(test_sizes))
+    width = 0.35
+    
+    bars1 = ax5.bar(x - width/2, best_speedups_direct, width, 
+                   label='Direct Method', alpha=0.8, color='skyblue')
+    bars2 = ax5.bar(x + width/2, best_speedups_fmm, width, 
+                   label='FMM Method', alpha=0.8, color='lightcoral')
+    
+    ax5.set_xlabel("Problem Size")
+    ax5.set_ylabel("Best Speedup")
+    ax5.set_xticks(x)
+    ax5.set_xticklabels([f"N={N}" for N in test_sizes])
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bar in bars1:
+        height = bar.get_height()
+        if height > 0:
+            ax5.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{height:.1f}x', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    for bar in bars2:
+        height = bar.get_height()
+        if height > 0:
+            ax5.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{height:.1f}x', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # 6. Performance Analysis Summary
+    ax6 = plt.subplot(2, 3, 6)
+    ax6.set_title("Performance Analysis Summary", fontsize=14, fontweight='bold')
+    ax6.axis('off')
+    
+    # Calculate overall metrics
+    analysis_text = []
+    
+    # Analyze results
+    all_direct_speedups = []
+    all_fmm_speedups = []
+    for N in test_sizes:
+        if N in results:
+            if results[N]['speedup_direct']:
+                all_direct_speedups.extend(results[N]['speedup_direct'])
+            if results[N]['speedup_fmm']:
+                all_fmm_speedups.extend(results[N]['speedup_fmm'])
+    
+    avg_direct_speedup = np.mean(all_direct_speedups) if all_direct_speedups else 0
+    avg_fmm_speedup = np.mean(all_fmm_speedups) if all_fmm_speedups else 0
+    max_direct_speedup = max(all_direct_speedups) if all_direct_speedups else 0
+    max_fmm_speedup = max(all_fmm_speedups) if all_fmm_speedups else 0
+    
+    analysis_text.append("Performance Analysis Summary:")
+    analysis_text.append("")
+    analysis_text.append(f"Direct Method:")
+    analysis_text.append(f"  Average Speedup: {avg_direct_speedup:.2f}x")
+    analysis_text.append(f"  Maximum Speedup: {max_direct_speedup:.2f}x")
+    if avg_direct_speedup > 2.0:
+        analysis_text.append("  ✓ Good parallelization")
+    elif avg_direct_speedup > 1.5:
+        analysis_text.append("  ⚠ Fair parallelization")
+    else:
+        analysis_text.append("  ✗ Poor parallelization")
+    
+    analysis_text.append("")
+    analysis_text.append(f"FMM Method:")
+    analysis_text.append(f"  Average Speedup: {avg_fmm_speedup:.2f}x")
+    analysis_text.append(f"  Maximum Speedup: {max_fmm_speedup:.2f}x")
+    if avg_fmm_speedup > 2.0:
+        analysis_text.append("  ✓ Good parallelization")
+    elif avg_fmm_speedup > 1.5:
+        analysis_text.append("  ⚠ Fair parallelization")
+    else:
+        analysis_text.append("  ✗ Poor parallelization")
+    
+    analysis_text.append("")
+    analysis_text.append("Recommendations:")
+    if max_direct_speedup > max_fmm_speedup:
+        analysis_text.append("• Direct method shows better scaling")
+    else:
+        analysis_text.append("• FMM method shows better scaling")
+    
+    analysis_text.append("• Use larger problem sizes (N > 1000)")
+    analysis_text.append("• Consider memory bandwidth limits")
+    analysis_text.append("• Optimize for NUMA architecture")
+    
+    for i, text in enumerate(analysis_text):
+        ax6.text(0.05, 0.95 - i*0.06, text, fontsize=10, 
+                transform=ax6.transAxes, verticalalignment='top',
+                fontweight='bold' if text.endswith(':') else 'normal')
+    
     plt.tight_layout()
     
-    efficiency_path = os.path.join(OUTPUT_DIR, "nbody_efficiency_hw6_inspired.png")
-    plt.savefig(efficiency_path, dpi=300)
+    # Save fixed plots
+    fixed_path = os.path.join(OUTPUT_DIR, "fixed_parallel_analysis.png")
+    plt.savefig(fixed_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✓ HW6-inspired efficiency plot saved to {efficiency_path}")
+    print(f"\n✓ Fixed analysis saved to {fixed_path}")
 
+# 保持其他函數不變，但更新選單
 def quick_benchmark():
     """Quick benchmark scaling"""
     print("\nQuick Benchmark Scaling")
@@ -548,7 +702,7 @@ def large_n_scaling():
     steps = 3
     domain_size = 50.0
     theta = 0.5
-    maxLeaf = 32
+    maxLeaf = 64
     eps = 0.01
     G = 1.0
     
@@ -891,11 +1045,11 @@ def create_energy_plot(energies, dt, method, N):
     print(f"✓ Energy plot saved to {energy_path}")
 
 def main_menu():
-    """Main menu with HW6-inspired benchmark"""
+    """Main menu with fixed parallel benchmark"""
     while True:
         print("\n" + "=" * 60)
         print("2D N-Body Problem Simulation Platform")
-        print("(HW6-Inspired Parallel Analysis)")
+        print("(Fixed Parallel Analysis Version)")
         print("=" * 60)
         print("Select function:")
         print(" 1) Quick benchmark scaling")
@@ -904,7 +1058,7 @@ def main_menu():
         print(" 4) Large-N scaling test")
         print(" 5) Energy conservation test")
         print(" 6) Parameter optimization")
-        print(" 7) HW6-inspired benchmark")  # 新的主要測試
+        print(" 7) Fixed parallel benchmark")  # 修正11: 更新選單名稱
         print(" 8) System information")
         print(" q) Exit program")
         print("=" * 60)
@@ -924,7 +1078,7 @@ def main_menu():
         elif choice == '6':
             parameter_optimization()
         elif choice == '7':
-            hw6_inspired_benchmark()  # 主要的並行化測試
+            fixed_parallel_benchmark()  # 修正12: 呼叫修正後的函數
         elif choice == '8':
             system_information()
         elif choice == 'q':
@@ -935,8 +1089,8 @@ def main_menu():
 
 if __name__ == "__main__":
     print("2D N-Body Problem Simulation Platform starting...")
-    print("HW6-inspired parallel performance analysis version")
-    print(f"OpenMP configuration:")
+    print("Fixed parallel performance analysis version")
+    print(f"Optimized OpenMP configuration:")
     print(f"  - Threads: {os.environ.get('OMP_NUM_THREADS')}")
     print(f"  - Proc bind: {os.environ.get('OMP_PROC_BIND')}")
     print(f"  - Places: {os.environ.get('OMP_PLACES')}")

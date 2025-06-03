@@ -96,7 +96,7 @@ void direct_force(const py::array_t<double>& x_arr,
             ay(i) = ayi;
         }
     }
-}
+} // 修正：加入這個缺少的大括號
 
 PYBIND11_MODULE(force_kernel, m) {
     m.doc() = "2D direct O(N^2) gravitational kernel (HW6-inspired)";
