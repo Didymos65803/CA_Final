@@ -43,7 +43,7 @@ print(f"Compiler flags: {base_args}")
 ext_modules = [
     Pybind11Extension(
         "force_kernel",
-        ["force_kernel.cpp"],
+        ["force_kernel_full.cpp"],
         include_dirs=[pybind11.get_include()],
         language='c++',
         cxx_std=17,
@@ -52,7 +52,7 @@ ext_modules = [
     ),
     Pybind11Extension(
         "fmm_kernel", 
-        ["fmm_kernel.cpp"],
+        ["fmm_kernel_full.cpp"],
         include_dirs=[pybind11.get_include()],
         language='c++',
         cxx_std=17,
@@ -62,7 +62,7 @@ ext_modules = [
 ]
 
 setup(
-    name="nbody_kernels_full",
+    name="nbody_kernels",
     version="1.0.0",
     description="High-precision N-body simulation kernels",
     ext_modules=ext_modules,

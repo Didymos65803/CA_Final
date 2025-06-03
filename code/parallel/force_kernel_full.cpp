@@ -155,40 +155,54 @@ void bh_insert_particle(BHNode* node, int particle_id,
 }
 
 // Compute force using Barnes-Hut with proper theta criterion
-void bh_compute_force(const BHNode* node, double px, double py, double theta, double G, double soft2,
+void bh_compute_force(const BHNode* node, double px, double py, int current_particle_id,
+                      const std::vector<double>& x, const std::vector<double>& y, 
+                      const std::vector<double>& m, double theta, double G, double soft2,
                       double& fx, double& fy) {
     
     if (!node || node->total_mass == 0.0) return;
     
-    const double dx = node->center_of_mass_x - px;
-    const double dy = node->center_of_mass_y - py;
-    const double r2 = dx * dx + dy * dy + soft2;
-    
-    if (r2 < 1e-20) return; // Avoid self-interaction
-    
-    const double r = std::sqrt(r2);
-    
-    // Barnes-Hut approximation criterion: s/d < theta
-    const bool use_approximation = node->is_leaf || (node->size / r < theta);
-    
-    if (use_approximation) {
-        // Use this node's center of mass
-        const double inv_r = 1.0 / r;
-        const double inv_r3 = inv_r * inv_r * inv_r;
-        const double force = G * node->total_mass * inv_r3;
-        
-        fx += force * dx;
-        fy += force * dy;
+    if (node->is_leaf) {
+        // FIXED: Direct calculation for all particles in leaf
+        for (int particle_id : node->particle_indices) {
+            if (particle_id == current_particle_id) continue; // Skip self-interaction
+            
+            const double dx = x[particle_id] - px;
+            const double dy = y[particle_id] - py;
+            const double r2 = dx * dx + dy * dy + soft2;
+            
+            if (r2 > 1e-20) { // Avoid division by zero
+                const double inv_r = 1.0 / std::sqrt(r2);
+                const double inv_r3 = inv_r * inv_r * inv_r;
+                
+                fx += G * m[particle_id] * dx * inv_r3;
+                fy += G * m[particle_id] * dy * inv_r3;
+            }
+        }
     } else {
-        // Recurse to children
-        for (const auto& child : node->children) {
-            if (child) {
-                bh_compute_force(child.get(), px, py, theta, G, soft2, fx, fy);
+        // Internal node: check approximation criterion
+        const double dx = node->center_of_mass_x - px;
+        const double dy = node->center_of_mass_y - py;
+        const double r2 = dx * dx + dy * dy + soft2;
+        const double r = std::sqrt(r2);
+        
+        if (node->size / r < theta && r2 > 1e-20) {
+            // Use center of mass approximation
+            const double inv_r = 1.0 / r;
+            const double inv_r3 = inv_r * inv_r * inv_r;
+            
+            fx += G * node->total_mass * dx * inv_r3;
+            fy += G * node->total_mass * dy * inv_r3;
+        } else {
+            // Recurse to children
+            for (const auto& child : node->children) {
+                if (child) {
+                    bh_compute_force(child.get(), px, py, current_particle_id, x, y, m, theta, G, soft2, fx, fy);
+                }
             }
         }
     }
 }
-
 // Main Barnes-Hut function
 py::tuple bh_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<double> m,
                  double domain, double theta = 0.5, double G = 1.0, double soft = 0.05) {
@@ -233,8 +247,8 @@ py::tuple bh_omp(py::array_t<double> x, py::array_t<double> y, py::array_t<doubl
         double fx = 0.0, fy = 0.0;
         
         try {
-            bh_compute_force(root.get(), vx[i], vy[i], theta, G, soft2, fx, fy);
-        } catch (...) {
+        bh_compute_force(root.get(), vx[i], vy[i], i, vx, vy, vm, theta, G, soft2, fx, fy);
+	} catch (...) {
             // Fallback to direct calculation for this particle
             for (size_t j = 0; j < N; ++j) {
                 if (i == j) continue;
