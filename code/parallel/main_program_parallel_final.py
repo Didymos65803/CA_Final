@@ -5,6 +5,11 @@ main_program_parallel_final.py
 Interactive 2-D N-body playground with optimized high-precision kernels
 Fixed Barnes-Hut parameters and enhanced user experience
 
+ENHANCED VERSION WITH:
+- OpenMP thread detection and benchmarking
+- Unique output filenames for each method
+- Thread performance comparison
+
 Menu
 -----
 1. Quick benchmark               → benchmark_scaling.png
@@ -13,6 +18,8 @@ Menu
 4. Large-N scaling test          → scaling_largeN.png + scaling_largeN.csv
 5. Energy conservation test      → energy_conservation.png
 6. Parameter optimization        → Find best settings
+7. OpenMP thread benchmark       → Compare single vs multi-threaded
+8. System information           → Show OpenMP details
 q. Quit
 """
 
@@ -61,6 +68,233 @@ OPTIMIZED_PARAMS = {
     'distribution_size': 50.0,  # Reduced clustering
     'mass_range': (0.5, 2.0),   # Reduced mass variation
 }
+
+def get_unique_filename(base_name, solver=None, N=None, steps=None, extension=None):
+    """Generate unique filenames for different methods and parameters"""
+    if extension and not base_name.endswith(extension):
+        base_name = base_name.replace('.png', '').replace('.gif', '')
+    
+    parts = [base_name]
+    if solver:
+        parts.append(solver)
+    if N:
+        parts.append(f"N{N}")
+    if steps:
+        parts.append(f"steps{steps}")
+    
+    filename = "_".join(parts)
+    if extension:
+        filename += extension
+    elif '.png' in base_name or '.gif' in base_name:
+        filename += '.png' if 'png' in base_name else '.gif'
+    
+    return filename
+
+def get_openmp_info():
+    """Get OpenMP information from the compiled modules"""
+    info = {
+        'threads_available': int(os.environ.get('OMP_NUM_THREADS', 1)),
+        'has_openmp': False,
+        'max_threads': 1
+    }
+    
+    try:
+        # Check if modules have OpenMP support
+        if hasattr(direct_omp, '__module__'):
+            # Try to get OpenMP info from the compiled module
+            import force_kernel
+            if hasattr(force_kernel, 'has_openmp'):
+                info['has_openmp'] = force_kernel.has_openmp
+        
+        # Get system thread count
+        import multiprocessing
+        info['max_threads'] = multiprocessing.cpu_count()
+        
+    except Exception as e:
+        print(f"Warning: Could not detect OpenMP info: {e}")
+    
+    return info
+
+def system_info():
+    """Display system and OpenMP information"""
+    print("\n" + "="*60)
+    print("SYSTEM INFORMATION")
+    print("="*60)
+    
+    info = get_openmp_info()
+    
+    print(f"OpenMP Threads Set: {info['threads_available']}")
+    print(f"System CPU Cores: {info['max_threads']}")
+    print(f"OpenMP Support: {'✓ Yes' if info['has_openmp'] else '❌ No'}")
+    
+    # Test kernel performance
+    print(f"\nTesting kernel performance...")
+    try:
+        N = 100
+        x = np.random.random(N)
+        y = np.random.random(N)
+        m = np.ones(N)
+        
+        t0 = time.time()
+        direct_omp(x, y, m, G=1.0, soft=0.01)
+        direct_time = time.time() - t0
+        
+        t0 = time.time()
+        bh_omp(x, y, m, domain=100.0, theta=0.5, G=1.0, soft=0.01)
+        bh_time = time.time() - t0
+        
+        print(f"Direct kernel: {direct_time*1000:.2f} ms")
+        print(f"Barnes-Hut kernel: {bh_time*1000:.2f} ms")
+        print(f"Performance ratio: {direct_time/bh_time:.1f}x")
+        
+    except Exception as e:
+        print(f"Performance test failed: {e}")
+    
+    print("\nEnvironment Variables:")
+    for var in ['OMP_NUM_THREADS', 'OMP_STACKSIZE', 'OMP_SCHEDULE']:
+        value = os.environ.get(var, 'Not set')
+        print(f"  {var}: {value}")
+
+def openmp_benchmark():
+    """Compare single-threaded vs multi-threaded performance"""
+    print("\n" + "="*60)
+    print("OPENMP THREAD BENCHMARK")
+    print("="*60)
+    
+    # Get current thread count
+    current_threads = int(os.environ.get('OMP_NUM_THREADS', 1))
+    
+    print(f"Current OpenMP threads: {current_threads}")
+    print("Testing different thread counts...")
+    
+    # Test parameters
+    N = int(input("Number of particles for benchmark [500]: ") or "500")
+    solver = (input("Solver to test (direct/bh/fmm) [bh]: ") or "bh").lower()
+    
+    if solver not in SOLVERS:
+        solver = "bh"
+    
+    # Create test data
+    np.random.seed(42)
+    x = (np.random.random(N) - 0.5) * 50.0
+    y = (np.random.random(N) - 0.5) * 50.0
+    m = np.random.uniform(0.5, 2.0, N)
+    
+    # Test different thread counts
+    thread_counts = [1, 2, 4, current_threads] if current_threads > 4 else [1, 2, current_threads]
+    thread_counts = sorted(list(set(thread_counts)))  # Remove duplicates
+    
+    results = []
+    
+    print(f"\nBenchmarking {solver.upper()} with N={N}:")
+    print("Threads  Time (s)  Speedup  Efficiency")
+    print("-" * 40)
+    
+    for threads in thread_counts:
+        # Set thread count
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        
+        # Warmup
+        try:
+            if solver == "direct":
+                direct_omp(x[:10], y[:10], m[:10], G=1.0, soft=0.01)
+            elif solver == "bh":
+                bh_omp(x[:10], y[:10], m[:10], domain=100.0, theta=0.5, G=1.0, soft=0.01)
+            elif solver == "fmm":
+                fmm_omp(x[:10], y[:10], m[:10], domain=100.0, theta=0.4, G=1.0, soft=0.01)
+        except:
+            pass
+        
+        # Benchmark
+        times = []
+        for _ in range(3):  # Run 3 times for stability
+            t0 = time.time()
+            
+            try:
+                if solver == "direct":
+                    direct_omp(x, y, m, G=1.0, soft=0.01)
+                elif solver == "bh":
+                    bh_omp(x, y, m, domain=100.0, theta=0.5, G=1.0, soft=0.01)
+                elif solver == "fmm":
+                    fmm_omp(x, y, m, domain=100.0, theta=0.4, G=1.0, soft=0.01)
+                
+                elapsed = time.time() - t0
+                times.append(elapsed)
+                
+            except Exception as e:
+                print(f"Error with {threads} threads: {e}")
+                times.append(float('inf'))
+        
+        avg_time = min(times)  # Use best time
+        results.append((threads, avg_time))
+        
+        # Calculate speedup and efficiency
+        if threads == 1:
+            baseline_time = avg_time
+            speedup = 1.0
+            efficiency = 1.0
+        else:
+            speedup = baseline_time / avg_time if avg_time > 0 else 0
+            efficiency = speedup / threads
+        
+        print(f"{threads:7d}  {avg_time:7.4f}  {speedup:7.2f}  {efficiency:8.1%}")
+    
+    # Restore original thread count
+    os.environ["OMP_NUM_THREADS"] = str(current_threads)
+    
+    # Create performance plot
+    if len(results) > 1:
+        try:
+            threads_list, times_list = zip(*results)
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            # Time vs threads
+            ax1.plot(threads_list, times_list, 'bo-', linewidth=2, markersize=8)
+            ax1.set_xlabel('Number of Threads', fontsize=12)
+            ax1.set_ylabel('Time (s)', fontsize=12)
+            ax1.set_title(f'{solver.upper()} Performance vs Thread Count (N={N})', fontsize=14)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')
+            
+            # Speedup vs threads
+            baseline = times_list[0]
+            speedups = [baseline / t for t in times_list]
+            ideal_speedup = threads_list
+            
+            ax2.plot(threads_list, speedups, 'ro-', linewidth=2, markersize=8, label='Actual Speedup')
+            ax2.plot(threads_list, ideal_speedup, 'k--', alpha=0.7, label='Ideal Speedup')
+            ax2.set_xlabel('Number of Threads', fontsize=12)
+            ax2.set_ylabel('Speedup', fontsize=12)
+            ax2.set_title('Speedup vs Thread Count', fontsize=14)
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Use unique filename
+            plot_filename = get_unique_filename(f"openmp_benchmark_{solver}", N=N, extension=".png")
+            plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
+            plt.show()
+            print(f"\n✓ Saved {plot_filename}")
+            
+            # Summary
+            max_speedup = max(speedups)
+            best_threads = threads_list[speedups.index(max_speedup)]
+            
+            print(f"\nBenchmark Summary:")
+            print(f"  Best performance: {best_threads} threads")
+            print(f"  Maximum speedup: {max_speedup:.2f}x")
+            print(f"  Current setting: {current_threads} threads")
+            
+            if best_threads != current_threads:
+                print(f"\n💡 Suggestion: Use {best_threads} threads for optimal performance")
+                print(f"   Run with: --threads {best_threads}")
+            
+        except Exception as e:
+            print(f"Could not create plot: {e}")
+    
+    print(f"\nOpenMP analysis complete!")
 
 class Body:
     """Particle container"""
@@ -207,6 +441,11 @@ def total_energy(bodies, include_central: bool = True):
 def quick_benchmark():
     """Benchmark with optimized parameters"""
     print("Running optimized benchmark...")
+    
+    # Show thread info
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
+    
     Ns = [100, 200, 500, 1000]
     times = defaultdict(list)
     errors = defaultdict(list)
@@ -221,7 +460,7 @@ def quick_benchmark():
             ax_ref, ay_ref = compute_acc(bodies, "direct")
             direct_time = time.time() - t0
             times['direct'].append(direct_time)
-            print(f"  Direct:    {direct_time:.4e} s")
+            print(f"  Direct:    {direct_time:.4e} s ({thread_count} threads)")
         else:
             ax_ref, ay_ref = None, None
         
@@ -231,7 +470,7 @@ def quick_benchmark():
             ax, ay = compute_acc(bodies, solver)
             solver_time = time.time() - t0
             times[solver].append(solver_time)
-            print(f"  {solver.upper():8}: {solver_time:.4e} s")
+            print(f"  {solver.upper():8}: {solver_time:.4e} s ({thread_count} threads)")
             
             # Calculate error relative to direct method
             if ax_ref is not None and len(ax) > 0:
@@ -242,7 +481,7 @@ def quick_benchmark():
             else:
                 errors[solver].append(np.nan)
 
-    # Plot results
+    # Plot results with unique filename
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
     # Performance plot
@@ -258,7 +497,7 @@ def quick_benchmark():
     
     ax1.set_xlabel("N particles", fontsize=12)
     ax1.set_ylabel("Wall-clock time (s)", fontsize=12)
-    ax1.set_title("Performance with Optimized Parameters", fontsize=14)
+    ax1.set_title(f"Performance with {thread_count} OpenMP Threads", fontsize=14)
     ax1.grid(True, which="both", alpha=0.3)
     ax1.legend(fontsize=11)
     
@@ -281,13 +520,19 @@ def quick_benchmark():
     ax2.legend(fontsize=11)
     
     plt.tight_layout()
-    plt.savefig("benchmark_scaling_optimized.png", dpi=200, bbox_inches='tight')
+    
+    # Use unique filename
+    plot_filename = get_unique_filename("benchmark_scaling", N=Ns[-1], extension=".png")
+    plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
     plt.show()
-    print("Saved benchmark_scaling_optimized.png")
+    print(f"Saved {plot_filename}")
 
 def save_trajectory():
     """Save trajectory with optimized settings"""
     print("\n=== Trajectory + Energy Analysis ===")
+    
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
     
     N = int(input("Number of particles [100]: ") or "100")
     steps = int(input("Integration steps [600]: ") or "600")
@@ -313,7 +558,7 @@ def save_trajectory():
     fixed_star = distribution == "disc"
     bodies = init_system(N, with_central=fixed_star, distribution=distribution)
     
-    print(f"Integrating for {steps} steps using {solver.upper()} solver...")
+    print(f"Integrating for {steps} steps using {solver.upper()} solver with {thread_count} threads...")
     if theta is not None:
         print(f"Using custom theta = {theta}")
     
@@ -345,7 +590,7 @@ def save_trajectory():
         print(f"\nError during integration: {e}")
         return
 
-    # Energy plot
+    # Energy plot with unique filename
     if E_list:
         times, energies, rel_errors = zip(*E_list)
         
@@ -355,7 +600,7 @@ def save_trajectory():
         ax1.axhline(y=E0, color='r', linestyle='--', alpha=0.7, label='Initial Energy')
         ax1.set_xlabel("Time", fontsize=12)
         ax1.set_ylabel("Total Energy", fontsize=12)
-        ax1.set_title(f"Energy vs Time ({solver.upper()}, θ={theta if theta else 'default'})", fontsize=14)
+        ax1.set_title(f"Energy vs Time ({solver.upper()}, θ={theta if theta else 'default'}, {thread_count} threads)", fontsize=14)
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
@@ -366,14 +611,17 @@ def save_trajectory():
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig("energy_vs_time_optimized.png", dpi=180, bbox_inches='tight')
+        
+        # Use unique filename
+        energy_filename = get_unique_filename("energy_vs_time", solver, N, extension=".png")
+        plt.savefig(energy_filename, dpi=180, bbox_inches='tight')
         plt.close()
-        print("Saved energy_vs_time_optimized.png")
+        print(f"Saved {energy_filename}")
         
         final_error = abs(rel_errors[-1]) if rel_errors else 0
         print(f"Final energy error: {final_error:.6f}")
 
-    # Create animation using individual points
+    # Create animation using individual points with unique filename
     if len(xs) > 0 and len(xs[0]) > 0:
         print("Creating animation...")
         try:
@@ -407,7 +655,7 @@ def save_trajectory():
             
             ax.set_aspect('equal')
             ax.grid(True, alpha=0.3)
-            ax.set_title(f"{solver.upper()} N-body simulation (N={len(bodies)})")
+            ax.set_title(f"{solver.upper()} N-body simulation (N={len(bodies)}, {thread_count} threads)")
 
             def init():
                 for point in points:
@@ -423,6 +671,13 @@ def save_trajectory():
 
             ani = FuncAnimation(fig, update, frames=len(xs[0]), init_func=init, 
                               blit=True, interval=50)
+            
+            # Use unique filename for GIF
+            if gif == "trajectory.gif":  # Default name
+                gif = get_unique_filename("trajectory", solver, len(bodies), extension=".gif")
+            elif not gif.endswith('.gif'):
+                gif += '.gif'
+                
             ani.save(gif, writer=PillowWriter(fps=20))
             plt.close(fig)
             print(f"Saved {gif}")
@@ -433,6 +688,9 @@ def save_trajectory():
 def live_animation():
     """Live animation with optimized parameters"""
     print("\n=== Live Animation ===")
+    
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
     
     N = int(input("Number of particles [50]: ") or "50")
     solver = (input("Solver direct/bh/fmm [fmm]: ") or "fmm").lower()
@@ -465,7 +723,7 @@ def live_animation():
     ax.set_ylim(-70, 70)
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)})")
+    ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)}, {thread_count} threads)")
 
     def update(frame):
         try:
@@ -475,7 +733,7 @@ def live_animation():
                 if i < len(bodies):
                     point.set_data([bodies[i].x], [bodies[i].y])
             
-            ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)}, frame={frame})")
+            ax.set_title(f"Live {solver.upper()} simulation (N={len(bodies)}, frame={frame}, {thread_count} threads)")
             return points
         except Exception as e:
             print(f"Error in frame {frame}: {e}")
@@ -487,6 +745,8 @@ def live_animation():
     if gif_name:
         if not gif_name.endswith('.gif'):
             gif_name += '.gif'
+        # Add unique identifier
+        gif_name = get_unique_filename(gif_name.replace('.gif', ''), solver, len(bodies), extension=".gif")
         try:
             ani.save(gif_name, writer=PillowWriter(fps=20))
             print(f"Saved {gif_name}")
@@ -498,6 +758,9 @@ def live_animation():
 def scaling_test():
     """Large-N scaling test with optimized parameters"""
     print("\n=== Large-N Scaling Test ===")
+    
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
     
     choice = input("Test (1) small N with all methods or (2) large N with BH/FMM [1]: ").strip()
     
@@ -511,7 +774,7 @@ def scaling_test():
     times = defaultdict(list)
     
     for N in Ns:
-        print(f"\nN = {N}")
+        print(f"\nN = {N} ({thread_count} threads)")
         bodies = init_system(N, with_central=False, distribution="random")
         
         for method in methods:
@@ -527,11 +790,13 @@ def scaling_test():
             except Exception as e:
                 print(f"  {method.upper():6}: ERROR - {e}")
 
-    # Save and plot results
-    csv_file = f"scaling_{'large' if choice == '2' else 'small'}N_optimized.csv"
+    # Save and plot results with unique filename
+    size_type = 'large' if choice == '2' else 'small'
+    csv_file = get_unique_filename(f"scaling_{size_type}N", N=Ns[-1], extension=".csv")
+    
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["N"] + [m.upper() for m in methods])
+        writer.writerow(["N"] + [m.upper() for m in methods] + [f"OpenMP_Threads"])
         
         for i, N in enumerate(Ns):
             row = [N]
@@ -540,11 +805,12 @@ def scaling_test():
                     row.append(times[method][i])
                 else:
                     row.append("")
+            row.append(thread_count)
             writer.writerow(row)
     
     print(f"Saved {csv_file}")
 
-    # Plot
+    # Plot with unique filename
     plt.figure(figsize=(12, 8))
     colors = {"direct": "red", "bh": "blue", "fmm": "green"}
     markers = {"direct": "o", "bh": "s", "fmm": "^"}
@@ -571,12 +837,12 @@ def scaling_test():
     
     plt.xlabel("Number of Particles", fontsize=12)
     plt.ylabel("Computation Time (s)", fontsize=12)
-    plt.title("Optimized Scaling Comparison", fontsize=14)
+    plt.title(f"Scaling Comparison ({thread_count} OpenMP threads)", fontsize=14)
     plt.grid(True, which="both", alpha=0.3)
     plt.legend(fontsize=11)
     plt.tight_layout()
     
-    png_file = f"scaling_{'large' if choice == '2' else 'small'}N_optimized.png"
+    png_file = get_unique_filename(f"scaling_{size_type}N", N=Ns[-1], extension=".png")
     plt.savefig(png_file, dpi=200, bbox_inches='tight')
     plt.show()
     print(f"Saved {png_file}")
@@ -584,6 +850,9 @@ def scaling_test():
 def energy_conservation_test():
     """Enhanced energy conservation test"""
     print("\n=== Energy Conservation Test ===")
+    
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
     
     N = int(input("Number of particles [100]: ") or "100")
     steps = int(input("Integration steps [1000]: ") or "1000")
@@ -599,7 +868,7 @@ def energy_conservation_test():
             print(f"Skipping direct solver for N={N}")
             continue
             
-        print(f"\nTesting {solver.upper()} solver...")
+        print(f"\nTesting {solver.upper()} solver with {thread_count} threads...")
         bodies = [Body(b.x, b.y, b.m, b.vx, b.vy) for b in bodies_init]
         
         times, energies, errors = [], [], []
@@ -619,7 +888,7 @@ def energy_conservation_test():
         except Exception as e:
             print(f"Error testing {solver}: {e}")
     
-    # Plot results
+    # Plot results with unique filename
     if results:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
         colors = {"direct": "red", "bh": "blue", "fmm": "green"}
@@ -632,7 +901,7 @@ def energy_conservation_test():
         ax1.axhline(y=E0, color='black', linestyle='--', alpha=0.7, label='Initial Energy')
         ax1.set_xlabel("Time", fontsize=12)
         ax1.set_ylabel("Total Energy", fontsize=12)
-        ax1.set_title("Energy vs Time (Optimized Parameters)", fontsize=14)
+        ax1.set_title(f"Energy vs Time ({thread_count} OpenMP threads)", fontsize=14)
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
@@ -643,9 +912,12 @@ def energy_conservation_test():
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig("energy_conservation_optimized.png", dpi=200, bbox_inches='tight')
+        
+        # Use unique filename
+        energy_filename = get_unique_filename("energy_conservation", N=N, steps=steps, extension=".png")
+        plt.savefig(energy_filename, dpi=200, bbox_inches='tight')
         plt.show()
-        print("Saved energy_conservation_optimized.png")
+        print(f"Saved {energy_filename}")
         
         # Print final errors
         print("\nFinal energy errors:")
@@ -657,6 +929,9 @@ def parameter_optimization():
     """Interactive parameter optimization"""
     print("\n=== Parameter Optimization ===")
     
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    print(f"Using {thread_count} OpenMP threads")
+    
     N = int(input("Number of particles for testing [100]: ") or "100")
     solver = input("Solver to optimize (bh/fmm) [bh]: ").strip().lower() or "bh"
     
@@ -664,7 +939,7 @@ def parameter_optimization():
         print("Invalid solver")
         return
     
-    print(f"\nOptimizing {solver.upper()} parameters...")
+    print(f"\nOptimizing {solver.upper()} parameters with {thread_count} threads...")
     
     # Create test system
     bodies = init_system(N, with_central=False, distribution="random")
@@ -720,9 +995,9 @@ def parameter_optimization():
     print(f"  Theta: {best_params['theta']}")
     print(f"  Domain: {best_params['domain']}")
     print(f"  Error: {best_error:.2e}")
-    print(f"  Time: {best_params['time']:.2f} ms")
+    print(f"  Time: {best_params['time']:.2f} ms ({thread_count} threads)")
     
-    # Create parameter space plot
+    # Create parameter space plot with unique filename
     try:
         # Reshape results for plotting
         theta_grid = np.array([r[0] for r in results])
@@ -741,7 +1016,7 @@ def parameter_optimization():
         
         ax.set_xlabel('Theta Parameter', fontsize=12)
         ax.set_ylabel('Domain Size', fontsize=12)
-        ax.set_title(f'{solver.upper()} Parameter Optimization', fontsize=14)
+        ax.set_title(f'{solver.upper()} Parameter Optimization ({thread_count} threads)', fontsize=14)
         ax.legend()
         ax.grid(True, alpha=0.3)
         
@@ -750,32 +1025,45 @@ def parameter_optimization():
         cbar.set_label('log10(Relative Error)', fontsize=12)
         
         plt.tight_layout()
-        plt.savefig(f'{solver}_parameter_optimization.png', dpi=200, bbox_inches='tight')
+        
+        # Use unique filename - this one already was correct!
+        plot_filename = get_unique_filename(f'{solver}_parameter_optimization', N=N, extension=".png")
+        plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
         plt.show()
-        print(f"Saved {solver}_parameter_optimization.png")
+        print(f"Saved {plot_filename}")
         
     except Exception as e:
         print(f"Could not create plot: {e}")
 
 def main_menu():
-    """Enhanced main menu"""
+    """Enhanced main menu with OpenMP information"""
     print("\n" + "="*60)
     print("    2-D High-Precision N-body Simulation")
     print("    Optimized Barnes-Hut and FMM kernels")
     print("="*60)
-    print(f"\nCurrent optimized parameters:")
+    
+    # Show OpenMP info
+    thread_count = int(os.environ.get('OMP_NUM_THREADS', 1))
+    openmp_info = get_openmp_info()
+    
+    print(f"\nCurrent OpenMP configuration:")
+    print(f"  Threads: {thread_count} (max available: {openmp_info['max_threads']})")
+    print(f"  OpenMP support: {'✓ Yes' if openmp_info['has_openmp'] else '❌ No'}")
+    
+    print(f"\nOptimized parameters:")
     print(f"  Barnes-Hut: θ={OPTIMIZED_PARAMS['bh_theta']}, domain={OPTIMIZED_PARAMS['bh_domain']}")
     print(f"  FMM: θ={OPTIMIZED_PARAMS['fmm_theta']}, domain={OPTIMIZED_PARAMS['fmm_domain']}")
-    print(f"  Distribution size: {OPTIMIZED_PARAMS['distribution_size']}")
     
     while True:
         print("\n=== Main Menu ===")
-        print("1) Quick benchmark (optimized)")
+        print("1) Quick benchmark (with OpenMP)")
         print("2) Save trajectory + energy plot")
         print("3) Live animation")
         print("4) Large-N scaling test")
         print("5) Energy conservation test")
         print("6) Parameter optimization")
+        print("7) OpenMP thread benchmark")
+        print("8) System information")
         print("q) Quit")
         
         choice = input("\nSelect option: ").strip().lower()
@@ -793,6 +1081,10 @@ def main_menu():
                 energy_conservation_test()
             elif choice == "6":
                 parameter_optimization()
+            elif choice == "7":
+                openmp_benchmark()
+            elif choice == "8":
+                system_info()
             elif choice in ["q", "quit", "exit"]:
                 print("Goodbye!")
                 break
