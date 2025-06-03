@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-setup.py - 高精度數值穩定編譯腳本
+setup.py - Optimized build script for high-precision N-body kernels
+Usage: python setup.py build_ext --inplace
 """
 
 from pybind11.setup_helpers import Pybind11Extension, build_ext
@@ -9,44 +10,36 @@ import pybind11
 import platform
 import os
 
-# 偵測系統並設定編譯標誌
+# Detect system and set compiler flags
 system = platform.system()
-print(f"正在為 {system} 系統編譯")
+print(f"Building for {system}")
 
-# 基礎編譯參數
+# Base compiler arguments
 base_args = ["-std=c++17", "-O3", "-DNDEBUG"]
 base_link_args = []
 
-# 關鍵數值穩定性標誌
-base_args.extend([
-    "-fno-finite-math-only",           # 保留NaN和無限值處理
-    "-fno-unsafe-math-optimizations",  # 禁用不安全的數學優化
-    "-fno-associative-math",           # 保持運算順序
-    "-fno-reciprocal-math",            # 避免除法優化導致的精度損失
-    "-ffp-contract=off"                # 禁用浮點收縮優化
-])
-
-# 系統特定優化
+# System-specific optimizations
 if system == "Linux":
-    base_args.extend(["-march=native", "-fopenmp"])
+    base_args.extend(["-march=native", "-ffast-math", "-fopenmp"])
     base_link_args.extend(["-fopenmp"])
-    # 注意：移除 -ffast-math 以保持數值穩定性
 elif system == "Darwin":  # macOS
-    base_args.extend(["-march=native"])
-    # OpenMP設定
+    base_args.extend(["-march=native", "-ffast-math"])
+    # Try to find OpenMP
     omp_paths = ["/opt/homebrew", "/usr/local", "/opt/local"]
     for path in omp_paths:
         if os.path.exists(f"{path}/include/omp.h"):
             base_args.extend(["-Xpreprocessor", "-fopenmp", f"-I{path}/include"])
             base_link_args.extend([f"-L{path}/lib", "-lomp"])
-            print(f"找到OpenMP於 {path}")
+            print(f"Found OpenMP at {path}")
             break
+    else:
+        print("OpenMP not found - compiling without parallel support")
 elif system == "Windows":
     base_args.extend(["/O2", "/openmp"])
 
-print(f"編譯標誌: {base_args}")
+print(f"Compiler flags: {base_args}")
 
-# 定義擴充模組
+# Define extensions
 ext_modules = [
     Pybind11Extension(
         "force_kernel",
@@ -69,12 +62,11 @@ ext_modules = [
 ]
 
 setup(
-    name="nbody_kernels_stable",
-    version="2.1.0",
-    description="高精度數值穩定N體模擬核心",
+    name="nbody_kernels",
+    version="1.0.0",
+    description="High-precision N-body simulation kernels",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     zip_safe=False,
     python_requires=">=3.7",
 )
-
