@@ -54,9 +54,9 @@ except ImportError as e:
 
 # Physical constants
 G = 1.0
-SOFT = 0.01
+SOFT = 0.1
 DOMAIN = 100.0
-DT = 0.01
+DT = 0.001
 STAR_M = 100.0
 
 # Optimized parameters (from testing)
