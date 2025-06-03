@@ -1,5 +1,5 @@
 // fmm_kernel_full.cpp
-// Redesigned with spatial decomposition approach
+// Redesigned with better parallelization strategy
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -15,37 +15,75 @@
 
 namespace py = pybind11;
 
-// Simple spatial decomposition FMM
-class SpatialFMM {
+const int CACHE_LINE_SIZE = 64;
+
+// Thread-safe spatial grid implementation
+class OptimizedSpatialFMM {
 private:
+    struct alignas(CACHE_LINE_SIZE) GridCell {
+        std::vector<int> particles;
+        double total_mass;
+        double center_x, center_y;
+        char padding[CACHE_LINE_SIZE - sizeof(std::vector<int>) - 3*sizeof(double)];
+        
+        GridCell() : total_mass(0.0), center_x(0.0), center_y(0.0) {}
+    };
+    
     const double* x_data;
     const double* y_data;
     const double* m_data;
     int N;
     double domain_size;
-    double theta;
     double eps;
     double G;
     
-    // Use spatial decomposition instead of tree traversal
-    void compute_forces_spatial(double* ax, double* ay) {
-        const int grid_size = 8; // 8x8 spatial grid
+    void compute_forces_optimized(double* ax, double* ay) {
+        const int grid_size = std::max(4, static_cast<int>(std::sqrt(N / 100.0)));
         const double cell_size = domain_size * 2.0 / grid_size;
         
-        // Create spatial grid
-        std::vector<std::vector<int>> grid(grid_size * grid_size);
+        // Create thread-safe spatial grid
+        std::vector<GridCell> grid(grid_size * grid_size);
         
-        // Assign particles to grid cells
+        // Assign particles to grid cells (sequential to avoid race conditions)
         for (int i = 0; i < N; ++i) {
-            int grid_x = std::max(0, std::min(grid_size - 1, 
+            int grid_x = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((x_data[i] + domain_size) / cell_size)));
-            int grid_y = std::max(0, std::min(grid_size - 1, 
+            int grid_y = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((y_data[i] + domain_size) / cell_size)));
-            grid[grid_y * grid_size + grid_x].push_back(i);
+            
+            int cell_idx = grid_y * grid_size + grid_x;
+            grid[cell_idx].particles.push_back(i);
         }
         
-        // Compute forces using spatial decomposition
-        #pragma omp parallel for schedule(dynamic, 1) if(N > 500)
+        // Compute cell mass centers (parallel)
+        #pragma omp parallel for schedule(static)
+        for (int cell_idx = 0; cell_idx < grid_size * grid_size; ++cell_idx) {
+            GridCell& cell = grid[cell_idx];
+            if (cell.particles.empty()) continue;
+            
+            double total_mass = 0.0;
+            double mx_sum = 0.0;
+            double my_sum = 0.0;
+            
+            for (int pi : cell.particles) {
+                double mi = m_data[pi];
+                total_mass += mi;
+                mx_sum += mi * x_data[pi];
+                my_sum += mi * y_data[pi];
+            }
+            
+            cell.total_mass = total_mass;
+            if (total_mass > 0.0) {
+                cell.center_x = mx_sum / total_mass;
+                cell.center_y = my_sum / total_mass;
+            }
+        }
+        
+        // Compute forces with better parallelization
+        const int max_threads = omp_get_max_threads();
+        const int chunk_size = std::max(1, N / (max_threads * 8));
+        
+        #pragma omp parallel for schedule(guided, chunk_size)
         for (int i = 0; i < N; ++i) {
             ax[i] = 0.0;
             ay[i] = 0.0;
@@ -53,23 +91,22 @@ private:
             const double xi = x_data[i];
             const double yi = y_data[i];
             
-            // Determine which grid cell this particle is in
-            int grid_x = std::max(0, std::min(grid_size - 1, 
+            // Find particle's grid cell
+            int grid_x = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((xi + domain_size) / cell_size)));
-            int grid_y = std::max(0, std::min(grid_size - 1, 
+            int grid_y = std::max(0, std::min(grid_size - 1,
                          static_cast<int>((yi + domain_size) / cell_size)));
             
-            // Interact with nearby cells (3x3 neighborhood)
+            // Direct interaction with nearby cells
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     int nx = grid_x + dx;
                     int ny = grid_y + dy;
                     
                     if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size) {
-                        const auto& cell = grid[ny * grid_size + nx];
+                        const GridCell& cell = grid[ny * grid_size + nx];
                         
-                        // Direct interaction with particles in this cell
-                        for (int j : cell) {
+                        for (int j : cell.particles) {
                             if (i == j) continue;
                             
                             const double dx_val = xi - x_data[j];
@@ -87,45 +124,25 @@ private:
                 }
             }
             
-            // For distant cells, use multipole approximation
+            // Multipole approximation for distant cells
             for (int cy = 0; cy < grid_size; ++cy) {
                 for (int cx = 0; cx < grid_size; ++cx) {
-                    // Skip nearby cells (already computed above)
+                    // Skip nearby cells
                     if (std::abs(cx - grid_x) <= 1 && std::abs(cy - grid_y) <= 1) {
                         continue;
                     }
                     
-                    const auto& cell = grid[cy * grid_size + cx];
-                    if (cell.empty()) continue;
+                    const GridCell& cell = grid[cy * grid_size + cx];
+                    if (cell.total_mass == 0.0) continue;
                     
-                    // Compute cell center and total mass
-                    double cell_cx = (cx + 0.5) * cell_size - domain_size;
-                    double cell_cy = (cy + 0.5) * cell_size - domain_size;
-                    double total_mass = 0.0;
-                    double mass_cx = 0.0;
-                    double mass_cy = 0.0;
+                    const double dx_val = xi - cell.center_x;
+                    const double dy_val = yi - cell.center_y;
+                    const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
                     
-                    for (int j : cell) {
-                        double mj = m_data[j];
-                        total_mass += mj;
-                        mass_cx += mj * x_data[j];
-                        mass_cy += mj * y_data[j];
-                    }
-                    
-                    if (total_mass > 0.0) {
-                        mass_cx /= total_mass;
-                        mass_cy /= total_mass;
-                        
-                        // Use monopole approximation
-                        const double dx_val = xi - mass_cx;
-                        const double dy_val = yi - mass_cy;
-                        const double r2 = dx_val*dx_val + dy_val*dy_val + eps*eps;
-                        
-                        if (r2 > eps*eps) {
-                            const double inv_r3 = G / (r2 * std::sqrt(r2));
-                            ax[i] += total_mass * dx_val * inv_r3;
-                            ay[i] += total_mass * dy_val * inv_r3;
-                        }
+                    if (r2 > eps*eps) {
+                        const double inv_r3 = G / (r2 * std::sqrt(r2));
+                        ax[i] += cell.total_mass * dx_val * inv_r3;
+                        ay[i] += cell.total_mass * dy_val * inv_r3;
                     }
                 }
             }
@@ -143,13 +160,12 @@ public:
         m_data = m;
         N = n;
         domain_size = domain;
-        theta = th;
         eps = epsilon;
         G = gravity;
         
-        if (N < 1000) {
-            // For small problems, fall back to direct method
-            #pragma omp parallel for schedule(static) if(N > 100)
+        if (N < 200) {
+            // For small problems, use direct method
+            #pragma omp parallel for schedule(static) if(N > 50)
             for (int i = 0; i < N; ++i) {
                 ax[i] = 0.0;
                 ay[i] = 0.0;
@@ -170,8 +186,8 @@ public:
                 }
             }
         } else {
-            // Use spatial decomposition for larger problems
-            compute_forces_spatial(ax, ay);
+            // Use optimized spatial decomposition
+            compute_forces_optimized(ax, ay);
         }
     }
 };
@@ -199,12 +215,8 @@ void fmm_force(const py::array_t<double>& x_arr,
         throw std::runtime_error("Array size mismatch in fmm_force");
     }
     
-    if (N <= 0) {
-        throw std::runtime_error("Invalid particle count");
-    }
-    
     try {
-        SpatialFMM fmm;
+        OptimizedSpatialFMM fmm;
         
         const double* x_ptr = x.data(0);
         const double* y_ptr = y.data(0);
@@ -222,7 +234,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 }
 
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "2D Spatial Decomposition FMM kernel (Optimized)";
+    m.doc() = "2D Optimized Spatial FMM kernel";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),
