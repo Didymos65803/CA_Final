@@ -3,18 +3,13 @@
 """
 main_program_parallel_final.py
 ==============================
+
 Interactive 2-D N-body playground with optimized high-precision kernels
 
-支持菜单（共 8 个选项）：
- 1) Quick benchmark scaling              → test_scaling() 输出 performance_comparison.png + scaling_smallN.csv
- 2) Save trajectory + energy plot        → 生成 trajectory.gif + energy_vs_time.png
- 3) Live animation (real-time)           → 生成 live.gif
- 4) Large-N scaling test                 → test_largeN_scaling() 输出 scaling_largeN.png + scaling_largeN.csv
- 5) Energy conservation test             → test_energy_conservation() 输出 energy_conservation.png
- 6) Parameter optimization               → optimize_parameters() 输出 parameter_optimization.png
- 7) OpenMP thread benchmark              → thread_benchmark() 输出 openmp_thread_benchmark.png + openmp_thread_benchmark.csv
- 8) System information                   → show_system_info() 打印 OpenMP/CPU/系统信息
-  q) Quit
+主要改动：
+- 在程序启动时可以指定一个“日志文件名”，将所有输出同时写入终端和该文件。
+- 菜单项 2 和 3 改为“逐行提示”输入参数，而不是通过命令行参数传递。
+- 其余选项（1、4、5、6、7、8、q）保持原有功能。
 """
 
 import os
@@ -26,6 +21,33 @@ from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+# ----------------------------
+# 日志输出辅助
+# ----------------------------
+# 我们将所有 print 包装成 `log_print`，使其同时输出到终端和日志文件（如果指定了）。
+LOG_FILE = None
+
+def log_print(*args, **kwargs):
+    """
+    将内容打印到 stdout，同时（如果 LOG_FILE 不为 None）写入日志文件。
+    """
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    text = sep.join(str(a) for a in args) + end
+    # 输出到终端
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    # 如果指定了日志文件，则也写入
+    global LOG_FILE
+    if LOG_FILE is not None:
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(text)
+        except Exception as e:
+            # 如果写文件出错，不打断程序，只在终端提示
+            sys.stdout.write(f"[Warning] Unable to write to log file: {e}\n")
+            sys.stdout.flush()
 
 # ----------------------------
 # 导入 C++ 模块
@@ -211,7 +233,20 @@ def generate_disk(n, radius=OPTIMIZED_PARAMS['distribution_size'], include_centr
 # 交互式菜单主程序
 # ----------------------------
 def main_menu():
-    global USE_SOLVER
+    global USE_SOLVER, LOG_FILE
+
+    # 先询问用户是否要指定日志文件
+    log_print("Enter log filename (or press Enter to skip): ", end="")
+    log_fname = input().strip()
+    if log_fname != "":
+        LOG_FILE = log_fname
+        # 如果文件已存在，先清空再写
+        try:
+            with open(LOG_FILE, "w") as f:
+                f.write(f"Log start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception as e:
+            LOG_FILE = None
+            print(f"[Warning] 无法创建日志文件 '{log_fname}': {e}\n")
 
     menu_text = """
 === 2D N-body Playground (Parallel, High-Precision) ===
@@ -227,66 +262,90 @@ Select option:
   q) Quit
 ==============================================
 """
-    print(menu_text)
+    log_print(menu_text)
 
     while True:
         try:
-            choice = input("Enter choice: ").strip().lower()
+            log_print("Enter choice: ", end="")
+            choice = input().strip().lower()
             if choice in ["1", "benchmark"]:
                 # Option 1: Quick benchmark scaling
                 if ctest is not None:
                     ctest.test_scaling()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法执行 Quick benchmark。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法执行 Quick benchmark。\n")
 
             elif choice in ["2", "save", "save trajectory"]:
                 # Option 2: Save trajectory + energy plot
-                print("\nSave trajectory + energy plot")
-                parser = argparse.ArgumentParser()
-                parser.add_argument("--solver", type=str, default="direct",
-                                    choices=["direct", "bh", "fmm"],
-                                    help="Solver to use: direct / bh / fmm")
-                parser.add_argument("--n", type=int, default=200,
-                                    help="Number of particles (excluding central star)")
-                parser.add_argument("--steps", type=int, default=2000,
-                                    help="Number of integration steps")
-                parser.add_argument("--threads", type=int, default=4,
-                                    help="Number of OpenMP threads")
-                parser.add_argument("--fixed-star", action="store_true",
-                                    help="Include a fixed central star at index 0")
-                args = parser.parse_args()
+                log_print("\n[Option 2] Save trajectory + energy plot")
+                # 逐行提示用户输入 Solver, N, Steps, Threads, Include central star
+                log_print("Enter Solver (direct / bh / fmm): ", end="")
+                sol = input().strip().lower()
+                if sol not in ["direct", "bh", "fmm"]:
+                    log_print("Invalid solver. Must be one of direct, bh, fmm.\n")
+                    continue
+                USE_SOLVER = sol
 
-                USE_SOLVER = args.solver
-                N = args.n
-                STEPS = args.steps
-                THREADS = args.threads
-                fixed_star = args.fixed_star
+                log_print("Enter number of particles N (int, e.g. 200): ", end="")
+                try:
+                    N = int(input().strip())
+                except:
+                    log_print("Invalid N. Must be an integer.\n")
+                    continue
 
+                log_print("Enter number of integration steps STEPS (int, e.g. 2000): ", end="")
+                try:
+                    STEPS = int(input().strip())
+                except:
+                    log_print("Invalid STEPS. Must be an integer.\n")
+                    continue
+
+                log_print("Enter number of OpenMP threads THREADS (int, e.g. 4): ", end="")
+                try:
+                    THREADS = int(input().strip())
+                except:
+                    log_print("Invalid THREADS. Must be an integer.\n")
+                    continue
+
+                log_print("Include fixed central star? (y / n): ", end="")
+                ans = input().strip().lower()
+                fixed_star = (ans == "y")
+
+                # 设置环境变量 OMP_NUM_THREADS
                 os.environ["OMP_NUM_THREADS"] = str(THREADS)
+
+                # 生成初始分布
                 bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
                 total_N = bodies.shape[0]
                 E0 = total_energy(bodies, include_central=fixed_star)
 
-                # 初始加速度
+                # 第一次计算加速度
                 x0 = bodies[:, 0].tolist()
                 y0 = bodies[:, 1].tolist()
                 m0 = bodies[:, 4].tolist()
-                if USE_SOLVER.upper() == 'DIRECT':
-                    if not HAS_DIRECT_BH:
-                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
-                    ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
-                elif USE_SOLVER.upper() == 'BH':
-                    if not HAS_DIRECT_BH:
-                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
-                    theta = OPTIMIZED_PARAMS['bh_theta']
-                    ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
-                elif USE_SOLVER.upper() == 'FMM':
-                    if not HAS_FMM:
-                        raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
-                    theta = OPTIMIZED_PARAMS['fmm_theta']
-                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
-                else:
-                    raise ValueError(f"Unknown solver: {USE_SOLVER}")
+                try:
+                    if USE_SOLVER.upper() == 'DIRECT':
+                        if not HAS_DIRECT_BH:
+                            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                        ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
+
+                    elif USE_SOLVER.upper() == 'BH':
+                        if not HAS_DIRECT_BH:
+                            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                        theta = OPTIMIZED_PARAMS['bh_theta']
+                        ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
+
+                    elif USE_SOLVER.upper() == 'FMM':
+                        if not HAS_FMM:
+                            raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
+                        theta = OPTIMIZED_PARAMS['fmm_theta']
+                        ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
+
+                    else:
+                        raise ValueError(f"Unknown solver: {USE_SOLVER}")
+                except Exception as e:
+                    log_print(f"Error initializing accelerations: {e}\n")
+                    continue
 
                 ax = ax0
                 ay = ay0
@@ -308,14 +367,14 @@ Select option:
                             rel_error = abs(E - E0) / (abs(E0) + 1e-16)
                             E_list.append((s * DT, E, rel_error))
                 except KeyboardInterrupt:
-                    print("\nIntegration interrupted by user.")
+                    log_print("\nIntegration interrupted by user.\n")
                 except Exception as e:
-                    print(f"\nError during integration: {e}\n")
-                    return
+                    log_print(f"\nError during integration: {e}\n")
+                    continue
 
                 # (a) 保存轨迹动画
                 if xs and ys:
-                    print("Creating animation GIF...")
+                    log_print("Creating animation GIF...")
                     fig, axg = plt.subplots(figsize=(8, 8))
                     points = []
                     if fixed_star:
@@ -333,21 +392,22 @@ Select option:
                     axg.set_ylim(-DOMAIN, DOMAIN)
                     axg.set_title(f"Trajectory ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
 
-                    def update(frame):
+                    def update_traj(frame):
                         for i, pt in enumerate(points):
                             pt.set_data([xs[frame][i]], [ys[frame][i]])
                         return points
 
                     import matplotlib.animation as animation
-                    ani = animation.FuncAnimation(fig, update, frames=len(xs), interval=50, blit=True)
-                    gif_name = f"trajectory_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
+                    ani = animation.FuncAnimation(fig, update_traj, frames=len(xs), interval=50, blit=True)
+                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                    gif_name = f"trajectory_{USE_SOLVER}_{N}_{THREADS}_{timestamp}.gif"
                     ani.save(gif_name, fps=20, dpi=80)
                     plt.close(fig)
-                    print(f"✓ Saved trajectory GIF: {gif_name}")
+                    log_print(f"✓ Saved trajectory GIF: {gif_name}")
 
                 # (b) 保存能量-时间曲线
                 if E_list:
-                    print("Creating energy vs time plot...")
+                    log_print("Creating energy vs time plot...")
                     times = [item[0] for item in E_list]
                     energies = [item[1] for item in E_list]
 
@@ -359,34 +419,47 @@ Select option:
                     axp.set_title(f"Energy vs Time ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
                     axp.legend()
 
-                    energy_plot = f"energy_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+                    energy_plot = f"energy_{USE_SOLVER}_{N}_{THREADS}_{timestamp}.png"
                     fig.tight_layout()
                     fig.savefig(energy_plot, dpi=150)
                     plt.close(fig)
-                    print(f"✓ Saved energy plot: {energy_plot}\n")
+                    log_print(f"✓ Saved energy plot: {energy_plot}\n")
 
             elif choice in ["3", "live", "live animation"]:
                 # Option 3: Live animation (real-time)
-                print("\nLive simulation animation")
-                parser = argparse.ArgumentParser()
-                parser.add_argument("--solver", type=str, default="fmm",
-                                    choices=["direct", "bh", "fmm"],
-                                    help="Solver to use: direct / bh / fmm")
-                parser.add_argument("--n", type=int, default=100,
-                                    help="Number of particles (excluding central star)")
-                parser.add_argument("--steps", type=int, default=500,
-                                    help="Number of integration steps")
-                parser.add_argument("--threads", type=int, default=8,
-                                    help="Number of OpenMP threads")
-                parser.add_argument("--fixed-star", action="store_true",
-                                    help="Include a fixed central star at index 0")
-                args = parser.parse_args()
+                log_print("\n[Option 3] Live simulation animation")
+                # 逐行提示用户输入 Solver, N, Steps, Threads, Include central star
+                log_print("Enter Solver (direct / bh / fmm): ", end="")
+                sol = input().strip().lower()
+                if sol not in ["direct", "bh", "fmm"]:
+                    log_print("Invalid solver. Must be one of direct, bh, fmm.\n")
+                    continue
+                USE_SOLVER = sol
 
-                USE_SOLVER = args.solver
-                N = args.n
-                STEPS = args.steps
-                THREADS = args.threads
-                fixed_star = args.fixed_star
+                log_print("Enter number of particles N (int, e.g. 100): ", end="")
+                try:
+                    N = int(input().strip())
+                except:
+                    log_print("Invalid N. Must be an integer.\n")
+                    continue
+
+                log_print("Enter number of integration steps STEPS (int, e.g. 500): ", end="")
+                try:
+                    STEPS = int(input().strip())
+                except:
+                    log_print("Invalid STEPS. Must be an integer.\n")
+                    continue
+
+                log_print("Enter number of OpenMP threads THREADS (int, e.g. 8): ", end="")
+                try:
+                    THREADS = int(input().strip())
+                except:
+                    log_print("Invalid THREADS. Must be an integer.\n")
+                    continue
+
+                log_print("Include fixed central star? (y / n): ", end="")
+                ans = input().strip().lower()
+                fixed_star = (ans == "y")
 
                 os.environ["OMP_NUM_THREADS"] = str(THREADS)
                 bodies = generate_disk(N, OPTIMIZED_PARAMS['distribution_size'], include_central=fixed_star)
@@ -395,27 +468,34 @@ Select option:
                 x0 = bodies[:, 0].tolist()
                 y0 = bodies[:, 1].tolist()
                 m0 = bodies[:, 4].tolist()
-                if USE_SOLVER.upper() == 'DIRECT':
-                    if not HAS_DIRECT_BH:
-                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
-                    ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
-                elif USE_SOLVER.upper() == 'BH':
-                    if not HAS_DIRECT_BH:
-                        raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
-                    theta = OPTIMIZED_PARAMS['bh_theta']
-                    ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
-                elif USE_SOLVER.upper() == 'FMM':
-                    if not HAS_FMM:
-                        raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
-                    theta = OPTIMIZED_PARAMS['fmm_theta']
-                    ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
-                else:
-                    raise ValueError(f"Unknown solver: {USE_SOLVER}")
+                try:
+                    if USE_SOLVER.upper() == 'DIRECT':
+                        if not HAS_DIRECT_BH:
+                            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                        ax0, ay0 = direct_omp(x0, y0, m0, G=G, soft=SOFT)
+
+                    elif USE_SOLVER.upper() == 'BH':
+                        if not HAS_DIRECT_BH:
+                            raise RuntimeError("Direct/BH 模块 force_kernel 未加载！")
+                        theta = OPTIMIZED_PARAMS['bh_theta']
+                        ax0, ay0 = bh_omp(x0, y0, m0, OPTIMIZED_PARAMS['bh_domain'], theta, G, SOFT)
+
+                    elif USE_SOLVER.upper() == 'FMM':
+                        if not HAS_FMM:
+                            raise RuntimeError("FMM 模块 fmm_kernel 未加载！")
+                        theta = OPTIMIZED_PARAMS['fmm_theta']
+                        ax0, ay0 = fmm_kernel.fmm_omp(x0, y0, m0, OPTIMIZED_PARAMS['fmm_domain'], theta, G, SOFT)
+
+                    else:
+                        raise ValueError(f"Unknown solver: {USE_SOLVER}")
+                except Exception as e:
+                    log_print(f"Error initializing accelerations: {e}\n")
+                    continue
 
                 ax = ax0
                 ay = ay0
 
-                print("Creating live simulation GIF...")
+                log_print("Creating live simulation GIF...")
                 fig, ax_live = plt.subplots(figsize=(8, 8))
                 points = []
                 if fixed_star:
@@ -433,7 +513,7 @@ Select option:
                 ax_live.set_ylim(-DOMAIN, DOMAIN)
                 ax_live.set_title(f"Live Simulation ({USE_SOLVER.upper()}, N={N}, threads={THREADS})")
 
-                def update(frame):
+                def update_live(frame):
                     nonlocal ax, ay
                     ax, ay = leapfrog_step(bodies, ax, ay, include_central=fixed_star)
                     for idx, pt in enumerate(points):
@@ -441,63 +521,64 @@ Select option:
                     return points
 
                 import matplotlib.animation as animation
-                ani = animation.FuncAnimation(fig, update, frames=STEPS, interval=50, blit=True)
-                gif_name = f"live_{USE_SOLVER}_{N}_{THREADS}_{datetime.now().strftime('%Y%m%d%H%M%S')}.gif"
+                ani = animation.FuncAnimation(fig, update_live, frames=STEPS, interval=50, blit=True)
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                gif_name = f"live_{USE_SOLVER}_{N}_{THREADS}_{timestamp}.gif"
                 ani.save(gif_name, fps=20, dpi=80)
                 plt.close(fig)
-                print(f"✓ Saved live simulation GIF: {gif_name}\n")
+                log_print(f"✓ Saved live simulation GIF: {gif_name}\n")
 
             elif choice in ["4", "large-n", "large-n scaling"]:
                 # Option 4: Large-N scaling test
-                print("\nLarge-N Scaling Test")
+                log_print("\n[Option 4] Large-N Scaling Test")
                 if ctest is not None:
                     ctest.test_largeN_scaling()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法执行 Large-N scaling。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法执行 Large-N scaling。\n")
 
             elif choice in ["5", "energy", "energy conservation"]:
                 # Option 5: Energy conservation test
-                print("\nEnergy conservation test")
+                log_print("\n[Option 5] Energy Conservation Test")
                 if ctest is not None:
                     ctest.test_energy_conservation()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法执行 Energy conservation test。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法执行 Energy conservation test。\n")
 
             elif choice in ["6", "optimize", "parameter optimization"]:
                 # Option 6: Parameter optimization
-                print("\nParameter optimization")
+                log_print("\n[Option 6] Parameter Optimization")
                 if ctest is not None:
                     ctest.optimize_parameters()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法执行 Parameter optimization。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法执行 Parameter optimization。\n")
 
             elif choice in ["7", "thread", "openmp thread benchmark"]:
                 # Option 7: OpenMP thread benchmark
-                print("\nOpenMP thread benchmark")
+                log_print("\n[Option 7] OpenMP Thread Benchmark")
                 if ctest is not None:
                     ctest.thread_benchmark()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法执行 Thread benchmark。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法执行 Thread benchmark。\n")
 
             elif choice in ["8", "system", "system information"]:
                 # Option 8: System information
-                print("\nSystem information")
+                log_print("\n[Option 8] System Information")
                 if ctest is not None:
                     ctest.show_system_info()
                 else:
-                    print("Error: comprehensive_test.py 未找到，无法显示 System information。\n")
+                    log_print("Error: comprehensive_test.py 未找到，无法显示 System information。\n")
 
             elif choice in ["q", "quit", "exit"]:
-                print("Goodbye!")
+                log_print("Goodbye!")
                 break
 
             else:
-                print("Invalid choice. Please try again.\n")
+                log_print("Invalid choice. Please try again.\n")
 
         except KeyboardInterrupt:
-            print("\n\nOperation interrupted by user. Returning to menu...\n")
+            log_print("\n\nOperation interrupted by user. Returning to menu...\n")
         except Exception as e:
-            print(f"\nError: {e}\nPlease try again or choose a different option.\n")
+            log_print(f"\nError: {e}\nPlease try again or choose a different option.\n")
 
 
 if __name__ == "__main__":
