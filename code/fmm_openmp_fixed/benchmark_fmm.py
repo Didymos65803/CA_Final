@@ -19,7 +19,7 @@ try:
 except ImportError:
     sys.exit("fmm_openmp module not found – compile fmm_openmp.cpp first!")
 
-OUT = pathlib.Path("results_bench_rev5")
+OUT = pathlib.Path("results_bench_rev6")
 OUT.mkdir(exist_ok=True)
 _rng = np.random.default_rng(42)
 
