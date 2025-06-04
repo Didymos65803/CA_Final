@@ -1,127 +1,157 @@
-# benchmark_fmm.py – complete benchmark + plotting utility
-# =========================================================
-# Requires:
-#   • compiled fmm_openmp module (fmm_openmp.so)
-#   • matplotlib, numpy
+# benchmark_fmm.py — in‑depth OpenMP & algorithmic speed‑up analysis
+# ================================================================
+#  This script produces **four** figures:
+#   1. size_vs_time.png      – direct vs FMM timing with O(N²) & O(N log N) guidelines
+#   2. size_vs_speedup.png   – algorithmic speed‑up (direct / FMM)
+#   3. thread_scaling.png    – wall‑time & parallel speed‑up vs thread count
+#   4. theta_tradeoff.png    – accuracy vs runtime for several θ values
 #
-# It will:
-#   1. measure direct vs FMM times for several N
-#   2. produce a thread‑scaling plot for one representative N
-#   3. sweep θ to show accuracy vs runtime
-#   4. save three PNGs into ./results_bench/
+#  All plots are written into ./results_bench/  (created on the fly).
 #
-# Usage:
-#   python benchmark_fmm.py               # default settings
-#   python benchmark_fmm.py --sizes 500 1000 2000 --threads 1 2 4 8 --theta 0.3 0.5 0.7
-# =========================================================
+#  Requirements:  fmm_openmp (compiled), numpy, matplotlib
+#
+#  Usage examples
+#  --------------
+#  $ python benchmark_fmm.py                         # defaults
+#  $ python benchmark_fmm.py --sizes 1e3 2e3 4e3 8e3 --threads 1 2 4 8 16 \
+#        --theta 0.4 0.6 0.8                        # custom sweep
+#
+#  Tip: set   OMP_PROC_BIND=spread   OMP_PLACES=cores   in your shell to
+#       reduce thread contention when scaling.
+# ================================================================
 from __future__ import annotations
-import os, time, math, argparse, pathlib
-import numpy as np
-import matplotlib.pyplot as plt
-import fmm_openmp as fm
+import os, time, math, argparse, pathlib, sys
+import numpy as np, matplotlib.pyplot as plt
 
-OUT = pathlib.Path("results_bench"); OUT.mkdir(exist_ok=True)
+try:
+    import fmm_openmp as fm
+except ImportError:
+    sys.exit("fmm_openmp module not found – compile fmm_openmp.cpp first!")
 
-# ---------------------------------------------------------
-# reference direct vs FMM times over sizes
-# ---------------------------------------------------------
-def benchmark_sizes(sizes, threads=4, soft=0.01):
+OUT = pathlib.Path("results_bench_rev1"); OUT.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------
+_rng = np.random.default_rng(42)
+
+def random_system(N: int, domain=50.0):
+    x = _rng.uniform(-domain, domain, N).astype(np.float64)
+    y = _rng.uniform(-domain, domain, N).astype(np.float64)
+    m = np.ones(N, dtype=np.float64)
+    return x, y, m
+
+# ---------------------------------------------------------------
+# 1)  size sweep (direct vs FMM, with theoretical guidelines)
+# ---------------------------------------------------------------
+
+def run_size_sweep(Ns, threads, soft2, domain):
     os.environ["OMP_NUM_THREADS"] = str(threads)
-    soft2 = soft*soft
-    ref, fmm = [], []
+    direct_t, fmm_t = [], []
 
-    for N in sizes:
-        rng = np.random.default_rng(42)
-        x = rng.uniform(-50,50,N).astype(np.float64)
-        y = rng.uniform(-50,50,N).astype(np.float64)
-        m = np.ones(N, dtype=np.float64)
+    for N in Ns:
+        x, y, m = random_system(N)
         ax = np.zeros(N); ay = np.zeros(N)
 
-        # direct
-        t0=time.perf_counter(); fm.direct_force(x,y,m,soft2,ax,ay); td=time.perf_counter()-t0
-        # fmm
-        t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,100.0,ax,ay); tf=time.perf_counter()-t0
-        ref.append(td); fmm.append(tf)
-        print(f"N={N:6}  direct={td:.4e}s  fmm={tf:.4e}s  speedup={td/tf:.2f}")
+        t0 = time.perf_counter(); fm.direct_force(x, y, m, soft2, ax, ay); direct_t.append(time.perf_counter()-t0)
+        t0 = time.perf_counter(); fm.fmm_force   (x, y, m, soft2, domain, ax, ay); fmm_t   .append(time.perf_counter()-t0)
+        print(f"N={N:6d}  direct={direct_t[-1]:.4g}s  fmm={fmm_t[-1]:.4g}s  speed‑up={direct_t[-1]/fmm_t[-1]:.2f}")
 
-    plt.figure(figsize=(6,4))
-    plt.loglog(sizes, ref,'o-',label='Direct O(N²)')
-    plt.loglog(sizes, fmm,'s-',label='FMM O(N log N)')
-    plt.xlabel('N'); plt.ylabel('time [s]'); plt.title(f'Timing @ {threads} threads')
-    plt.grid(alpha=.3); plt.legend()
-    path=OUT/'size_sweep.png'; plt.tight_layout(); plt.savefig(path,dpi=300); plt.close()
-    print('✓ size plot ->',path)
+    # theoretical lines through first data point
+    N0 = Ns[0]
+    th_n2   = [direct_t[0]*(N/N0)**2           for N in Ns]
+    th_nlog = [fmm_t[0]*(N/N0)*math.log2(N)/math.log2(N0) for N in Ns]
 
-# ---------------------------------------------------------
-# thread scaling for fixed N
-# ---------------------------------------------------------
+    # plot times -------------------------------------------------
+    plt.figure(figsize=(6.4,4.2))
+    plt.loglog(Ns, direct_t,'o-', label='Direct O(N²)')
+    plt.loglog(Ns, fmm_t,   's-', label='FMM  O(N log N)')
+    plt.loglog(Ns, th_n2,  '--', color='C0', alpha=.4)
+    plt.loglog(Ns, th_nlog,':',  color='C1', alpha=.4)
+    plt.title(f'Timing @ {threads} threads'); plt.xlabel('N'); plt.ylabel('time [s]')
+    plt.legend(); plt.grid(alpha=.3)
+    path_time = OUT/'size_vs_time.png'; plt.tight_layout(); plt.savefig(path_time,dpi=300); plt.close()
 
-def scaling(N, thread_list, soft=0.01):
-    rng = np.random.default_rng(1)
-    x = rng.uniform(-50,50,N).astype(np.float64)
-    y = rng.uniform(-50,50,N).astype(np.float64)
-    m = np.ones(N, dtype=np.float64)
+    # plot speed‑up ---------------------------------------------
+    speed = np.array(direct_t)/np.array(fmm_t)
+    plt.figure(figsize=(6.4,4.2))
+    plt.loglog(Ns, speed,'o-')
+    plt.xlabel('N'); plt.ylabel('direct / FMM'); plt.title('Algorithmic speed‑up')
+    plt.grid(alpha=.3)
+    path_speed = OUT/'size_vs_speedup.png'; plt.tight_layout(); plt.savefig(path_speed,dpi=300); plt.close()
+
+    print('✓ saved', path_time, 'and', path_speed)
+
+# ---------------------------------------------------------------
+# 2) thread scaling for one N
+# ---------------------------------------------------------------
+
+def run_scaling(N, thread_list, soft2, domain):
+    x, y, m = random_system(N)
     ax = np.zeros(N); ay = np.zeros(N)
-    soft2 = soft*soft
 
     times=[]
     for t in thread_list:
-        os.environ['OMP_NUM_THREADS']=str(t); time.sleep(0.1)
-        t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,100.0,ax,ay); times.append(time.perf_counter()-t0)
-        print(f"{t} threads : {times[-1]:.5f}s")
+        os.environ['OMP_NUM_THREADS']=str(t); time.sleep(0.05)
+        t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,domain,ax,ay); times.append(time.perf_counter()-t0)
+        print(f" {t:3d} threads : {times[-1]:.6f}s")
 
     speed = [times[0]/tt for tt in times]
-    plt.figure(figsize=(6,4))
-    plt.plot(thread_list, times,'o-'); plt.xlabel('#threads'); plt.ylabel('time [s]');
-    plt.twinx(); plt.plot(thread_list, speed,'s--',color='orange'); plt.ylabel('speed‑up')
-    plt.title(f'FMM scaling N={N}')
-    path=OUT/'thread_scaling.png'; plt.tight_layout(); plt.savefig(path,dpi=300); plt.close()
-    print('✓ scaling plot ->',path)
+    plt.figure(figsize=(6.4,4.2))
+    plt.plot(thread_list, times,'o-', label='wall‑time')
+    plt.xlabel('#threads'); plt.ylabel('time [s]')
+    ax2 = plt.gca().twinx()
+    ax2.plot(thread_list, speed,'s--',color='C1', label='speed‑up')
+    ax2.set_ylabel('speed‑up')
+    plt.title(f'FMM scaling  N={N}')
+    plt.grid(alpha=.3)
+    plt.tight_layout();
+    path = OUT/'thread_scaling.png'; plt.savefig(path,dpi=300); plt.close()
+    print('✓ saved', path)
 
-# ---------------------------------------------------------
-# θ sweep to show accuracy/performance tradeoff
-# ---------------------------------------------------------
+# ---------------------------------------------------------------
+# 3) θ trade‑off (accuracy vs time)
+# ---------------------------------------------------------------
 
-def theta_sweep(N, thetas, soft=0.01):
-    rng = np.random.default_rng(7)
-    x = rng.uniform(-50,50,N).astype(np.float64)
-    y = rng.uniform(-50,50,N).astype(np.float64)
-    m = np.ones(N, dtype=np.float64)
-    ax=np.zeros(N); ay=np.zeros(N)
-    soft2=soft*soft
+def run_theta(N, thetas, soft2, domain):
+    x,y,m = random_system(N)
+    ax = np.zeros(N); ay = np.zeros(N)
 
-    # reference
-    fm.direct_force(x,y,m,soft2,ax,ay)
-    ref=np.hypot(ax,ay)
-
-    errs=[]; times=[]
+    fm.direct_force(x,y,m,soft2,ax,ay); ref = np.hypot(ax,ay)
+    errs, tms = [], []
     for th in thetas:
-        t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,100.0,ax,ay); dt=time.perf_counter()-t0
-        force=np.hypot(ax,ay)
-        errs.append(np.mean(np.abs(force-ref)/(ref+1e-12)))
-        times.append(dt)
-        print(f"θ={th:.2f}  time={dt:.4e}s  rel‑err={errs[-1]:.3e}")
+        t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,domain,ax,ay); dt=time.perf_counter()-t0
+        err = np.mean(np.abs(np.hypot(ax,ay)-ref)/(ref+1e-12))
+        errs.append(err); tms.append(dt)
+        print(f" θ={th:.2f} : time={dt:.3e}s  rel‑err={err:.3e}")
 
-    fig,(ax1,ax2)=plt.subplots(1,2,figsize=(9,4))
-    ax1.semilogy(thetas,errs,'o-'); ax1.set_xlabel('θ'); ax1.set_ylabel('relative error')
-    ax2.plot(thetas,times,'s-');    ax2.set_xlabel('θ'); ax2.set_ylabel('time [s]')
-    fig.suptitle(f'Accuracy vs θ  (N={N})')
-    path=OUT/'theta_sweep.png'; plt.tight_layout(); plt.savefig(path,dpi=300); plt.close()
-    print('✓ θ sweep plot ->',path)
+    fig,(a1,a2)=plt.subplots(1,2,figsize=(9,4))
+    a1.semilogy(thetas, errs,'o-'); a1.set_xlabel('θ'); a1.set_ylabel('relative error')
+    a2.plot(thetas, tms,'s-');     a2.set_xlabel('θ'); a2.set_ylabel('time [s]')
+    fig.suptitle(f'Accuracy vs runtime  (N={N})')
+    path=OUT/'theta_tradeoff.png'; plt.tight_layout(); plt.savefig(path,dpi=300); plt.close()
+    print('✓ saved', path)
 
-# ---------------------------------------------------------
-# CLI
-# ---------------------------------------------------------
-if __name__=='__main__':
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--sizes', nargs='+', type=int, default=[500,1000,2000,4000])
-    ap.add_argument('--threads', nargs='+', type=int, default=[1,2,4,8])
-    ap.add_argument('--theta',  nargs='+', type=float, default=[0.3,0.5,0.7,1.0])
-    ap.add_argument('--soft', type=float, default=0.01)
-    args=ap.parse_args()
+# ===== CLI wrapper ============================================================
+if __name__ == '__main__':
+    p = argparse.ArgumentParser(description='FMM vs Direct performance analyser')
+    p.add_argument('--sizes',   type=float, nargs='+', default=[1e3,2e3,4e3,8e3], help='particle counts for algorithmic sweep')
+    p.add_argument('--threads', type=int,   nargs='+', default=[1,2,4,8], help='thread counts for scaling')
+    p.add_argument('--theta',   type=float, nargs='+', default=[0.4,0.6,0.8], help='θ values for accuracy trade‑off')
+    p.add_argument('--soft',    type=float, default=0.01, help='softening length')
+    p.add_argument('--domain',  type=float, default=100.0, help='simulation box half‑width')
+    args = p.parse_args()
 
-    benchmark_sizes(args.sizes, threads=args.threads[-1], soft=args.soft)
-    scaling(args.sizes[len(args.sizes)//2], args.threads, soft=args.soft)
-    theta_sweep(min(args.sizes), args.theta, soft=args.soft)
-    print('\nAll plots saved to', OUT)
+    sizes = [int(s) for s in args.sizes]
+    print('\n=== Size sweep ============================================')
+    run_size_sweep(sizes, threads=max(args.threads), soft2=args.soft**2, domain=args.domain)
+
+    print('\n=== Thread scaling ========================================')
+    midN = sizes[len(sizes)//2]
+    run_scaling(midN, args.threads, args.soft**2, args.domain)
+
+    print('\n=== θ trade‑off ===========================================')
+    run_theta(min(sizes), args.theta, args.soft**2, args.domain)
+
+    print('\nAll figures written to', OUT)
 
