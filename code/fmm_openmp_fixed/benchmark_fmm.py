@@ -14,7 +14,7 @@ try:
 except ImportError:
     sys.exit("fmm_openmp module not found – compile fmm_openmp.cpp first!")
 
-OUT = pathlib.Path("results_bench_rev3"); OUT.mkdir(exist_ok=True)
+OUT = pathlib.Path("results_bench_rev4"); OUT.mkdir(exist_ok=True)
 _rng = np.random.default_rng(42)
 
 def random_system(N:int, domain=50.):
@@ -42,7 +42,7 @@ def run_size_sweep(Ns, threads, soft2, domain):
     plt.tight_layout(); (OUT/'size_vs_time.png').write_bytes(plt.gcf().canvas.buffer_rgba()); plt.close()
     plt.figure(figsize=(6.2,4)); plt.loglog(Ns,np.array(direct_t)/np.array(fmm_t),'o-')
     plt.xlabel('N'); plt.ylabel('direct / FMM'); plt.title('Algorithmic speed‑up'); plt.grid(alpha=.3)
-    plt.tight_layout(); (OUT/'size_vs_speedup.png').write_bytes(plt.gcf().canvas.buffer_rgba()); plt.close()
+    plt.tight_layout(); plt.savefig(OUT/"size_vs_speedup.png"); plt.close()
 # ------------------------------------------------------------------
 # 2) rich thread scaling (both algos)
 # ------------------------------------------------------------------
@@ -74,7 +74,7 @@ def run_theta(N, thetas, soft2, domain):
     errs=[]; tms=[]
     for th in thetas:
         t0=time.perf_counter(); fm.fmm_force(x,y,m,soft2,domain,ax,ay); tms.append(time.perf_counter()-t0)
-        err=np.linalg.norm(np.vstack((ax,ay)).T-ref)/np.linalg.norm(ref); errs.append(err)
+        err=np.linalg.norm(np.vstack((ax,ay)).T-ref)/max(np.linalg.norm(ref), 1e-12); errs.append(err)
         print(f" θ={th:.2f}  t={tms[-1]:.3e}s  L2‑err={errs[-1]:.2e}")
     fig,(a1,a2)=plt.subplots(1,2,figsize=(9,4))
     a1.semilogy(thetas,errs,'o-'); a1.set_xlabel('θ'); a1.set_ylabel('L2 relative error')
