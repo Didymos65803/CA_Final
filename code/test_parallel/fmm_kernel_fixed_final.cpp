@@ -1,12 +1,13 @@
 // fmm_kernel_fixed_final.cpp
-// Completely rewritten working FMM implementation with proper parallelization
+// Simplified but correct FMM implementation focusing on parallelization and correctness
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <cstring>
+#include <memory>
+#include <numeric>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -14,258 +15,248 @@
 
 namespace py = pybind11;
 
-// Cache-aligned particle structure
-struct alignas(64) Particle {
+// Particle structure
+struct Particle {
     double x, y, mass;
     double ax, ay;
-    int grid_id;
-    char padding[26];
+    int id;
     
-    Particle() : x(0), y(0), mass(0), ax(0), ay(0), grid_id(-1) {}
+    Particle() : x(0), y(0), mass(0), ax(0), ay(0), id(-1) {}
+    Particle(double x_, double y_, double m_, int id_) : x(x_), y(y_), mass(m_), ax(0), ay(0), id(id_) {}
 };
 
-// Grid cell for spatial decomposition
-struct GridCell {
-    std::vector<int> particle_ids;
-    double total_mass;
+// Tree node for spatial decomposition
+struct TreeNode {
     double center_x, center_y;
-    bool computed;
+    double size;
+    int level;
+    bool is_leaf;
     
-    GridCell() : total_mass(0), center_x(0), center_y(0), computed(false) {}
+    // Child nodes (quadtree)
+    std::unique_ptr<TreeNode> children[4];
     
-    void clear() {
-        particle_ids.clear();
-        total_mass = 0;
-        center_x = center_y = 0;
-        computed = false;
+    // Particles (for leaf nodes)
+    std::vector<int> particle_ids;
+    
+    // Center of mass approximation
+    double total_mass;
+    double com_x, com_y;
+    
+    TreeNode(double cx, double cy, double sz, int lvl) 
+        : center_x(cx), center_y(cy), size(sz), level(lvl), is_leaf(true),
+          total_mass(0), com_x(0), com_y(0) {
     }
 };
 
-class WorkingFMM {
+class SimplifiedFMM {
 private:
     std::vector<Particle> particles;
-    std::vector<GridCell> grid;
-    int grid_size;
-    double cell_size;
+    std::unique_ptr<TreeNode> root;
     double domain_size;
+    double theta;
+    int max_particles_per_leaf;
     double eps_squared;
     double G_constant;
-    int num_threads;
+    int max_level;
     
-    // Thread-safe force computation kernel
-    inline void compute_pairwise_force(double xi, double yi, double mi,
-                                       double xj, double yj, double mj,
-                                       double& fx, double& fy) const {
-        const double dx = xi - xj;
-        const double dy = yi - yj;
-        const double r2 = dx*dx + dy*dy + eps_squared;
-        
-        if (r2 > eps_squared) {
-            const double inv_r = 1.0 / std::sqrt(r2);
-            const double inv_r3 = inv_r * inv_r * inv_r;
-            const double force_mag = G_constant * mj * inv_r3;
-            
-            fx -= force_mag * dx;
-            fy -= force_mag * dy;
-        }
-    }
-    
-    // Assign particles to grid cells
-    void assign_particles_to_grid() {
-        // Clear all grid cells
-        for (auto& cell : grid) {
-            cell.clear();
+    // Build the tree recursively
+    void build_tree(TreeNode* node, const std::vector<int>& particle_ids, int current_level) {
+        if (particle_ids.size() <= static_cast<size_t>(max_particles_per_leaf) || current_level >= max_level) {
+            node->is_leaf = true;
+            node->particle_ids = particle_ids;
+            compute_center_of_mass(node);
+            return;
         }
         
-        // Assign particles to cells
-        for (size_t i = 0; i < particles.size(); ++i) {
-            const double px = particles[i].x;
-            const double py = particles[i].y;
-            
-            // Calculate grid coordinates
-            int gx = static_cast<int>((px + domain_size) / cell_size);
-            int gy = static_cast<int>((py + domain_size) / cell_size);
-            
-            // Clamp to valid range
-            gx = std::max(0, std::min(gx, grid_size - 1));
-            gy = std::max(0, std::min(gy, grid_size - 1));
-            
-            const int grid_id = gy * grid_size + gx;
-            particles[i].grid_id = grid_id;
-            grid[grid_id].particle_ids.push_back(static_cast<int>(i));
+        node->is_leaf = false;
+        
+        // Create four children
+        const double half_size = node->size * 0.5;
+        const double quarter_size = half_size * 0.5;
+        
+        node->children[0] = std::make_unique<TreeNode>(
+            node->center_x - quarter_size, node->center_y - quarter_size, half_size, current_level + 1);
+        node->children[1] = std::make_unique<TreeNode>(
+            node->center_x + quarter_size, node->center_y - quarter_size, half_size, current_level + 1);
+        node->children[2] = std::make_unique<TreeNode>(
+            node->center_x - quarter_size, node->center_y + quarter_size, half_size, current_level + 1);
+        node->children[3] = std::make_unique<TreeNode>(
+            node->center_x + quarter_size, node->center_y + quarter_size, half_size, current_level + 1);
+        
+        // Distribute particles to children
+        std::vector<std::vector<int>> child_particles(4);
+        
+        for (int pid : particle_ids) {
+            const Particle& p = particles[pid];
+            int child_idx = 0;
+            if (p.x > node->center_x) child_idx += 1;
+            if (p.y > node->center_y) child_idx += 2;
+            child_particles[child_idx].push_back(pid);
         }
-    }
-    
-    // Compute mass centers for all grid cells
-    void compute_mass_centers() {
-        #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-        for (int cell_id = 0; cell_id < grid_size * grid_size; ++cell_id) {
-            GridCell& cell = grid[cell_id];
-            
-            if (cell.particle_ids.empty()) {
-                continue;
+        
+        // Recursively build children
+        for (int i = 0; i < 4; ++i) {
+            if (!child_particles[i].empty()) {
+                build_tree(node->children[i].get(), child_particles[i], current_level + 1);
             }
-            
-            double total_mass = 0.0;
-            double weighted_x = 0.0;
-            double weighted_y = 0.0;
-            
-            for (int pid : cell.particle_ids) {
+        }
+        
+        // Compute center of mass for this node
+        compute_center_of_mass(node);
+    }
+    
+    // Compute center of mass for a node
+    void compute_center_of_mass(TreeNode* node) {
+        node->total_mass = 0.0;
+        node->com_x = 0.0;
+        node->com_y = 0.0;
+        
+        if (node->is_leaf) {
+            // Compute from particles
+            for (int pid : node->particle_ids) {
                 const Particle& p = particles[pid];
-                total_mass += p.mass;
-                weighted_x += p.mass * p.x;
-                weighted_y += p.mass * p.y;
+                node->total_mass += p.mass;
+                node->com_x += p.mass * p.x;
+                node->com_y += p.mass * p.y;
             }
-            
-            cell.total_mass = total_mass;
-            if (total_mass > 0.0) {
-                cell.center_x = weighted_x / total_mass;
-                cell.center_y = weighted_y / total_mass;
+        } else {
+            // Compute from children
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i]) {
+                    node->total_mass += node->children[i]->total_mass;
+                    node->com_x += node->children[i]->total_mass * node->children[i]->com_x;
+                    node->com_y += node->children[i]->total_mass * node->children[i]->com_y;
+                }
             }
-            cell.computed = true;
+        }
+        
+        if (node->total_mass > 0.0) {
+            node->com_x /= node->total_mass;
+            node->com_y /= node->total_mass;
         }
     }
     
-    // Compute forces using spatial decomposition
-    void compute_forces_spatial() {
-        // Initialize forces
-        #pragma omp parallel for simd num_threads(num_threads)
-        for (size_t i = 0; i < particles.size(); ++i) {
-            particles[i].ax = 0.0;
-            particles[i].ay = 0.0;
-        }
+    // Compute force on a particle using the tree
+    void compute_particle_force(int particle_id, TreeNode* node) {
+        if (!node || node->total_mass <= 0.0) return;
         
-        // Parallel force computation
-        #pragma omp parallel num_threads(num_threads)
-        {
-            // Each thread processes a subset of particles
-            #pragma omp for schedule(guided, 16) nowait
-            for (size_t i = 0; i < particles.size(); ++i) {
-                compute_particle_forces(static_cast<int>(i));
-            }
-        }
-    }
-    
-    // Compute forces for a single particle
-    void compute_particle_forces(int particle_id) {
-        const Particle& pi = particles[particle_id];
-        const int my_grid_id = pi.grid_id;
-        const int gx = my_grid_id % grid_size;
-        const int gy = my_grid_id / grid_size;
+        const Particle& p = particles[particle_id];
+        const double dx = p.x - node->com_x;
+        const double dy = p.y - node->com_y;
+        const double r2 = dx*dx + dy*dy + eps_squared;
+        const double distance = std::sqrt(r2);
         
-        double fx_total = 0.0;
-        double fy_total = 0.0;
-        
-        // Near-field: direct interaction with neighboring cells
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                const int nx = gx + dx;
-                const int ny = gy + dy;
+        // Barnes-Hut opening criterion
+        if (node->is_leaf || (node->size / distance) < theta) {
+            // Use this node as a single mass
+            if (r2 > eps_squared) {
+                const double inv_r = 1.0 / distance;
+                const double inv_r3 = inv_r * inv_r * inv_r;
+                const double force_mag = G_constant * node->total_mass * inv_r3;
                 
-                if (nx >= 0 && nx < grid_size && ny >= 0 && ny < grid_size) {
-                    const int neighbor_id = ny * grid_size + nx;
-                    const GridCell& neighbor = grid[neighbor_id];
+                particles[particle_id].ax -= force_mag * dx;
+                particles[particle_id].ay -= force_mag * dy;
+            }
+        } else {
+            // Recurse to children
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i]) {
+                    compute_particle_force(particle_id, node->children[i].get());
+                }
+            }
+        }
+    }
+    
+    // Handle particle-particle interactions for particles in the same leaf
+    void compute_direct_interactions(TreeNode* node) {
+        if (!node || !node->is_leaf) return;
+        
+        const auto& pids = node->particle_ids;
+        const size_t n = pids.size();
+        
+        // Direct interactions within the leaf
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const int pid_i = pids[i];
+                const int pid_j = pids[j];
+                
+                const double dx = particles[pid_i].x - particles[pid_j].x;
+                const double dy = particles[pid_i].y - particles[pid_j].y;
+                const double r2 = dx*dx + dy*dy + eps_squared;
+                
+                if (r2 > eps_squared) {
+                    const double inv_r = 1.0 / std::sqrt(r2);
+                    const double inv_r3 = inv_r * inv_r * inv_r;
                     
-                    // Direct particle-particle interaction
-                    for (int other_id : neighbor.particle_ids) {
-                        if (other_id != particle_id) {
-                            double fx_local = 0.0, fy_local = 0.0;
-                            compute_pairwise_force(pi.x, pi.y, pi.mass,
-                                                   particles[other_id].x, 
-                                                   particles[other_id].y, 
-                                                   particles[other_id].mass,
-                                                   fx_local, fy_local);
-                            fx_total += fx_local;
-                            fy_total += fy_local;
-                        }
-                    }
+                    const double force_mag_i = G_constant * particles[pid_j].mass * inv_r3;
+                    const double force_mag_j = G_constant * particles[pid_i].mass * inv_r3;
+                    
+                    // Apply Newton's third law
+                    particles[pid_i].ax -= force_mag_i * dx;
+                    particles[pid_i].ay -= force_mag_i * dy;
+                    particles[pid_j].ax += force_mag_j * dx;
+                    particles[pid_j].ay += force_mag_j * dy;
                 }
             }
         }
+    }
+    
+    // Traverse tree and handle direct interactions
+    void handle_direct_interactions(TreeNode* node) {
+        if (!node) return;
         
-        // Far-field: multipole approximation
-        for (int cy = 0; cy < grid_size; ++cy) {
-            for (int cx = 0; cx < grid_size; ++cx) {
-                // Skip near-field cells
-                if (std::abs(cx - gx) <= 1 && std::abs(cy - gy) <= 1) {
-                    continue;
-                }
-                
-                const int far_cell_id = cy * grid_size + cx;
-                const GridCell& far_cell = grid[far_cell_id];
-                
-                if (far_cell.computed && far_cell.total_mass > 0.0) {
-                    double fx_far = 0.0, fy_far = 0.0;
-                    compute_pairwise_force(pi.x, pi.y, pi.mass,
-                                           far_cell.center_x, far_cell.center_y, 
-                                           far_cell.total_mass,
-                                           fx_far, fy_far);
-                    fx_total += fx_far;
-                    fy_total += fy_far;
+        if (node->is_leaf) {
+            compute_direct_interactions(node);
+        } else {
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i]) {
+                    handle_direct_interactions(node->children[i].get());
                 }
             }
         }
-        
-        // Atomic update to avoid race conditions
-        #pragma omp atomic
-        particles[particle_id].ax += fx_total;
-        #pragma omp atomic
-        particles[particle_id].ay += fy_total;
     }
     
 public:
     void solve_forces(const double* x, const double* y, const double* mass, int n,
-                      double domain, double theta, int max_particles_per_leaf,
+                      double domain, double theta_param, int max_particles_per_leaf_param,
                       double epsilon, double G,
                       double* ax, double* ay) {
         
         // Initialize parameters
         domain_size = domain;
+        theta = theta_param;
+        max_particles_per_leaf = std::max(4, max_particles_per_leaf_param);
         eps_squared = epsilon * epsilon;
         G_constant = G;
-        num_threads = omp_get_max_threads();
-        
-        // Adaptive grid sizing based on problem size
-        if (n <= 500) {
-            grid_size = 4;
-        } else if (n <= 2000) {
-            grid_size = 8;
-        } else if (n <= 8000) {
-            grid_size = 16;
-        } else {
-            grid_size = 32;
-        }
-        
-        cell_size = (2.0 * domain_size) / grid_size;
-        
-        // Resize containers
-        particles.resize(n);
-        grid.resize(grid_size * grid_size);
+        max_level = std::max(3, static_cast<int>(std::log2(n / max_particles_per_leaf)) + 3);
         
         // Copy input data
-        #pragma omp parallel for simd num_threads(num_threads)
+        particles.resize(n);
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < n; ++i) {
-            particles[i].x = x[i];
-            particles[i].y = y[i];
-            particles[i].mass = mass[i];
-            particles[i].ax = 0.0;
-            particles[i].ay = 0.0;
+            particles[i] = Particle(x[i], y[i], mass[i], i);
         }
         
-        // For small problems, use direct computation
-        if (n < 200) {
-            #pragma omp parallel for schedule(static) num_threads(num_threads)
+        // For very small problems, use direct computation
+        if (n < 50) {
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < n; ++i) {
                 double fx = 0.0, fy = 0.0;
                 
                 for (int j = 0; j < n; ++j) {
                     if (i != j) {
-                        double fx_local = 0.0, fy_local = 0.0;
-                        compute_pairwise_force(particles[i].x, particles[i].y, particles[i].mass,
-                                               particles[j].x, particles[j].y, particles[j].mass,
-                                               fx_local, fy_local);
-                        fx += fx_local;
-                        fy += fy_local;
+                        const double dx = particles[i].x - particles[j].x;
+                        const double dy = particles[i].y - particles[j].y;
+                        const double r2 = dx*dx + dy*dy + eps_squared;
+                        
+                        if (r2 > eps_squared) {
+                            const double inv_r = 1.0 / std::sqrt(r2);
+                            const double inv_r3 = inv_r * inv_r * inv_r;
+                            const double force_mag = G_constant * particles[j].mass * inv_r3;
+                            
+                            fx -= force_mag * dx;
+                            fy -= force_mag * dy;
+                        }
                     }
                 }
                 
@@ -273,17 +264,101 @@ public:
                 particles[i].ay = fy;
             }
         } else {
-            // Use FMM for larger problems
-            assign_particles_to_grid();
-            compute_mass_centers();
-            compute_forces_spatial();
+            // Use simplified FMM for larger problems
+            
+            // Create particle list
+            std::vector<int> all_particles(n);
+            std::iota(all_particles.begin(), all_particles.end(), 0);
+            
+            // Build tree
+            root = std::make_unique<TreeNode>(0.0, 0.0, domain_size, 0);
+            build_tree(root.get(), all_particles, 0);
+            
+            // Initialize forces
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < n; ++i) {
+                particles[i].ax = 0.0;
+                particles[i].ay = 0.0;
+            }
+            
+            // Handle direct interactions within leaves (to avoid double-counting)
+            handle_direct_interactions(root.get());
+            
+            // Compute forces using tree walk
+            #pragma omp parallel for schedule(dynamic, 32)
+            for (int i = 0; i < n; ++i) {
+                // Find the leaf containing this particle
+                TreeNode* leaf = find_leaf_containing_particle(i, root.get());
+                
+                // Compute force from tree, excluding the particle's own leaf
+                compute_particle_force_excluding_leaf(i, root.get(), leaf);
+            }
         }
         
         // Copy results back
-        #pragma omp parallel for simd num_threads(num_threads)
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < n; ++i) {
             ax[i] = particles[i].ax;
             ay[i] = particles[i].ay;
+        }
+    }
+    
+private:
+    // Find the leaf node containing a specific particle
+    TreeNode* find_leaf_containing_particle(int particle_id, TreeNode* node) {
+        if (!node) return nullptr;
+        
+        if (node->is_leaf) {
+            // Check if this leaf contains the particle
+            for (int pid : node->particle_ids) {
+                if (pid == particle_id) {
+                    return node;
+                }
+            }
+            return nullptr;
+        }
+        
+        // Recurse to children
+        for (int i = 0; i < 4; ++i) {
+            if (node->children[i]) {
+                TreeNode* result = find_leaf_containing_particle(particle_id, node->children[i].get());
+                if (result) return result;
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    // Compute force excluding a specific leaf (to avoid double-counting direct interactions)
+    void compute_particle_force_excluding_leaf(int particle_id, TreeNode* node, TreeNode* exclude_leaf) {
+        if (!node || node->total_mass <= 0.0 || node == exclude_leaf) return;
+        
+        const Particle& p = particles[particle_id];
+        const double dx = p.x - node->com_x;
+        const double dy = p.y - node->com_y;
+        const double r2 = dx*dx + dy*dy + eps_squared;
+        const double distance = std::sqrt(r2);
+        
+        // Barnes-Hut opening criterion
+        if (node->is_leaf || (node->size / distance) < theta) {
+            // Use this node as a single mass
+            if (r2 > eps_squared && node != exclude_leaf) {
+                const double inv_r = 1.0 / distance;
+                const double inv_r3 = inv_r * inv_r * inv_r;
+                const double force_mag = G_constant * node->total_mass * inv_r3;
+                
+                #pragma omp atomic
+                particles[particle_id].ax -= force_mag * dx;
+                #pragma omp atomic
+                particles[particle_id].ay -= force_mag * dy;
+            }
+        } else {
+            // Recurse to children
+            for (int i = 0; i < 4; ++i) {
+                if (node->children[i]) {
+                    compute_particle_force_excluding_leaf(particle_id, node->children[i].get(), exclude_leaf);
+                }
+            }
         }
     }
 };
@@ -315,7 +390,7 @@ void fmm_force(const py::array_t<double>& x_arr,
     }
     
     try {
-        WorkingFMM fmm_solver;
+        SimplifiedFMM fmm_solver;
         
         // Get data pointers
         const double* x_ptr = x.data(0);
@@ -336,7 +411,7 @@ void fmm_force(const py::array_t<double>& x_arr,
 
 // Python module definition
 PYBIND11_MODULE(fmm_kernel, m) {
-    m.doc() = "Working 2D FMM kernel with proper parallelization";
+    m.doc() = "Simplified but correct 2D FMM kernel with proper Barnes-Hut algorithm";
     m.def("fmm_force",
           &fmm_force,
           py::arg("x"),
@@ -350,5 +425,5 @@ PYBIND11_MODULE(fmm_kernel, m) {
           py::arg("G") = 1.0,
           py::arg("ax"),
           py::arg("ay"),
-          "Compute gravitational forces using Fast Multipole Method");
+          "Compute gravitational forces using simplified Barnes-Hut FMM");
 }
