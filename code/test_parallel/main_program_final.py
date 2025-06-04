@@ -8,266 +8,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Set optimal OpenMP environment
-def create_scaling_plot(thread_counts, times):
-    """Create parallel scaling plot"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    # Filter valid data
-    valid_times = [t for t in times if not math.isnan(t)]
-    valid_threads = thread_counts[:len(valid_times)]
-    
-    if len(valid_times) > 1:
-        # Calculate speedup and efficiency
-        speedups = [valid_times[0] / t for t in valid_times]
-        efficiency = [s / tc for s, tc in zip(speedups, valid_threads)]
-        
-        # Speedup plot
-        ax1.plot(valid_threads, speedups, 'o-', linewidth=2.5, markersize=8, label='Actual')
-        ax1.plot(valid_threads, valid_threads, '--', alpha=0.7, label='Ideal')
-        ax1.set_xlabel('Number of Threads', fontsize=12)
-        ax1.set_ylabel('Speedup', fontsize=12)
-        ax1.set_title('Parallel Speedup', fontsize=14, fontweight='bold')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Efficiency plot
-        ax2.plot(valid_threads, efficiency, 's-', linewidth=2.5, markersize=8, color='orange')
-        ax2.axhline(y=1.0, color='black', linestyle='--', alpha=0.7)
-        ax2.axhline(y=0.8, color='green', linestyle=':', alpha=0.7, label='Good (80%)')
-        ax2.axhline(y=0.5, color='red', linestyle=':', alpha=0.7, label='Poor (50%)')
-        ax2.set_xlabel('Number of Threads', fontsize=12)
-        ax2.set_ylabel('Parallel Efficiency', fontsize=12)
-        ax2.set_title('Parallel Efficiency', fontsize=14, fontweight='bold')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        ax2.set_ylim(0, 1.1)
-    
-    plt.tight_layout()
-    plot_path = os.path.join(OUTPUT_DIR, "parallel_scaling.png")
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Parallel scaling plot saved to {plot_path}")
-
-def energy_conservation_test():
-    """Test energy conservation in time integration"""
-    print("\nEnergy Conservation Test")
-    print("=" * 50)
-    
-    if not HAS_FMM:
-        print("FMM method required for energy conservation test")
-        return
-    
-    N = 100
-    system = ParticleSystem(N, domain_size=25.0)
-    x, y, m = system.get_arrays()
-    
-    # Initialize velocities (circular motion)
-    vx = np.zeros(N, dtype=np.float64)
-    vy = np.zeros(N, dtype=np.float64)
-    
-    for i in range(N):
-        r = np.sqrt(x[i]**2 + y[i]**2)
-        if r > 0:
-            # Circular velocity for rough equilibrium
-            v_circ = np.sqrt(np.sum(m) * 0.1 / r)  # Rough estimate
-            vx[i] = -v_circ * y[i] / r
-            vy[i] = v_circ * x[i] / r
-    
-    # Time integration parameters
-    dt = 0.001
-    steps = 1000
-    save_every = 10
-    
-    # Storage for energy history
-    times = []
-    energies = []
-    
-    print(f"Running {steps} steps with dt={dt}")
-    
-    # Calculate initial energy
-    def calculate_energy():
-        ke = 0.5 * np.sum(m * (vx**2 + vy**2))
-        pe = 0.0
-        for i in range(N):
-            for j in range(i+1, N):
-                dx = x[j] - x[i]
-                dy = y[j] - y[i]
-                r = np.sqrt(dx**2 + dy**2 + 0.01**2)
-                pe -= m[i] * m[j] / r
-        return ke + pe
-    
-    E0 = calculate_energy()
-    print(f"Initial energy: {E0:.6e}")
-    
-    # Time integration loop
-    for step in range(steps):
-        # Compute forces
-        ax, ay = compute_fmm_forces(x, y, m)
-        if ax is None:
-            print("Force computation failed")
-            break
-        
-        # Leapfrog integration
-        vx += 0.5 * dt * ax
-        vy += 0.5 * dt * ay
-        
-        x += dt * vx
-        y += dt * vy
-        
-        # Recompute forces
-        ax, ay = compute_fmm_forces(x, y, m)
-        if ax is None:
-            break
-        
-        vx += 0.5 * dt * ax
-        vy += 0.5 * dt * ay
-        
-        # Save energy
-        if step % save_every == 0:
-            E = calculate_energy()
-            times.append(step * dt)
-            energies.append(E)
-    
-    if energies:
-        # Calculate relative energy error
-        rel_errors = [abs(E - E0) / abs(E0) for E in energies]
-        
-        print(f"Final relative energy error: {rel_errors[-1]:.4e}")
-        
-        # Create energy conservation plot
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # Total energy vs time
-        ax1.plot(times, energies, 'b-', linewidth=2)
-        ax1.axhline(y=E0, color='red', linestyle='--', alpha=0.7, label='Initial Energy')
-        ax1.set_xlabel('Time', fontsize=12)
-        ax1.set_ylabel('Total Energy', fontsize=12)
-        ax1.set_title('Energy Conservation Test', fontsize=14, fontweight='bold')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Relative error vs time
-        ax2.semilogy(times, rel_errors, 'r-', linewidth=2)
-        ax2.set_xlabel('Time', fontsize=12)
-        ax2.set_ylabel('Relative Energy Error', fontsize=12)
-        ax2.set_title('Energy Conservation Error', fontsize=14, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plot_path = os.path.join(OUTPUT_DIR, "energy_conservation.png")
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✓ Energy conservation plot saved to {plot_path}")
-
-def system_info():
-    """Display system information"""
-    print("\nSystem Information")
-    print("=" * 50)
-    
-    print(f"Python version: {sys.version.split()[0]}")
-    print(f"NumPy version: {np.__version__}")
-    
-    # OpenMP information
-    omp_vars = ["OMP_NUM_THREADS", "OMP_PROC_BIND", "OMP_PLACES", "OMP_SCHEDULE"]
-    for var in omp_vars:
-        print(f"{var}: {os.environ.get(var, 'Not set')}")
-    
-    # Module availability
-    print(f"Direct method: {'Available' if HAS_DIRECT else 'Not available'}")
-    print(f"FMM method: {'Available' if HAS_FMM else 'Not available'}")
-    
-    # System information
-    try:
-        import platform
-        import multiprocessing
-        print(f"Operating system: {platform.system()} {platform.release()}")
-        print(f"CPU cores: {multiprocessing.cpu_count()}")
-        print(f"Architecture: {platform.machine()}")
-    except:
-        pass
-
-def comprehensive_benchmark():
-    """Run comprehensive benchmark suite"""
-    print("\nComprehensive Benchmark Suite")
-    print("=" * 60)
-    
-    if not HAS_DIRECT and not HAS_FMM:
-        print("No computation modules available")
-        return
-    
-    print("Running all benchmark tests...")
-    print("This may take several minutes...")
-    
-    # Test 1: Performance benchmark
-    benchmark_performance()
-    
-    # Test 2: Accuracy test
-    test_accuracy()
-    
-    # Test 3: Parallel scaling
-    test_parallel_scaling()
-    
-    # Test 4: Energy conservation
-    energy_conservation_test()
-    
-    print("\n" + "=" * 60)
-    print("✓ Comprehensive benchmark completed!")
-    print(f"✓ Results saved to {OUTPUT_DIR}/")
-    print("=" * 60)
-
-def main_menu():
-    """Main menu interface"""
-    while True:
-        print("\n" + "=" * 60)
-        print("N-Body Simulation Platform - Final Working Version")
-        print("=" * 60)
-        print("Available functions:")
-        print(" 1) Performance benchmark")
-        print(" 2) Accuracy test")
-        print(" 3) Parallel scaling test")
-        print(" 4) Energy conservation test")
-        print(" 5) Comprehensive benchmark suite")
-        print(" 6) System information")
-        print(" q) Exit")
-        print("=" * 60)
-        
-        choice = input("Enter your choice: ").strip().lower()
-        
-        if choice == '1':
-            benchmark_performance()
-        elif choice == '2':
-            test_accuracy()
-        elif choice == '3':
-            test_parallel_scaling()
-        elif choice == '4':
-            energy_conservation_test()
-        elif choice == '5':
-            comprehensive_benchmark()
-        elif choice == '6':
-            system_info()
-        elif choice == 'q':
-            print("Goodbye!")
-            break
-        else:
-            print("Invalid choice. Please try again.")
-
-if __name__ == "__main__":
-    print("N-Body Simulation Platform Starting...")
-    print("Final Working Version with Proper Parallelization")
-    
-    # Check module availability
-    if not HAS_DIRECT and not HAS_FMM:
-        print("\nError: No computation modules available!")
-        print("Please compile the modules first:")
-        print("  python setup_final.py build_ext --inplace")
-        print("Then run the test suite:")
-        print("  python test_final.py")
-        sys.exit(1)
-    
-    main_menu() setup_openmp():
+def setup_openmp():
     """Setup optimal OpenMP environment"""
     import multiprocessing
     cpu_count = multiprocessing.cpu_count()
@@ -645,4 +386,262 @@ def create_accuracy_plot(theta_values, errors, times):
     
     print(f"✓ Accuracy plot saved to {plot_path}")
 
-def
+def create_scaling_plot(thread_counts, times):
+    """Create parallel scaling plot"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Filter valid data
+    valid_times = [t for t in times if not math.isnan(t)]
+    valid_threads = thread_counts[:len(valid_times)]
+    
+    if len(valid_times) > 1:
+        # Calculate speedup and efficiency
+        speedups = [valid_times[0] / t for t in valid_times]
+        efficiency = [s / tc for s, tc in zip(speedups, valid_threads)]
+        
+        # Speedup plot
+        ax1.plot(valid_threads, speedups, 'o-', linewidth=2.5, markersize=8, label='Actual')
+        ax1.plot(valid_threads, valid_threads, '--', alpha=0.7, label='Ideal')
+        ax1.set_xlabel('Number of Threads', fontsize=12)
+        ax1.set_ylabel('Speedup', fontsize=12)
+        ax1.set_title('Parallel Speedup', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Efficiency plot
+        ax2.plot(valid_threads, efficiency, 's-', linewidth=2.5, markersize=8, color='orange')
+        ax2.axhline(y=1.0, color='black', linestyle='--', alpha=0.7)
+        ax2.axhline(y=0.8, color='green', linestyle=':', alpha=0.7, label='Good (80%)')
+        ax2.axhline(y=0.5, color='red', linestyle=':', alpha=0.7, label='Poor (50%)')
+        ax2.set_xlabel('Number of Threads', fontsize=12)
+        ax2.set_ylabel('Parallel Efficiency', fontsize=12)
+        ax2.set_title('Parallel Efficiency', fontsize=14, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(0, 1.1)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_DIR, "parallel_scaling.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✓ Parallel scaling plot saved to {plot_path}")
+
+def energy_conservation_test():
+    """Test energy conservation in time integration"""
+    print("\nEnergy Conservation Test")
+    print("=" * 50)
+    
+    if not HAS_FMM:
+        print("FMM method required for energy conservation test")
+        return
+    
+    N = 100
+    system = ParticleSystem(N, domain_size=25.0)
+    x, y, m = system.get_arrays()
+    
+    # Initialize velocities (circular motion)
+    vx = np.zeros(N, dtype=np.float64)
+    vy = np.zeros(N, dtype=np.float64)
+    
+    for i in range(N):
+        r = np.sqrt(x[i]**2 + y[i]**2)
+        if r > 0:
+            # Circular velocity for rough equilibrium
+            v_circ = np.sqrt(np.sum(m) * 0.1 / r)  # Rough estimate
+            vx[i] = -v_circ * y[i] / r
+            vy[i] = v_circ * x[i] / r
+    
+    # Time integration parameters
+    dt = 0.001
+    steps = 1000
+    save_every = 10
+    
+    # Storage for energy history
+    times = []
+    energies = []
+    
+    print(f"Running {steps} steps with dt={dt}")
+    
+    # Calculate initial energy
+    def calculate_energy():
+        ke = 0.5 * np.sum(m * (vx**2 + vy**2))
+        pe = 0.0
+        for i in range(N):
+            for j in range(i+1, N):
+                dx = x[j] - x[i]
+                dy = y[j] - y[i]
+                r = np.sqrt(dx**2 + dy**2 + 0.01**2)
+                pe -= m[i] * m[j] / r
+        return ke + pe
+    
+    E0 = calculate_energy()
+    print(f"Initial energy: {E0:.6e}")
+    
+    # Time integration loop
+    for step in range(steps):
+        # Compute forces
+        ax, ay = compute_fmm_forces(x, y, m)
+        if ax is None:
+            print("Force computation failed")
+            break
+        
+        # Leapfrog integration
+        vx += 0.5 * dt * ax
+        vy += 0.5 * dt * ay
+        
+        x += dt * vx
+        y += dt * vy
+        
+        # Recompute forces
+        ax, ay = compute_fmm_forces(x, y, m)
+        if ax is None:
+            break
+        
+        vx += 0.5 * dt * ax
+        vy += 0.5 * dt * ay
+        
+        # Save energy
+        if step % save_every == 0:
+            E = calculate_energy()
+            times.append(step * dt)
+            energies.append(E)
+    
+    if energies:
+        # Calculate relative energy error
+        rel_errors = [abs(E - E0) / abs(E0) for E in energies]
+        
+        print(f"Final relative energy error: {rel_errors[-1]:.4e}")
+        
+        # Create energy conservation plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        
+        # Total energy vs time
+        ax1.plot(times, energies, 'b-', linewidth=2)
+        ax1.axhline(y=E0, color='red', linestyle='--', alpha=0.7, label='Initial Energy')
+        ax1.set_xlabel('Time', fontsize=12)
+        ax1.set_ylabel('Total Energy', fontsize=12)
+        ax1.set_title('Energy Conservation Test', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Relative error vs time
+        ax2.semilogy(times, rel_errors, 'r-', linewidth=2)
+        ax2.set_xlabel('Time', fontsize=12)
+        ax2.set_ylabel('Relative Energy Error', fontsize=12)
+        ax2.set_title('Energy Conservation Error', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = os.path.join(OUTPUT_DIR, "energy_conservation.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Energy conservation plot saved to {plot_path}")
+
+def system_info():
+    """Display system information"""
+    print("\nSystem Information")
+    print("=" * 50)
+    
+    print(f"Python version: {sys.version.split()[0]}")
+    print(f"NumPy version: {np.__version__}")
+    
+    # OpenMP information
+    omp_vars = ["OMP_NUM_THREADS", "OMP_PROC_BIND", "OMP_PLACES", "OMP_SCHEDULE"]
+    for var in omp_vars:
+        print(f"{var}: {os.environ.get(var, 'Not set')}")
+    
+    # Module availability
+    print(f"Direct method: {'Available' if HAS_DIRECT else 'Not available'}")
+    print(f"FMM method: {'Available' if HAS_FMM else 'Not available'}")
+    
+    # System information
+    try:
+        import platform
+        import multiprocessing
+        print(f"Operating system: {platform.system()} {platform.release()}")
+        print(f"CPU cores: {multiprocessing.cpu_count()}")
+        print(f"Architecture: {platform.machine()}")
+    except:
+        pass
+
+def comprehensive_benchmark():
+    """Run comprehensive benchmark suite"""
+    print("\nComprehensive Benchmark Suite")
+    print("=" * 60)
+    
+    if not HAS_DIRECT and not HAS_FMM:
+        print("No computation modules available")
+        return
+    
+    print("Running all benchmark tests...")
+    print("This may take several minutes...")
+    
+    # Test 1: Performance benchmark
+    benchmark_performance()
+    
+    # Test 2: Accuracy test
+    test_accuracy()
+    
+    # Test 3: Parallel scaling
+    test_parallel_scaling()
+    
+    # Test 4: Energy conservation
+    energy_conservation_test()
+    
+    print("\n" + "=" * 60)
+    print("✓ Comprehensive benchmark completed!")
+    print(f"✓ Results saved to {OUTPUT_DIR}/")
+    print("=" * 60)
+
+def main_menu():
+    """Main menu interface"""
+    while True:
+        print("\n" + "=" * 60)
+        print("N-Body Simulation Platform - Final Working Version")
+        print("=" * 60)
+        print("Available functions:")
+        print(" 1) Performance benchmark")
+        print(" 2) Accuracy test")
+        print(" 3) Parallel scaling test")
+        print(" 4) Energy conservation test")
+        print(" 5) Comprehensive benchmark suite")
+        print(" 6) System information")
+        print(" q) Exit")
+        print("=" * 60)
+        
+        choice = input("Enter your choice: ").strip().lower()
+        
+        if choice == '1':
+            benchmark_performance()
+        elif choice == '2':
+            test_accuracy()
+        elif choice == '3':
+            test_parallel_scaling()
+        elif choice == '4':
+            energy_conservation_test()
+        elif choice == '5':
+            comprehensive_benchmark()
+        elif choice == '6':
+            system_info()
+        elif choice == 'q':
+            print("Goodbye!")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+if __name__ == "__main__":
+    print("N-Body Simulation Platform Starting...")
+    print("Final Working Version with Proper Parallelization")
+    
+    # Check module availability
+    if not HAS_DIRECT and not HAS_FMM:
+        print("\nError: No computation modules available!")
+        print("Please compile the modules first:")
+        print("  python setup_final.py build_ext --inplace")
+        print("Then run the test suite:")
+        print("  python test_final.py")
+        sys.exit(1)
+    
+    main_menu()
