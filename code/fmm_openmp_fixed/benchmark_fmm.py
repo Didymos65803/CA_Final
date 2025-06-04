@@ -28,7 +28,7 @@ try:
 except ImportError:
     sys.exit("fmm_openmp module not found – compile fmm_openmp.cpp first!")
 
-OUT = pathlib.Path("results_bench_rev1"); OUT.mkdir(exist_ok=True)
+OUT = pathlib.Path("results_bench_rev2"); OUT.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------
 # helpers
