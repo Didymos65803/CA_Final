@@ -1,254 +1,137 @@
-// fmm_openmp.cpp
-// ===============
-//
-// A 2D Barnes–Hut / FMM‐style solver with OpenMP.
-//
-// We have increased MAX_LEAF from 64 to 1024 so that any N ≤ 1024
-// is treated as a single leaf (no subdivision). This makes build_tree
-// finish in one pass for small‐to‐moderate N.
-//
-// To compile:
-//   python3 setup_openmp.py build_ext --inplace
-// Then rename the produced .so to fmm_openmp.so so Python can import it.
+// fmm_openmp.cpp  ──  Barnes–Hut FMM (sequential build, OpenMP traversal)
+// ----------------------------------------------------------------------------
+// • Guard against infinite subdivision: stop if node.h < 1e-6  OR depth > 30.
+// • MAX_LEAF = 64  → accurate & fast for 10^2 – 10^5 particles.
+// ----------------------------------------------------------------------------
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <array>
 #include <vector>
 #include <cmath>
-#include <iostream>      // for debug printing
+#include <iostream>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 namespace py = pybind11;
 
-// A simple Body struct
-struct Body {
-    double x, y, m;
-};
+/* ---------------- data --------------------------------------------------- */
+struct Body { double x, y, m; };
 
-// A Node in the quadtree
 struct Node {
-    double cx = 0.0, cy = 0.0, size = 0.0;   // center and half‐width
-    double mass = 0.0, cmx = 0.0, cmy = 0.0; // total mass and centroid
-    bool leaf = true;
-    std::vector<int> ids;                    // indices of bodies in this node
-    std::array<std::unique_ptr<Node>, 4> ch; // children: {SW, SE, NW, NE}
+    double cx{}, cy{}, h{};                       // centre & half-width
+    double mass{}, cmx{}, cmy{};                  // multipole
+    bool   leaf{true};
+    std::vector<int> ids;                         // bodies (if leaf)
+    std::array<std::unique_ptr<Node>,4> ch;       // children SW,SE,NW,NE
 };
 
-// Raise leaf threshold so N ≤ 1024 never subdivides
-static constexpr int MAX_LEAF = 1024;
+static constexpr int MAX_LEAF   = 64;
+static constexpr int MAX_DEPTH  = 30;   // safety against stack blow-up
+static constexpr double H_MIN   = 1e-6; // min half-width before we stop
 
-// Subdivide node n into 4 children, distribute body‐indices into correct quadrant.
-void subdivide(Node *n, const std::vector<Body>& B) {
-    double midx = n->cx, midy = n->cy;
-    double h = 0.5 * n->size; // new half‐width for children
-
-    for (int quadrant = 0; quadrant < 4; ++quadrant) {
-        n->ch[quadrant] = std::make_unique<Node>();
-        n->ch[quadrant]->size = h;
-        n->ch[quadrant]->leaf = true;
-        if (quadrant == 0) {       // SW quadrant (lower‐left)
-            n->ch[quadrant]->cx = midx - h * 0.5;
-            n->ch[quadrant]->cy = midy - h * 0.5;
-        }
-        else if (quadrant == 1) {  // SE quadrant (lower‐right)
-            n->ch[quadrant]->cx = midx + h * 0.5;
-            n->ch[quadrant]->cy = midy - h * 0.5;
-        }
-        else if (quadrant == 2) {  // NW quadrant (upper‐left)
-            n->ch[quadrant]->cx = midx - h * 0.5;
-            n->ch[quadrant]->cy = midy + h * 0.5;
-        }
-        else {                     // NE quadrant (upper‐right)
-            n->ch[quadrant]->cx = midx + h * 0.5;
-            n->ch[quadrant]->cy = midy + h * 0.5;
-        }
-    }
-    n->leaf = false;
-
-    // Distribute the body‐indices from n->ids into the new children
-    for (int id : n->ids) {
-        double bx = B[id].x;
-        double by = B[id].y;
-        int idx = 0;
-        if (bx > n->cx) idx += 1; // east half
-        if (by > n->cy) idx += 2; // north half
-        n->ch[idx]->ids.push_back(id);
-    }
-    n->ids.clear();
+/* ---------------- helpers ------------------------------------------------ */
+inline int quadrant(const Body& b, const Node* n) {
+    return (b.x > n->cx) + 2*(b.y > n->cy);
 }
 
-// SEQUENTIAL quadtree builder (BFS, but done on one thread).
-// Computes total mass & centroid bottom‐up.
-void build_tree(Node *root, const std::vector<Body>& B) {
-    std::vector<Node*> current{root}, next;
-
-    while (!current.empty()) {
-        next.clear();  // prepare next level
-
-        for (Node* n : current) {
-            // If this leaf node has more bodies than MAX_LEAF, subdivide
-            if ((int)n->ids.size() > MAX_LEAF) {
-                subdivide(n, B);
-            }
-
-            // Compute this node's mass & centroid
-            n->mass = 0.0;
-            n->cmx  = 0.0;
-            n->cmy  = 0.0;
-            if (n->leaf) {
-                // Sum over all bodies in n->ids
-                for (int id : n->ids) {
-                    n->mass += B[id].m;
-                    n->cmx  += B[id].m * B[id].x;
-                    n->cmy  += B[id].m * B[id].y;
-                }
-            } else {
-                // Sum over children’s masses
-                for (auto &c : n->ch) {
-                    if (c) {
-                        n->mass += c->mass;
-                        n->cmx  += c->mass * c->cmx;
-                        n->cmy  += c->mass * c->cmy;
-                        next.push_back(c.get());
-                    }
-                }
-            }
-            if (n->mass > 0.0) {
-                n->cmx /= n->mass;
-                n->cmy /= n->mass;
-            }
-        }
-
-        // Move to next level
-        current.swap(next);
-    }
-}
-
-// Return true if node n is “far enough” to approximate with its centroid
-inline bool far(const Body& p, const Node* n, double theta2) {
-    if (!n || n->mass == 0.0) return false;
-    double dx = p.x - n->cmx;
-    double dy = p.y - n->cmy;
-    return (n->size * n->size) / (dx*dx + dy*dy) < theta2;
-}
-
-// Recursively traverse the tree to accumulate force on particle p
-static void traverse(
-    const std::vector<Body>& B,
-    const Node* n,
-    const Body& p,
-    double eps2,
-    double theta2,
-    double& fx,
-    double& fy)
+/* ---------------- recursive build (with guard) -------------------------- */
+void build(Node* n, const std::vector<Body>& B, int depth = 0)
 {
-    if (!n || n->mass == 0.0) return;
+    if ((int)n->ids.size() > MAX_LEAF &&
+        n->h > H_MIN && depth < MAX_DEPTH)
+    {
+        n->leaf = false;
+        double h2 = 0.5 * n->h;
+        for (int q=0;q<4;++q) {
+            n->ch[q] = std::make_unique<Node>();
+            n->ch[q]->h    = h2;
+            n->ch[q]->leaf = true;
+            n->ch[q]->cx   = n->cx + (q&1 ? 0.5 : -0.5) * h2;
+            n->ch[q]->cy   = n->cy + (q&2 ? 0.5 : -0.5) * h2;
+        }
+        for (int id : n->ids)
+            n->ch[ quadrant(B[id], n) ]->ids.push_back(id);
+        n->ids.clear();
 
-    if (n->leaf || far(p, n, theta2)) {
-        // Approximate with this node's centroid
-        double dx = n->cmx - p.x;
-        double dy = n->cmy - p.y;
-        double r2 = dx*dx + dy*dy + eps2;
-        double invR = 1.0 / std::sqrt(r2);
-        double invR3 = invR * invR * invR;
-        double f = n->mass * invR3;
-        fx += f * dx;
-        fy += f * dy;
+        for (auto& c : n->ch) build(c.get(), B, depth+1);
+    }
+
+    /* multipole */
+    n->mass = n->cmx = n->cmy = 0.0;
+    if (n->leaf) {
+        for (int id : n->ids) {
+            n->mass += B[id].m;
+            n->cmx  += B[id].m * B[id].x;
+            n->cmy  += B[id].m * B[id].y;
+        }
     } else {
-        // Descend into children
-        for (auto &c : n->ch) {
-            if (c) {
-                traverse(B, c.get(), p, eps2, theta2, fx, fy);
-            }
+        for (auto& c : n->ch) {
+            n->mass += c->mass;
+            n->cmx  += c->mass * c->cmx;
+            n->cmy  += c->mass * c->cmy;
         }
     }
+    if (n->mass) { n->cmx /= n->mass;  n->cmy /= n->mass; }
 }
 
-// The core FMM entry point
-static void fmm_core(
-    const py::array_t<double>& x_arr,
-    const py::array_t<double>& y_arr,
-    const py::array_t<double>& m_arr,
-    double eps2,
-    double domain,
-    double theta,
-    py::array_t<double>& ax_arr,
-    py::array_t<double>& ay_arr)
+/* ---------------- traversal -------------------------------------------- */
+inline bool far(const Body& p, const Node* n, double th2)
 {
-    const int N = x_arr.shape(0);
+    double dx = p.x - n->cmx,  dy = p.y - n->cmy;
+    return (n->h*n->h)/(dx*dx + dy*dy) < th2;
+}
 
-    // Copy particle data into a vector of Body
+void walk(const std::vector<Body>& B, const Node* n, const Body& p,
+          double eps2, double th2, double& fx, double& fy)
+{
+    if (!n || n->mass==0.0) return;
+    if (n->leaf || far(p,n,th2)) {
+        double dx=n->cmx-p.x, dy=n->cmy-p.y;
+        double r2=dx*dx+dy*dy+eps2, invR=1/std::sqrt(r2), invR3=invR*invR*invR;
+        double f=n->mass*invR3; fx+=f*dx; fy+=f*dy;
+    } else {
+        for (auto& c : n->ch) walk(B,c.get(),p,eps2,th2,fx,fy);
+    }
+}
+
+/* ---------------- main kernel ------------------------------------------ */
+void fmm_force_theta(const py::array_t<double>& x,
+                     const py::array_t<double>& y,
+                     const py::array_t<double>& m,
+                     double eps2,double domain,double theta,
+                     py::array_t<double>& ax, py::array_t<double>& ay)
+{
+    int N = x.shape(0);
     std::vector<Body> B(N);
-    for (int i = 0; i < N; ++i) {
-        B[i].x = x_arr.at(i);
-        B[i].y = y_arr.at(i);
-        B[i].m = m_arr.at(i);
+    for (int i=0;i<N;++i) B[i] = { x.at(i), y.at(i), m.at(i) };
+
+    Node root;                         // root encloses  [−domain, +domain]
+    root.cx = root.cy = 0.0;
+    root.h  = domain;                  // half-width = domain  (200 wide box)
+    root.ids.resize(N); std::iota(root.ids.begin(), root.ids.end(), 0);
+
+    std::cout << "[FMM] build_tree N=" << N << '\n'; std::cout.flush();
+    build(&root, B);
+
+    auto axw=ax.mutable_unchecked<1>(), ayw=ay.mutable_unchecked<1>();
+    double th2 = theta * theta;
+
+    std::cout << "[FMM] traverse N=" << N << '\n'; std::cout.flush();
+    #pragma omp parallel for schedule(dynamic,256)
+    for (int i=0;i<N;++i) {
+        double fx=0.0, fy=0.0;
+        walk(B, &root, B[i], eps2, th2, fx, fy);
+        axw(i)=fx; ayw(i)=fy;
     }
-
-    // Build the root node covering [-domain, +domain]
-    Node root;
-    root.cx   = 0.0;
-    root.cy   = 0.0;
-    root.size = domain * 0.5; // half‐width
-    root.ids.resize(N);
-    for (int i = 0; i < N; ++i) {
-        root.ids[i] = i;
-    }
-
-    // Debug: Starting build_tree
-    std::cout << "[FMM] Entering build_tree (N=" << N << ", MAX_LEAF=" << MAX_LEAF << ")\n";
-    std::cout.flush();
-
-    build_tree(&root, B);
-
-    // Debug: Finished build_tree
-    std::cout << "[FMM] Finished build_tree\n";
-    std::cout.flush();
-
-    // Prepare the output arrays
-    auto ax_out = ax_arr.mutable_unchecked<1>();
-    auto ay_out = ay_arr.mutable_unchecked<1>();
-
-    // Compute forces in parallel by traversing the tree for each particle
-    std::cout << "[FMM] Starting parallel traversal (N=" << N << ")\n";
-    std::cout.flush();
-
-    double theta2 = theta * theta;
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int i = 0; i < N; ++i) {
-        double fx = 0.0, fy = 0.0;
-        traverse(B, &root, B[i], eps2, theta2, fx, fy);
-        ax_out(i) = fx;
-        ay_out(i) = fy;
-    }
-
-    // Debug: Finished parallel traversal
-    std::cout << "[FMM] Finished parallel traversal (N=" << N << ")\n";
-    std::cout.flush();
+    std::cout << "[FMM] done N=" << N << '\n'; std::cout.flush();
 }
 
-// Python wrapper for an arbitrary θ
-void fmm_force_theta(
-    const py::array_t<double>& x,
-    const py::array_t<double>& y,
-    const py::array_t<double>& m,
-    double eps2,
-    double domain,
-    double theta,
-    py::array_t<double>& ax,
-    py::array_t<double>& ay)
+/* ---------------- Python module ---------------------------------------- */
+PYBIND11_MODULE(fmm_openmp, m)
 {
-    fmm_core(x, y, m, eps2, domain, theta, ax, ay);
-}
-
-// Pybind11 module definition
-PYBIND11_MODULE(fmm_openmp, m) {
-    m.doc() = "2D Barnes-Hut / FMM solver with OpenMP (sequential build_tree, MAX_LEAF=1024)";
-    m.def(
-        "fmm_force_theta",
-        &fmm_force_theta,
-        "fmm_force_theta(x, y, m, eps2, domain, theta, ax, ay)  # Barnes-Hut / FMM"
-    );
+    m.doc() = "2-D Barnes–Hut FMM (guarded build, OpenMP traversal)";
+    m.def("fmm_force_theta", &fmm_force_theta,
+          "x,y,m,eps2,domain,theta,ax,ay  → fill ax, ay with accelerations");
 }
 
