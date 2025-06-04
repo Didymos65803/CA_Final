@@ -61,3 +61,4 @@ PYBIND11_MODULE(force_openmp, m)
           "O(N²) reference kernel with OpenMP parallelism");
 }
 
+

@@ -210,3 +210,4 @@ PYBIND11_MODULE(fmm_openmp, m)
           "Barnes–Hut FMM kernel with explicit opening angle θ");
 }
 
+
