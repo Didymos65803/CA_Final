@@ -2,17 +2,18 @@
 // ---------------------------------------------------------------------------
 // Serial‐build + parallel traversal 2D Barnes–Hut FMM with OpenMP
 //
-//   • Phase 1: recursive quadtree build (serial)
-//   • Phase 2: bottom‐up multipole accumulation (serial)
-//   • Phase 3: parallel traversal           (OpenMP schedule(static,1024))
+//  • Phase 1: recursive quadtree build (completely serial)
+//  • Phase 2: bottom‐up multipole accumulation (completely serial)
+//  • Phase 3: parallel traversal           (OpenMP schedule(static,1024))
 //
-// Build instructions (in your shell):
+// Build instructions (run these in your shell, not pasted into the file):
 //   cd parallel
-//   rm -f fmm_openmp.so fmm_openmp.cpython-*.so
+//   rm -f fmm_openmp.so fmm_openmp.cpython-39-x86_64-linux-gnu.so
+//   rm -rf build
 //   python3.9 setup_openmp.py build_ext --inplace
 //   mv build/lib*/fmm_openmp*.so fmm_openmp.so
 //
-// Note: force_openmp.cpp and setup_openmp.py remain unchanged.
+// Note: force_openmp.cpp and setup_openmp.py are unchanged.
 // ---------------------------------------------------------------------------
 
 #include <pybind11/pybind11.h>
@@ -27,41 +28,43 @@
 
 namespace py = pybind11;
 
-// Each Body stores x, y, mass; we'll add ax, ay after traversal.
+// Each Body holds (x, y, m).  We will fill ax, ay later.
 struct Body {
-    double x, y, m, ax, ay;
+    double x, y, m;
+    double ax, ay;
 };
 
 // A quadtree node.  We use 'h' = half‐width of this cell.
 struct Node {
-    double cx{}, cy{}, h{};                  // cell center (cx,cy) and half‐width h
-    double mass{}, cmx{}, cmy{};             // accumulated mass and center‐of‐mass
-    bool   leaf{true};                       // if true, this is a leaf node
-    std::vector<int> ids;                    // indices of bodies if leaf
-    std::array<std::unique_ptr<Node>,4> ch;  // children: SW(0), SE(1), NW(2), NE(3)
+    double cx{}, cy{}, h{};                   // cell center (cx,cy) and half‐width h
+    double mass{}, cmx{}, cmy{};              // accumulated mass and center‐of‐mass
+    bool   leaf{true};                        // if true, this is a leaf node
+    std::vector<int> ids;                     // indices of bodies if leaf
+    std::array<std::unique_ptr<Node>,4> ch;   // children pointers: {SW, SE, NW, NE}
 };
 
-static constexpr int MAX_LEAF = 64;  // max bodies per leaf before subdividing
+static constexpr int MAX_LEAF = 64;  // maximum bodies per leaf before subdividing
 
-// Return quadrant index [0..3] of body b relative to node n:
-//   0 = SW (x ≤ cx, y ≤ cy), 1 = SE (x > cx, y ≤ cy),
-//   2 = NW (x ≤ cx, y > cy), 3 = NE (x > cx, y > cy).
+// Return quadrant index [0..3] for body b relative to node n:
+//  0 = SW (x <= cx, y <= cy)
+//  1 = SE (x >  cx, y <= cy)
+//  2 = NW (x <= cx, y >  cy)
+//  3 = NE (x >  cx, y >  cy)
 inline int quadrant(const Body& b, const Node* n) {
     return (b.x > n->cx) + 2 * (b.y > n->cy);
 }
 
-// ---------------------------
-// Phase 1: recursive quadtree build (serial).
-// ---------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 1: recursive quadtree build (serial).  If node has > MAX_LEAF bodies,
+//  split into four children, distribute bodies, and recurse.  Otherwise remain leaf.
+// ────────────────────────────────────────────────────────────────────────────
 static void build_tree(Node* node, const std::vector<Body>& B) {
-    // If this node has ≤ MAX_LEAF bodies, stop subdividing.
     if ((int)node->ids.size() <= MAX_LEAF) {
         node->leaf = true;
         return;
     }
     node->leaf = false;
 
-    // Split into 4 children
     double h2 = 0.5 * node->h;
     for (int q = 0; q < 4; ++q) {
         node->ch[q] = std::make_unique<Node>();
@@ -71,23 +74,21 @@ static void build_tree(Node* node, const std::vector<Body>& B) {
         node->ch[q]->cy   = node->cy + (q & 2 ? 0.5 : -0.5) * h2;
     }
 
-    // Distribute bodies into the appropriate child quadrant
     for (int id : node->ids) {
         int q = quadrant(B[id], node);
         node->ch[q]->ids.push_back(id);
     }
     node->ids.clear();
 
-    // Recursively build each child
     for (auto& cptr : node->ch) {
         build_tree(cptr.get(), B);
     }
 }
 
-// ---------------------------
+// ────────────────────────────────────────────────────────────────────────────
 // Phase 2: bottom‐up multipole accumulation (serial).
-// Post‐order: compute children's mass first, then combine into parent.
-// ---------------------------
+//  Post‐order: compute children first, then sum into parent.
+// ────────────────────────────────────────────────────────────────────────────
 static void compute_multipoles(Node* node, const std::vector<Body>& B) {
     if (node->leaf) {
         node->mass = 0.0;
@@ -103,11 +104,9 @@ static void compute_multipoles(Node* node, const std::vector<Body>& B) {
             node->cmy /= node->mass;
         }
     } else {
-        // First process children
         for (auto& cptr : node->ch) {
             compute_multipoles(cptr.get(), B);
         }
-        // Then combine child multipoles
         node->mass = 0.0;
         node->cmx  = 0.0;
         node->cmy  = 0.0;
@@ -123,10 +122,10 @@ static void compute_multipoles(Node* node, const std::vector<Body>& B) {
     }
 }
 
-// ---------------------------
+// ────────────────────────────────────────────────────────────────────────────
 // Phase 3: recursive traversal (parallel over targets).
-// If (h² / r² < θ²), treat as monopole; else descend.
-// ---------------------------
+//  If (h² / r² < θ²), use monopole; else descend into children.
+// ────────────────────────────────────────────────────────────────────────────
 inline bool far(const Body& p, const Node* n, double th2) {
     double dx = p.x - n->cmx;
     double dy = p.y - n->cmy;
@@ -144,7 +143,6 @@ static void traverse(const std::vector<Body>& B,
     if (!node || node->mass == 0.0) return;
 
     if (node->leaf || far(p, node, th2)) {
-        // Use this node's monopole
         double dx = node->cmx - p.x;
         double dy = node->cmy - p.y;
         double r2 = dx*dx + dy*dy + eps2;
@@ -154,21 +152,20 @@ static void traverse(const std::vector<Body>& B,
         fx += f * dx;
         fy += f * dy;
     } else {
-        // Descend into all children
         for (auto& cptr : node->ch) {
             traverse(B, cptr.get(), p, eps2, th2, fx, fy);
         }
     }
 }
 
-// ---------------------------
+// ────────────────────────────────────────────────────────────────────────────
 // Python‐visible entry point:
 //   x, y, m : NumPy arrays (length N, dtype=float64)
 //   eps2    : softening²
 //   domain  : half‐width of root box
 //   theta   : opening angle
 //   ax, ay  : output NumPy arrays (length N) to fill with accelerations
-// ---------------------------
+// ────────────────────────────────────────────────────────────────────────────
 void fmm_force_theta(const py::array_t<double>& x,
                      const py::array_t<double>& y,
                      const py::array_t<double>& m,
@@ -179,17 +176,15 @@ void fmm_force_theta(const py::array_t<double>& x,
                      py::array_t<double>& ay)
 {
     int N = x.shape(0);
-    // 1) Copy inputs into Body vector
     std::vector<Body> B(N);
     for (int i = 0; i < N; ++i) {
-        B[i].x = x.at(i);
-        B[i].y = y.at(i);
-        B[i].m = m.at(i);
+        B[i].x  = x.at(i);
+        B[i].y  = y.at(i);
+        B[i].m  = m.at(i);
         B[i].ax = 0.0;
         B[i].ay = 0.0;
     }
 
-    // 2) Build root node
     Node root;
     root.cx = 0.0;
     root.cy = 0.0;
@@ -199,13 +194,13 @@ void fmm_force_theta(const py::array_t<double>& x,
         root.ids[i] = i;
     }
 
-    // Phase 1: serial build
+    // Phase 1: serial quadtree build
     build_tree(&root, B);
 
-    // Phase 2: serial multipole accumulation
+    // Phase 2: serial bottom‐up multipoles
     compute_multipoles(&root, B);
 
-    // Phase 3: parallel traversal
+    // Phase 3: parallel traversal over each target body
     auto axw = ax.mutable_unchecked<1>();
     auto ayw = ay.mutable_unchecked<1>();
     double th2 = theta * theta;

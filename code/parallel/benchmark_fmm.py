@@ -59,7 +59,7 @@ OUT.mkdir(exist_ok=True)
 _rng = np.random.default_rng(42)
 
 # ───────────────────────────────────────────────────────────────────────────
-# 4) Random N‐body system: uniform in [−domain, +domain], all masses = 1
+# 4) Random N‐body system: uniform in [–domain, +domain], all masses = 1
 # ───────────────────────────────────────────────────────────────────────────
 def random_system(N: int, domain: float):
     x = _rng.uniform(-domain, domain, size=N).astype(np.float64)
@@ -183,7 +183,7 @@ def run_thread_scaling(N, threads, eps2, domain, theta):
     plt.close()
 
 # ───────────────────────────────────────────────────────────────────────────
-# 7) Θ trade-off: fix N, vary θ, measure L² error vs runtime
+# 7) Θ trade‐off: fix N, vary θ, measure L² error vs runtime
 # ───────────────────────────────────────────────────────────────────────────
 def run_theta_tradeoff(N, thetas, eps2, domain):
     print(f"\n--- Θ trade-off for N = {N} ---", flush=True)
@@ -211,7 +211,6 @@ def run_theta_tradeoff(N, thetas, eps2, domain):
 
         print(f"   θ={th:.2f}  t={tf:.3e}s  L2-err={err:.3e}", flush=True)
 
-    # Plot error vs θ and time vs θ
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8,4))
     ax1.semilogy(thetas, errs, 'o-', color='C0')
     ax1.set_xlabel('θ')
@@ -228,7 +227,7 @@ def run_theta_tradeoff(N, thetas, eps2, domain):
     plt.close()
 
 # ───────────────────────────────────────────────────────────────────────────
-# 8) main: parse arguments and run everything
+# 8) main: parse arguments and run all steps
 # ───────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
