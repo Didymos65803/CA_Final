@@ -512,14 +512,14 @@ std::vector<Particle> init_solar_system(
 }
 
 int main(int argc, char* argv[]) {
-    int n_asteroids = 5000;
-    int steps = 200001;
+    int n_asteroids = 8000;
+    int steps = 100001;
     double dt = 0.004;
 
     double central_mass = 1000.0;
     double jupiter_mass = 1.0; 
     double jupiter_radius = 20.0;
-    double belt_min_r = 8.0;
+    double belt_min_r = 4.0;
     double belt_max_r = 15.0;
     double domain_size = jupiter_radius * 2.5;
     double theta = 0.5;
