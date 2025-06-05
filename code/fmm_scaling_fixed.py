@@ -10,7 +10,7 @@ G = 1.0  # gravitational constant
 softening = 0.01  # softening parameter to avoid singularities
 domain_size = 100.0  # size of the domain for the quad tree
 
-class Particle:
+class Particle: # Represents a particle in the simulation
     def __init__(self, x, y, mass=1.0, vx=0.0, vy=0.0):
         self.x = x
         self.y = y
@@ -36,17 +36,16 @@ def compute_forces_direct(particles):
                 if r < softening:
                     r = softening
                     
-                # Gravitational force
+                # Gravitational force and acceleration
                 particles[i].f = G * particles[i].mass * particles[j].mass / r**2
-                # Acceleration components
                 particles[i].ax += particles[i].f * dx / (r * particles[i].mass)
                 particles[i].ay += particles[i].f * dy / (r * particles[i].mass)
 
-class QuadTreeNode:
+class QuadTreeNode: # Build a quad tree
     global_level_registry = {}  # class-level registry of nodes per level
-    level_hash = {}
+    level_hash = {} # class-level hash table for quick access by grid key
 
-    def __init__(self, cx, cy, size, level=0, max_level=20, parent=None):
+    def __init__(self, cx, cy, size, level=0, max_level=20, parent=None): # Initialize a quad tree node
         self.cx = cx      # Center x-coordinate
         self.cy = cy      # Center y-coordinate
         self.size = size  # Size of the square
@@ -59,11 +58,11 @@ class QuadTreeNode:
         lvl_hash = QuadTreeNode.level_hash.setdefault(self.level, {})
         lvl_hash[self._grid_key] = self
         # ----------------------------------------------------------
-        self.max_level = max_level
+        self.max_level = max_level # Maximum level of subdivision
         self.children = [None, None, None, None]  # NW, NE, SW, SE
         self.parent = parent
-        self.particles = []
-        self.total_mass = 0.0
+        self.particles = [] # List of particles in this node
+        self.total_mass = 0.0 # Total mass of particles in this node
         self.com_x = 0.0  # Center of mass x
         self.com_y = 0.0  # Center of mass y
         self.is_leaf = True
@@ -78,9 +77,8 @@ class QuadTreeNode:
             QuadTreeNode.global_level_registry[level] = []
         QuadTreeNode.global_level_registry[level].append(self)
 
-    def insert(self, particle):
+    def insert(self, particle): # Insert a particle into the quad tree
         self.is_empty = False
-
         if self.is_leaf:
             if len(self.particles) == 0 or self.level >= self.max_level:
                 # Accept particle in this leaf
@@ -98,10 +96,10 @@ class QuadTreeNode:
                 # Create children
                 half = self.size / 2
                 quarter = half / 2
-                self.children[0] = QuadTreeNode(self.cx - quarter, self.cy - quarter, half, self.level + 1, self.max_level, parent=self)
-                self.children[1] = QuadTreeNode(self.cx + quarter, self.cy - quarter, half, self.level + 1, self.max_level, parent=self)
-                self.children[2] = QuadTreeNode(self.cx - quarter, self.cy + quarter, half, self.level + 1, self.max_level, parent=self)
-                self.children[3] = QuadTreeNode(self.cx + quarter, self.cy + quarter, half, self.level + 1, self.max_level, parent=self)
+                self.children[0] = QuadTreeNode(self.cx - quarter, self.cy - quarter, half, self.level + 1, self.max_level, parent=self) # NW
+                self.children[1] = QuadTreeNode(self.cx + quarter, self.cy - quarter, half, self.level + 1, self.max_level, parent=self) # NE
+                self.children[2] = QuadTreeNode(self.cx - quarter, self.cy + quarter, half, self.level + 1, self.max_level, parent=self) # SW
+                self.children[3] = QuadTreeNode(self.cx + quarter, self.cy + quarter, half, self.level + 1, self.max_level, parent=self) # SE
 
                 for p in old_particles:
                     self._insert_to_child(p)
@@ -120,11 +118,11 @@ class QuadTreeNode:
         if particle.x > self.cx:
             index += 1  # East
         if particle.y > self.cy:
-            index += 2  # South
-            
-        self.children[index].insert(particle)
+            index += 2  # South    
+        self.children[index].insert(particle) # Insert particle into the appropriate child node
 
-    def compute_force_barnes_hut(self, particle, theta=0.3):
+    def compute_force_barnes_hut(self, particle, theta=0.3): 
+        # Compute the force on a particle using Barnes-Hut approximation
         if self.is_empty:
             return 0.0, 0.0
         
@@ -139,9 +137,8 @@ class QuadTreeNode:
         # If it's a leaf with a single particle or the node is sufficiently far away
         if self.is_leaf or (self.size / r < theta):
             if r > 0:  # Avoid self-interactions
-                # Gravitational force
+                # Gravitational force and acceleration
                 f = G * particle.mass * self.total_mass / r_squared
-                # Acceleration components                
                 ax = f * dx / (r * particle.mass)
                 ay = f * dy / (r * particle.mass)
                 return ax, ay
@@ -162,14 +159,13 @@ class QuadTreeNode:
         # Compute multipole expansion for this node 
         if self.is_empty:
             return
-        
-        self.multipole = np.zeros(self.p, dtype=complex) # Initialize multipole expansion coefficients
+
+        self.multipole = np.zeros(self.p, dtype=complex)  # Initialize multipole expansion coefficients
         self.multipole[0] = self.total_mass  # a_0 is the total mass
 
         if self.is_leaf:
-            #print(f"Leaf at ({self.cx:.1f}, {self.cy:.1f}) multipole:", self.multipole)
+            #print(f"Leaf at ({self.cx:.1f}, {self.cy:.1f}) multipole:", self.multipole) # Debugging output
             # For leaf nodes, compute multipole expansion from particles
-            
             for particle in self.particles:
                 z_rel = complex(particle.x - self.cx, particle.y - self.cy)
                 # Q is already computed as self.total_mass
@@ -185,7 +181,7 @@ class QuadTreeNode:
                     z0 = complex(child.cx - self.cx, child.cy - self.cy)
                     self._translate_multipole_to_multipole(child.multipole, z0)
 
-    def _translate_multipole_to_multipole(self, child_expansion, z0):
+    def _translate_multipole_to_multipole(self, child_expansion, z0): # Translate multipole expansion from child to this node
         if self.multipole is None:
             self.multipole = np.zeros(self.p, dtype=complex)
 
@@ -198,14 +194,10 @@ class QuadTreeNode:
 
             # Σ_{k=1..l} a_k C(l−1,k−1) z₀^{l−k}
             for k in range(1, min(l, self.p-1)+1):
-                self.multipole[l] += (
-                    child_expansion[k] *
-                    math.comb(l-1, k-1) *
-                    (z0 ** (l-k))
-                )
+                self.multipole[l] += (child_expansion[k] * math.comb(l-1, k-1) * (z0 ** (l-k)))
     
     def compute_local_expansion(self, parent_local=None):
-        #Compute local expansion for this node (downward pass)
+        # Compute local expansion for this node (downward pass)
         if self.is_empty:
             return
             
@@ -221,10 +213,10 @@ class QuadTreeNode:
         for node in interaction_list:
             if node.multipole is not None:
                 self._multipole_to_local(node)
-        #print(f"Node at ({self.cx:.1f}, {self.cy:.1f}) local expansion:", self.local)
+        #print(f"Node at ({self.cx:.1f}, {self.cy:.1f}) local expansion:", self.local) # Debugging output
 
     def _translate_local_to_local(self, parent_local, z0):
-        #Translate local expansion from parent to child centered at z0 (L2L)
+        # Translate local expansion from parent to child centered at z0 (L2L)
         if self.local is None:
             self.local = np.zeros(self.p, dtype=complex)
 
@@ -238,9 +230,9 @@ class QuadTreeNode:
         self.local += b
 
     def _multipole_to_local(self, source_node):
-        #print(f"M2L: from ({source_node.cx:.1f}, {source_node.cy:.1f}) → ({self.cx:.1f}, {self.cy:.1f})")
-        #print("source multipole:", source_node.multipole)
-        #Convert source multipole expansion to local expansion at target (M2L)
+        #print(f"M2L: from ({source_node.cx:.1f}, {source_node.cy:.1f}) → ({self.cx:.1f}, {self.cy:.1f})") # Debugging output
+        #print("source multipole:", source_node.multipole) # Debugging output
+        #Convert source multipole expansion to local expansion at target
         z0 = complex(source_node.cx - self.cx, source_node.cy - self.cy)
         if abs(z0) < 1e-12: # Avoid division by zero if centers are too close
             return
@@ -248,9 +240,8 @@ class QuadTreeNode:
         if self.local is None:
             self.local = np.zeros(self.p, dtype=complex)
 
-        source_multipoles = source_node.multipole # These are M_k or a_k
+        source_multipoles = source_node.multipole # Source multipole coefficients
 
-        # L_l = sum_{k=0}^{p-1} M_k * (-1)^k * C(l+k, k) / (z0^(l+k+1))
         for l_idx in range(self.p): # l for L_l
             term_sum_for_L_l = 0j
             for k_idx in range(self.p): # k for M_k
@@ -271,7 +262,7 @@ class QuadTreeNode:
         dist = self.size
         return dx <= dist and dy <= dist
     
-    def get_neighbors(self):
+    def get_neighbors(self): # Get all neighboring nodes (8 surrounding boxes)
         if hasattr(self, '_neighbor_cache'):
             return self._neighbor_cache
 
@@ -313,13 +304,13 @@ class QuadTreeNode:
 
         return interaction
 
-    def evaluate_local_expansion(self, particle):
+    def evaluate_local_expansion(self, particle): # Evaluate the local expansion at a particle's position
         if self.local is None:
             return 0.0, 0.0
 
         z = complex(particle.x - self.cx, particle.y - self.cy)
         force_complex = 0.0 + 0.0j
-        z_power = 1.0 + 0.0j                # z⁰
+        z_power = 1.0 + 0.0j
         for k in range(1, self.p):          # start at k = 1
             force_complex += self.local[k] * k * z_power
             z_power *= z                    # increment z^{k}
@@ -349,7 +340,7 @@ def compute_forces_barnes_hut(particles, domain_size=100.0, theta=0.3):
 # Fast Multipole Method (O(N))
 def compute_forces_fmm(particles, domain_size=100.0, max_level=20):
     QuadTreeNode.global_level_registry.clear()  # Clear global registry for new run
-    QuadTreeNode.level_hash.clear() 
+    QuadTreeNode.level_hash.clear() # Clear level hash for new run
     # Reset accelerations
     for p in particles:
         p.ax = 0.0
@@ -358,9 +349,7 @@ def compute_forces_fmm(particles, domain_size=100.0, max_level=20):
     if len(particles) == 0:
         return
     
-    # Build the quad tree with limited depth for FMM
-    #target_leaf = 16
-    #max_level = math.ceil(math.log(max(len(particles)/target_leaf, 1), 4))
+    # Build the quad tree
     root = QuadTreeNode(0.0, 0.0, domain_size, max_level=max_level)
     for p in particles:
         root.insert(p)
@@ -397,7 +386,7 @@ def compute_forces_fmm(particles, domain_size=100.0, max_level=20):
                 ax_near, ay_near = 0.0, 0.0
                 soft2 = softening * softening
 
-                # helper *inside* the loop so it can see “particle”
+                # accumulate forces from self-leaf and neighbours
                 def accumulate_direct(src_node):
                     nonlocal ax_near, ay_near
                     if src_node.is_leaf:
@@ -431,7 +420,7 @@ def compute_forces_fmm(particles, domain_size=100.0, max_level=20):
     
     evaluate_forces(root)
 
-def performance_comparison(n_particles_list, method='all'):
+def performance_comparison(n_particles_list, method='all'): # Compare performance of different methods
     results = defaultdict(list)
     bh_error_array = []
     fmm_error_array = []
@@ -442,15 +431,13 @@ def performance_comparison(n_particles_list, method='all'):
         # Create particles randomly distributed in a square
         particles = []
         np.random.seed(0)  # For reproducibility
-        # Create a massive particle at the center
-        #particles.append(Particle(0.0, 0.0, mass=100.0))  # Central massive particle
         for i in range(n):
             x = (np.random.random() - 0.5) * 100.0
             y = (np.random.random() - 0.5) * 100.0
             mass = np.random.uniform(1.0, 3.0)  # Mass between 1 and 5
             particles.append(Particle(x, y, mass))
         
-        # Make a deep copy for comparing the two methods
+        # Make copies for comparing the two methods
         particles_direct = [Particle(p.x, p.y, p.mass, p.vx, p.vy) for p in particles]
         particles_bh = [Particle(p.x, p.y, p.mass, p.vx, p.vy) for p in particles]
         particles_fmm = [Particle(p.x, p.y, p.mass, p.vx, p.vy) for p in particles]
@@ -475,26 +462,28 @@ def performance_comparison(n_particles_list, method='all'):
         if method in ['fmm', 'all']:
             start_time = time.time()
             compute_forces_fmm(particles_fmm)
-            #compute_forces_fmm(particles_fmm, domain_size=100, max_level=max_level)
             fmm_time = time.time() - start_time
             results['fmm_times'].append(fmm_time)
             print(f" FMM: {fmm_time:.6f} seconds")
         
-        # Calculate discrapency between methods (if all methods are used)
+        # Calculate discrepency between methods if all methods are used
         if method == 'all' and n < 5000:
             bh_max_error = 0.0
             fmm_max_error = 0.0
+            
             for i in range(n):
                 p_direct = particles_direct[i]
                 p_bh = particles_bh[i]
                 p_fmm = particles_fmm[i]
-
+                
+                # Direct method value
+                direct = np.sqrt(p_direct.ax**2 + p_direct.ay**2)
+                direct_array.append(direct)
+                
                 # BH error
                 ax_error = p_bh.ax - p_direct.ax
                 ay_error = p_bh.ay - p_direct.ay
                 bh_error_magnitude = np.sqrt(ax_error**2 + ay_error**2)
-                direct = np.sqrt(p_direct.ax**2 + p_direct.ay**2)
-                direct_array.append(direct)
                 bh_error_array.append(bh_error_magnitude / direct)
                 bh_max_error = max(bh_max_error, bh_error_magnitude / direct)
                 
@@ -502,13 +491,13 @@ def performance_comparison(n_particles_list, method='all'):
                 ax_error = p_fmm.ax - p_direct.ax
                 ay_error = p_fmm.ay - p_direct.ay
                 fmm_error_magnitude = np.sqrt(ax_error**2 + ay_error**2)
-                fmm_max_error = max(fmm_max_error, fmm_error_magnitude / direct)
                 fmm_error_array.append(fmm_error_magnitude / direct)
+                fmm_max_error = max(fmm_max_error, fmm_error_magnitude / direct)
             
             results['bh_max_errors'].append(bh_max_error)
             results['fmm_max_errors'].append(fmm_max_error)
-            print(f" Barnes-Hut max error: {bh_max_error:.6f}")
-            print(f" FMM max error: {fmm_max_error:.6f}")
+            print(f" Barnes-Hut max relative error: {bh_max_error:.6f}")
+            print(f" FMM max relative error: {fmm_max_error:.6f}")
         
     if method == 'all':
         return results, direct_array, bh_error_array, fmm_error_array
@@ -531,9 +520,8 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
     plt.tight_layout()
     plt.show()
 
-    plt.figure(figsize=(12, 6))
-
     # Performance comparison
+    plt.figure(figsize=(12, 6))    
     plt.subplot(1, 2, 1)
     if 'direct_times' in results and results['direct_times']:
         n_direct = n_particles_list[:len(results['direct_times'])]
@@ -548,8 +536,7 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
     if 'fmm_times' in results and results['fmm_times']:
         plt.plot(n_particles_list, results['fmm_times'], 's-', label='FMM', color='green')
         scale_fmm = results['fmm_times'][0] / n_particles_list[0]
-        plt.plot(n_particles_list, scale_fmm * np.array(n_particles_list), '--', label='O(N) reference', color='green', alpha=0.5)
-    
+        plt.plot(n_particles_list, scale_fmm * np.array(n_particles_list), '--', label='O(N) reference', color='green', alpha=0.5)    
     plt.xlabel('Number of Particles')
     plt.ylabel('Computation Time (seconds)')
     plt.title('Performance Comparison')
@@ -563,8 +550,7 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
         plt.subplot(1, 2, 2)
         n_speedup = n_particles_list[:len(results['direct_times'])]
         bh_speedup = [results['direct_times'][i] / results['bh_times'][i] for i in range(len(results['direct_times']))]
-        fmm_speedup = [results['direct_times'][i] / results['fmm_times'][i] for i in range(len(results['direct_times']))]
-        
+        fmm_speedup = [results['direct_times'][i] / results['fmm_times'][i] for i in range(len(results['direct_times']))]        
         plt.loglog(n_speedup, bh_speedup, 's-', label='Barnes-Hut Speedup', color='blue')
         plt.loglog(n_speedup, fmm_speedup, '^-', label='FMM Speedup', color='green')
         plt.xlabel('Number of Particles')
@@ -576,7 +562,8 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
     plt.suptitle('Performance Analysis', fontsize=16)
     plt.show()
     
-def plot_fmm_scaling(n_particles_large, results_large):
+
+def plot_fmm_scaling(n_particles_large, results_large): # Plot FMM scaling for large N
 
     plt.figure(figsize=(10, 6))
     plt.loglog(n_particles_large, results_large['fmm_times'], '^-', label='FMM O(N)', color='green', linewidth=2)
