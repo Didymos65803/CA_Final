@@ -5,7 +5,7 @@ import os
 import numpy as np
 
 
-def plot_all_results(csv_file="timing_results.csv"):
+def plot_all_results(csv_file="timing_results.csv", output_dir="plots_fmm"):
     if not os.path.exists(csv_file):
         print(f"Error: File '{csv_file}' not found.")
         return
@@ -41,6 +41,10 @@ def plot_all_results(csv_file="timing_results.csv"):
 
     plt.style.use('seaborn-v0_8-whitegrid')
 
+    # Create output directory if not exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
     # --- Speedup vs Num Cores (faceted by N) ---
     print("Generating speedup vs cores (faceted)...")
     speedup_df = df[(df['Algorithm'] == 'FMM') & (df['Speedup'] > 0)]
@@ -68,12 +72,17 @@ def plot_all_results(csv_file="timing_results.csv"):
         ax.grid(True, which="both", ls="-", alpha=0.5)
         ax.legend()
 
+    # Clear any extra unused subplots
+    for j in range(len(unique_ns), len(axes)):
+        fig.delaxes(axes[j])
+
     fig.supxlabel("Number of Cores")
     fig.supylabel("Speedup (T1 / TN)")
     fig.suptitle("FMM Parallel Speedup vs Cores (Faceted by N)")
     plt.tight_layout(rect=[0.03, 0.03, 1, 0.95])
-    plt.savefig("plot_speedup_vs_n_cores_faceted_fmm_only.png")
-    print("Saved: plot_speedup_vs_n_cores_faceted_fmm_only.png")
+    output_path = os.path.join(output_dir, "plot_speedup_vs_n_cores_faceted_fmm_only.png")
+    plt.savefig(output_path)
+    print(f"Saved: {output_path}")
 
     plt.close(fig)
 
