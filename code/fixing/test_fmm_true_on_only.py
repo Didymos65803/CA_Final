@@ -1,4 +1,18 @@
-#!/usr/bin/env python3
+# 執行測試
+    results = test_true_fmm_scaling(sizes, threads_list)
+    
+    # 詳細分析
+    analyze_parallel_efficiency(results)
+    compare_with_theoretical(results)
+    
+    # 印出結果摘要
+    print_performance_summary(results)
+    
+    # 理論比較
+    compare_with_barnes_hut()
+    
+    # 增強的繪圖
+    plot_enhanced_results(results)#!/usr/bin/env python3
 """
 test_fmm_true_on_only.py
 
@@ -87,6 +101,261 @@ def test_true_fmm_scaling(sizes, threads_list, eps2=1e-6, theta=0.6):
                 results['speedups'][P] = speedups
     
     return results
+
+def analyze_parallel_efficiency(results):
+    """
+    詳細分析並行效率
+    """
+    sizes = results['sizes']
+    threads_list = sorted(results['times_by_threads'].keys())
+    
+    print(f"\n{'='*60}")
+    print("PARALLEL EFFICIENCY ANALYSIS")
+    print(f"{'='*60}")
+    
+    for i, N in enumerate(sizes):
+        if N < 1000:
+            continue  # 只分析較大的問題
+            
+        print(f"\nN = {N:,}")
+        print(f"{'Threads':>8} {'Time(s)':>10} {'Speed-up':>10} {'Efficiency':>12} {'Strategy':>15}")
+        print("-" * 65)
+        
+        base_time = results['times_by_threads'][1][i] if 1 in results['times_by_threads'] else 0
+        
+        for P in threads_list:
+            if P in results['times_by_threads'] and i < len(results['times_by_threads'][P]):
+                time_p = results['times_by_threads'][P][i]
+                speedup = base_time / time_p if time_p > 0 else 0
+                efficiency = speedup / P if P > 0 else 0
+                
+                # 判斷使用的策略
+                if N < 500:
+                    strategy = "Ultra-Parallel"
+                elif N < 3000:
+                    strategy = "NUMA-Parallel"
+                else:
+                    strategy = "Barnes-Hut"
+                
+                print(f"{P:8d} {time_p:10.4f} {speedup:10.2f} {efficiency:11.1%} {strategy:>15}")
+
+def compare_with_theoretical(results):
+    """
+    與理論性能比較
+    """
+    sizes = results['sizes']
+    
+    print(f"\n{'='*60}")
+    print("THEORETICAL PERFORMANCE COMPARISON")
+    print(f"{'='*60}")
+    
+    if 1 in results['times_by_threads']:
+        times_1thread = results['times_by_threads'][1]
+        
+        print(f"\n{'N':>8} {'Measured(s)':>12} {'O(N)':>10} {'O(NlogN)':>12} {'O(N²)':>10}")
+        print("-" * 54)
+        
+        base_n = sizes[0]
+        base_time = times_1thread[0]
+        
+        for i, N in enumerate(sizes):
+            if i < len(times_1thread):
+                measured = times_1thread[i]
+                
+                # 理論預測
+                on_pred = base_time * (N / base_n)
+                onlogn_pred = base_time * (N * np.log(N)) / (base_n * np.log(base_n))
+                on2_pred = base_time * (N / base_n) ** 2
+                
+                print(f"{N:8,} {measured:12.4f} {on_pred:10.4f} {onlogn_pred:12.4f} {on2_pred:10.4f}")
+
+def plot_enhanced_results(results):
+    """
+    增強的結果繪圖
+    """
+    sizes = results['sizes']
+    threads_list = list(results['times_by_threads'].keys())
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # Plot 1: 時間 vs N（不同線程數） - 包含更多參考線
+    ax1 = axes[0, 0]
+    colors = plt.cm.tab10(np.linspace(0, 1, len(threads_list)))
+    
+    for i, P in enumerate(sorted(threads_list)):
+        times = results['times_by_threads'][P]
+        ax1.loglog(sizes[:len(times)], times, 'o-', color=colors[i], 
+                  label=f'{P} threads', linewidth=2, markersize=4)
+    
+    # 多條參考線
+    if 1 in results['times_by_threads']:
+        base_time = results['times_by_threads'][1][0]
+        base_n = sizes[0]
+        
+        # O(N) 參考線
+        scale_n = base_time / base_n
+        ref_n = [scale_n * n for n in sizes]
+        ax1.loglog(sizes, ref_n, '--', color='green', alpha=0.7, label='O(N)', linewidth=2)
+        
+        # O(N log N) 參考線
+        scale_nlogn = base_time / (base_n * np.log(base_n))
+        ref_nlogn = [scale_nlogn * n * np.log(n) for n in sizes]
+        ax1.loglog(sizes, ref_nlogn, '--', color='blue', alpha=0.7, label='O(N log N)', linewidth=2)
+        
+        # O(N²) 參考線（僅顯示小N部分）
+        small_sizes = [s for s in sizes if s <= 10000]
+        scale_n2 = base_time / (base_n * base_n)
+        ref_n2 = [scale_n2 * n * n for n in small_sizes]
+        ax1.loglog(small_sizes, ref_n2, '--', color='red', alpha=0.7, label='O(N²)', linewidth=2)
+    
+    ax1.set_xlabel('Number of Particles')
+    ax1.set_ylabel('Time [s]')
+    ax1.set_title('Algorithmic Scaling')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: 並行效率熱圖
+    ax2 = axes[0, 1]
+    if results['speedups']:
+        speedup_matrix = []
+        efficiency_matrix = []
+        
+        for P in sorted(threads_list):
+            if P in results['speedups']:
+                speedups = results['speedups'][P]
+                efficiencies = [s/P for s in speedups]
+                speedup_matrix.append(speedups[:len(sizes)])
+                efficiency_matrix.append(efficiencies[:len(sizes)])
+        
+        # 繪製效率熱圖
+        im = ax2.imshow(efficiency_matrix, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+        ax2.set_xticks(range(len(sizes)))
+        ax2.set_xticklabels([f'{s//1000}k' if s >= 1000 else str(s) for s in sizes])
+        ax2.set_yticks(range(len(threads_list)))
+        ax2.set_yticklabels(sorted(threads_list))
+        ax2.set_xlabel('Problem Size')
+        ax2.set_ylabel('Threads')
+        ax2.set_title('Parallel Efficiency')
+        plt.colorbar(im, ax=ax2, label='Efficiency')
+    
+    # Plot 3: 不同N下的加速比曲線
+    ax3 = axes[0, 2]
+    if results['speedups']:
+        # 選擇幾個代表性的N值
+        representative_ns = [100, 1000, 10000, 100000, 400000]
+        available_ns = [n for n in representative_ns if n in sizes]
+        
+        for N in available_ns:
+            idx = sizes.index(N)
+            threads = []
+            speedups = []
+            
+            for P in sorted(threads_list):
+                if P in results['speedups'] and idx < len(results['speedups'][P]):
+                    threads.append(P)
+                    speedups.append(results['speedups'][P][idx])
+            
+            if threads:
+                ax3.plot(threads, speedups, 'o-', label=f'N={N:,}', linewidth=2, markersize=6)
+        
+        # 理想加速線
+        max_threads = max(threads_list)
+        ideal_threads = range(1, max_threads + 1)
+        ax3.plot(ideal_threads, ideal_threads, '--', color='gray', alpha=0.7, 
+                label='Ideal scaling', linewidth=2)
+        
+        ax3.set_xlabel('Threads')
+        ax3.set_ylabel('Speed-up')
+        ax3.set_title('Speed-up vs Threads')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: 複雜度分析（更詳細）
+    ax4 = axes[1, 0]
+    if 1 in results['times_by_threads']:
+        times_1thread = results['times_by_threads'][1]
+        
+        # 分段分析複雜度
+        small_mask = np.array(sizes) <= 3000
+        large_mask = np.array(sizes) > 3000
+        
+        small_sizes = np.array(sizes)[small_mask]
+        small_times = np.array(times_1thread)[small_mask]
+        
+        large_sizes = np.array(sizes)[large_mask]
+        large_times = np.array(times_1thread)[large_mask]
+        
+        if len(small_sizes) > 1:
+            slope_small, _, r2_small, _, _ = linregress(np.log(small_sizes), np.log(small_times))
+            ax4.loglog(small_sizes, small_times, 'o-', color='blue', 
+                      label=f'Small N: N^{slope_small:.2f} (R²={r2_small:.3f})', linewidth=2)
+        
+        if len(large_sizes) > 1:
+            slope_large, _, r2_large, _, _ = linregress(np.log(large_sizes), np.log(large_times))
+            ax4.loglog(large_sizes, large_times, 's-', color='red', 
+                      label=f'Large N: N^{slope_large:.2f} (R²={r2_large:.3f})', linewidth=2)
+    
+    ax4.set_xlabel('Problem Size')
+    ax4.set_ylabel('Time [s]')
+    ax4.set_title('Complexity Analysis by Size Range')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # Plot 5: 記憶體效率分析
+    ax5 = axes[1, 1]
+    if 1 in results['times_by_threads']:
+        times_1thread = results['times_by_threads'][1]
+        
+        # 計算每秒處理的粒子對數（反映記憶體效率）
+        particles_per_sec = [n / t for n, t in zip(sizes[:len(times_1thread)], times_1thread)]
+        
+        ax5.semilogx(sizes[:len(times_1thread)], particles_per_sec, 'o-', 
+                    linewidth=2, markersize=6)
+        ax5.set_xlabel('Problem Size')
+        ax5.set_ylabel('Particles/sec')
+        ax5.set_title('Memory/Computational Efficiency')
+        ax5.grid(True, alpha=0.3)
+    
+    # Plot 6: 策略效果比較
+    ax6 = axes[1, 2]
+    ax6.axis('off')
+    
+    # 創建策略效果摘要表
+    strategy_data = []
+    if results['speedups'] and 16 in results['speedups']:
+        for i, N in enumerate(sizes):
+            if i < len(results['speedups'][16]):
+                speedup_16 = results['speedups'][16][i]
+                efficiency_16 = speedup_16 / 16
+                
+                if N < 500:
+                    strategy = "Ultra-Parallel O(N²)"
+                elif N < 3000:
+                    strategy = "NUMA-Parallel O(N²)"
+                else:
+                    strategy = "Barnes-Hut O(N log N)"
+                
+                strategy_data.append([
+                    f'{N:,}',
+                    strategy,
+                    f'{speedup_16:.2f}x',
+                    f'{efficiency_16:.1%}'
+                ])
+    
+    if strategy_data:
+        table = ax6.table(
+            cellText=strategy_data[:8],  # 只顯示前8行
+            colLabels=['N', 'Strategy', '16-thread\nSpeed-up', 'Efficiency'],
+            cellLoc='center',
+            loc='center'
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.5)
+        ax6.set_title('Strategy Effectiveness Summary', pad=20)
+    
+    plt.tight_layout()
+    plt.show()
 
 def plot_fmm_results(results):
     """
@@ -404,11 +673,11 @@ def compare_with_barnes_hut():
     print("\n說明：當 N 增大時，O(N) 相對於 O(N log N) 的優勢會越來越明顯")
 
 def main():
-    # 測試參數
-    sizes = [10000, 50000, 100000, 200000, 400000]
+    # 測試參數：包含更小的N
+    sizes = [100, 500, 1000, 5000, 10000, 50000, 100000, 200000, 400000]
     threads_list = [1, 2, 4, 8, 16]
     
-    print("Testing True O(N) Fast Multipole Method (Optimized Version)")
+    print("Testing Highly Optimized O(N) FMM (All Size Ranges)")
     print("=" * 60)
     
     # 執行測試
