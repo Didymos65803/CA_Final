@@ -70,7 +70,7 @@ class QuadTreeNode: # Build a quad tree
         
         self.multipole = None  # Placeholder for multipole expansion
         self.local = None  # Placeholder for local expansion
-        self.p = 16  # Number of terms in multipole/local expansions
+        self.p = 16  # Order of multipole expansion
 
         # Register this node in the global level registry
         if level not in QuadTreeNode.global_level_registry:
@@ -167,9 +167,9 @@ class QuadTreeNode: # Build a quad tree
             #print(f"Leaf at ({self.cx:.1f}, {self.cy:.1f}) multipole:", self.multipole) # Debugging output
             # For leaf nodes, compute multipole expansion from particles
             for particle in self.particles:
-                z_rel = complex(particle.x - self.cx, particle.y - self.cy)
-                for l in range(1, self.p): # l from 1 to p-1 for a_l
-                    self.multipole[l] -= particle.mass * (z_rel ** l) / l
+                z_rel = complex(particle.x - self.cx, particle.y - self.cy) # Relative position to center of mass
+                for k in range(1, self.p): # l from 1 to p-1 for a_l
+                    self.multipole[k] -= particle.mass * (z_rel ** k) / k
 
         else:
             # For internal nodes, translate multipole expansions from children
@@ -191,7 +191,7 @@ class QuadTreeNode: # Build a quad tree
 
             self.multipole[l] += -child_expansion[0] * (z0**l) / l
 
-            # Σ_{k=1..l} a_k C(l−1,k−1) z₀^{l−k}
+            # Accumulate contributions from higher-order terms
             for k in range(1, min(l, self.p-1)+1):
                 self.multipole[l] += (child_expansion[k] * math.comb(l-1, k-1) * (z0 ** (l-k)))
     
@@ -241,18 +241,18 @@ class QuadTreeNode: # Build a quad tree
 
         source_multipoles = source_node.multipole # Source multipole coefficients
 
-        for l_idx in range(self.p): # l for L_l
-            term_sum_for_L_l = 0j
-            for k_idx in range(self.p): # k for M_k
-                if source_multipoles[k_idx] == 0: # Skip if source term is zero
+        for l in range(self.p): 
+            term_sum = 0j
+            for k in range(self.p): # k for M_k
+                if source_multipoles[k] == 0: # Skip if source term is zero
                     continue
 
-                binom_coeff = math.comb(l_idx + k_idx, k_idx)
-                denominator = z0**(l_idx + k_idx + 1)
+                binom_coeff = math.comb(l + k, k)
+                denominator = z0**(l + k + 1)
 
-                term = ((-1)**k_idx) * source_multipoles[k_idx] * binom_coeff / denominator
-                term_sum_for_L_l += term
-            self.local[l_idx] += term_sum_for_L_l
+                term = ((-1)**k) * source_multipoles[k] * binom_coeff / denominator
+                term_sum += term
+            self.local[l] += term_sum
 
     def are_neighbors(self, other):
         # Check if another box is a neighbor (shares edge or corner).
@@ -280,15 +280,14 @@ class QuadTreeNode: # Build a quad tree
         return nbrs
     
     def _get_interaction_list(self):
-        # empty root -> nothing to do
         if self.parent is None:
             return []
 
         interaction = []
-        # parent plus all its neighbours (U-list in Greengard’s jargon)
+        # parent plus all its neighbours
         for nbr in self.parent.get_neighbors() + [self.parent]:
 
-            # boxes that touch B are excluded
+            # neighboring boxes are excluded
             if self.are_neighbors(nbr):
                 continue
 
@@ -469,7 +468,9 @@ def performance_comparison(n_particles_list, method='all'): # Compare performanc
         if method == 'all' and n < 5000:
             bh_max_error = 0.0
             fmm_max_error = 0.0
-            
+            bh_total_error = 0
+            fmm_total_error = 0
+
             for i in range(n):
                 p_direct = particles_direct[i]
                 p_bh = particles_bh[i]
@@ -485,6 +486,7 @@ def performance_comparison(n_particles_list, method='all'): # Compare performanc
                 bh_error_magnitude = np.sqrt(ax_error**2 + ay_error**2)
                 bh_error_array.append(bh_error_magnitude / direct)
                 bh_max_error = max(bh_max_error, bh_error_magnitude / direct)
+                bh_total_error += bh_error_magnitude
                 
                 # FMM error
                 ax_error = p_fmm.ax - p_direct.ax
@@ -492,11 +494,16 @@ def performance_comparison(n_particles_list, method='all'): # Compare performanc
                 fmm_error_magnitude = np.sqrt(ax_error**2 + ay_error**2)
                 fmm_error_array.append(fmm_error_magnitude / direct)
                 fmm_max_error = max(fmm_max_error, fmm_error_magnitude / direct)
+                fmm_total_error += fmm_error_magnitude
             
             results['bh_max_errors'].append(bh_max_error)
+            results['bh_total_errors_average'].append(bh_total_error / n)
             results['fmm_max_errors'].append(fmm_max_error)
+            results['fmm_total_errors_average'].append(fmm_total_error / n)
             print(f" Barnes-Hut max relative error: {bh_max_error:.6f}")
+            print(f" Barnes-Hut total average error: {bh_total_error / n:.6f}")
             print(f" FMM max relative error: {fmm_max_error:.6f}")
+            print(f" FMM total average error: {fmm_total_error / n:.6f}")
         
     if method == 'all':
         return results, direct_array, bh_error_array, fmm_error_array
@@ -506,7 +513,7 @@ def performance_comparison(n_particles_list, method='all'): # Compare performanc
 def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_error_array):
     
     # Error analysis
-    plt.figure(figsize=(6, 5))
+    plt.figure(figsize=(10, 6))
     plt.title('Relative error against direct N-body method values')
     plt.scatter(direct_array, bh_error_array, label='Barnes-Hut Error', color='blue', alpha=0.7)
     plt.scatter(direct_array, fmm_error_array, label='FMM Error', color='green', alpha=0.7)
@@ -517,6 +524,20 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
+    plt.show()
+
+    # Plotting total errors
+    n_error = n_particles_list[:len(results['bh_total_errors_average'])]
+    plt.figure(figsize=(8, 5))
+    plt.title('Total Average Errors Compared to Direct Method')
+    plt.plot(n_error, results['bh_total_errors_average'], 's-', label='Barnes-Hut Total Error avg', color='blue')
+    plt.plot(n_error, results['fmm_total_errors_average'], '^-', label='FMM Total Error avg', color='green')
+    plt.xlabel('Number of Particles')
+    plt.ylabel('Total Average Error')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.show()
 
     # Performance comparison
@@ -591,15 +612,15 @@ def plot_fmm_scaling(n_particles_large, results_large): # Plot FMM scaling for l
 
 if __name__ == "__main__":    
     # Test with different particle counts
-    n_particles_small = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 2000, 3000, 4000]  # Smaller for direct comparison
+    n_particles_small = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 2000, 3000]  # Smaller for direct comparison
     n_particles_large = [5000, 10000, 20000, 30000, 40000, 50000, 75000, 100000]  # Larger for FMM scaling
     
     print("Performance comparison with direct method (smaller N):")
     results_small, darray, bharray, farray = performance_comparison(n_particles_small, 'all')
     
     print("\nPerformance comparison for large N (FMM vs Barnes-Hut):")
-    results_large = performance_comparison(n_particles_large, method='fmm')
+    #results_large = performance_comparison(n_particles_large, method='fmm')
     
     # Plot results
     plot_results(n_particles_small, results_small, darray, bharray, farray)
-    plot_fmm_scaling(n_particles_large, results_large)
+    #plot_fmm_scaling(n_particles_large, results_large)
