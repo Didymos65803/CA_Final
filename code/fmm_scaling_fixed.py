@@ -432,7 +432,7 @@ def performance_comparison(n_particles_list, method='all'): # Compare performanc
         for i in range(n):
             x = (np.random.random() - 0.5) * 100.0
             y = (np.random.random() - 0.5) * 100.0
-            mass = np.random.uniform(1.0, 3.0)  # Mass between 1 and 5
+            mass = np.random.uniform(1.0, 5.0)
             particles.append(Particle(x, y, mass))
         
         # Make copies for comparing the two methods
@@ -529,11 +529,11 @@ def plot_results(n_particles_list, results, direct_array, bh_error_array, fmm_er
     # Plotting total errors
     n_error = n_particles_list[:len(results['bh_total_errors_average'])]
     plt.figure(figsize=(8, 5))
-    plt.title('Total Average Errors Compared to Direct Method')
-    plt.plot(n_error, results['bh_total_errors_average'], 's-', label='Barnes-Hut Total Error avg', color='blue')
-    plt.plot(n_error, results['fmm_total_errors_average'], '^-', label='FMM Total Error avg', color='green')
+    plt.title('Average Absolute Errors Compared to Direct Method')
+    plt.plot(n_error, results['bh_total_errors_average'], 's-', label='Barnes-Hut Average Error', color='blue')
+    plt.plot(n_error, results['fmm_total_errors_average'], '^-', label='FMM Average Error', color='green')
     plt.xlabel('Number of Particles')
-    plt.ylabel('Total Average Error')
+    plt.ylabel('Average Error (absolute)')
     plt.xscale('log')
     plt.yscale('log')
     plt.legend()
@@ -619,8 +619,8 @@ if __name__ == "__main__":
     results_small, darray, bharray, farray = performance_comparison(n_particles_small, 'all')
     
     print("\nPerformance comparison for large N (FMM vs Barnes-Hut):")
-    #results_large = performance_comparison(n_particles_large, method='fmm')
+    results_large = performance_comparison(n_particles_large, method='fmm')
     
     # Plot results
     plot_results(n_particles_small, results_small, darray, bharray, farray)
-    #plot_fmm_scaling(n_particles_large, results_large)
+    plot_fmm_scaling(n_particles_large, results_large)
