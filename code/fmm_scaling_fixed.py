@@ -7,7 +7,7 @@ from scipy.stats import linregress
 
 # Constants
 G = 1.0  # gravitational constant
-softening = 0.01  # softening parameter to avoid singularities
+softening = 0.001  # softening parameter to avoid singularities
 domain_size = 100.0  # size of the domain for the quad tree
 
 class Particle: # Represents a particle in the simulation
@@ -168,7 +168,6 @@ class QuadTreeNode: # Build a quad tree
             # For leaf nodes, compute multipole expansion from particles
             for particle in self.particles:
                 z_rel = complex(particle.x - self.cx, particle.y - self.cy)
-                # Q is already computed as self.total_mass
                 for l in range(1, self.p): # l from 1 to p-1 for a_l
                     self.multipole[l] -= particle.mass * (z_rel ** l) / l
 
@@ -349,7 +348,7 @@ def compute_forces_fmm(particles, domain_size=100.0, max_level=20):
     if len(particles) == 0:
         return
     
-    # Build the quad tree
+    # Initialization: Build the quad tree and insert particles
     root = QuadTreeNode(0.0, 0.0, domain_size, max_level=max_level)
     for p in particles:
         root.insert(p)
@@ -569,7 +568,7 @@ def plot_fmm_scaling(n_particles_large, results_large): # Plot FMM scaling for l
     plt.loglog(n_particles_large, results_large['fmm_times'], '^-', label='FMM O(N)', color='green', linewidth=2)
     plt.loglog(n_particles_large, results_large['bh_times'], 's-', label='Barnes-Hut O(N log N)', color='blue', linewidth=2)
 
-    # Theoretical O(N) scaling
+    # Theoretical O(N) and O(N log N) scaling
     scale_fmm = results_large['fmm_times'][0] / n_particles_large[0]
     scale_bh = results_large['bh_times'][0] / (n_particles_large[0] * np.log(n_particles_large[0]))
     plt.loglog(n_particles_large, [scale_fmm * n for n in n_particles_large], '--', color='green', alpha=0.7, label='Theoretical O(N)')
@@ -579,7 +578,7 @@ def plot_fmm_scaling(n_particles_large, results_large): # Plot FMM scaling for l
     log_n = np.log(n_particles_large)
     log_times = np.log(results_large['fmm_times'])
     slope, intercept, r_value, p_value, std_err = linregress(log_n, np.log(results_large['bh_times']))
-    print(f"\nEmpirical Barnes-Hut scaling: O(N log N) {slope:.2f} with R² = {r_value**2:.3f}")
+    print(f"\nEmpirical Barnes-Hut scaling: O(N^{slope:.2f}) with R² = {r_value**2:.3f}")
     slope, intercept, r_value, p_value, std_err = linregress(log_n, log_times)
     print(f"\nEmpirical FMM scaling: O(N^{slope:.2f}) with R² = {r_value**2:.3f}")
     
