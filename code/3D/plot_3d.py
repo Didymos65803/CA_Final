@@ -150,8 +150,9 @@ def animate_3d_simulation(trajectory_df, n_total_particles, num_steps, output_fi
 
     actual_num_steps = trajectory_df['step'].max() + 1 if not trajectory_df.empty else num_steps
     print(f"Creating 3D animation for {actual_num_steps} steps...")
+    frame_step = 20  # 設定每 20 步畫一次
+    ani = FuncAnimation(fig, update, frames=tqdm(range(0, actual_num_steps, frame_step), desc="Animating 3D"), blit=True, interval=50)
     
-    ani = FuncAnimation(fig, update, frames=tqdm(range(actual_num_steps), desc="Animating 3D"), blit=True, interval=50) # blit=True might have issues with 3D sometimes
     
     try:
         ani.save(output_filename, writer=PillowWriter(fps=20))

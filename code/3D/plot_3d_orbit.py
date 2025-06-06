@@ -54,6 +54,7 @@ def create_animation(traj_file, bins, output_mp4):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
+    
     # --- Pre-calculate robust axis limits ---
     # Position plot limits
     if df['x'].empty or df['y'].empty:
